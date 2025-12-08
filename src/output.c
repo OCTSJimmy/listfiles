@@ -6,7 +6,7 @@
 #include <grp.h>
 #include <errno.h>
 #include <unistd.h>
-
+#include "async_worker.h"
 
 
 // 获取用户名(哈希表实现)
@@ -399,71 +399,75 @@ void cleanup_cache(RuntimeState *state) {
     }
 }
 
-
-// 显示状态信息(固定区域刷新)
 void display_status(const ThreadSharedState *shared) {
     const Config *cfg = shared->cfg;
     const RuntimeState *state = shared->state;
-    const SmartQueue *queue = shared->queue;
+    const SmartQueue *queue = shared->queue; // 目录队列 (生产者输入)
 
     // 只在使用-o或-O参数时显示
     if (!cfg->is_output_file && !cfg->is_output_split_dir) {
         return;
     }
 
-    // ANSI转义序列：移动到行首,清除从当前行到屏幕底部的内容
+    // 获取消费者（文件写入）队列的积压量
+    size_t async_pending = async_worker_get_queue_size();
+
+    // ANSI转义序列：移动到行首, 清除屏幕
     printf("\033[0;0H\033[J");
 
-    // 显示标题
-    printf("===== 处理状态 =====\n");
-    // 已执行时间
+    // === 标题栏 ===
+    printf("===== 异步流水线状态 (v%s) =====\n", VERSION);
+    
     char time_str[32];
     format_elapsed_time(state->start_time, time_str, sizeof(time_str));
-    printf("已执行时间: %s\n", time_str);
+    printf("运行时间: %s\n", time_str);
 
-    // 队列状态
-    size_t total_queued = queue->active_count + queue->buffer_count + queue->disk_count;
-    printf("待处理数量: %zu   已完成数量: %lu\n", total_queued, state->completed_count);
-    //各缓冲区情况
-    printf("执行区:%lu条  缓冲区:%lu条   磁盘区:%lu条\n", queue->active_count, queue->buffer_count, queue->disk_count);
-
-    // 处理速率
-    double enqueue_rate = calculate_rate(state->start_time, state->line_count);
-    double dequeue_rate = calculate_rate(state->start_time, state->completed_count);
-    printf("入队速率: %.2f 行/秒   出队速率: %.2f 行/秒\n", enqueue_rate, dequeue_rate);
-
+    // === 核心：双队列监控 ===
+    // 1. 生产者状态 (目录扫描)
+    size_t dir_queued = queue->active_count + queue->buffer_count + queue->disk_count;
+    printf("\n[生产者: 目录扫描]\n");
+    printf("├── 目录队列堆积: %zu (内存:%zu, 磁盘:%zu)\n", 
+           dir_queued, queue->active_count + queue->buffer_count, queue->disk_count);
+    
+    // 计算目录发现速率
     double dir_rate = calculate_rate(state->start_time, state->dir_count);
-    double file_rate = calculate_rate(state->start_time, state->file_count);
-    printf("目录速率: %.2f 个/秒   文件速率: %.2f 个/秒\n", dir_rate, file_rate);
+    printf("└── 目录发现速率: %.2f 个/秒\n", dir_rate);
 
-    // 续传相关信息
+    // 2. 消费者状态 (文件处理 & 落盘)
+    printf("\n[消费者: 结果写入]\n");
+    // async_pending 越大，说明 lstat/写入 慢于 扫描，瓶颈在 IO/Worker
+    // async_pending 接近 0，说明 扫描 慢于 写入，瓶颈在 readdir
+    printf("├── 待写入文件数: %zu (Output Buffer)\n", async_pending);
+    
+    // 计算文件处理完成速率 (基于 state->file_count，这个值现在由 Worker 增加)
+    double file_rate = calculate_rate(state->start_time, state->file_count);
+    printf("└── 文件产出速率: %.2f 个/秒\n", file_rate);
+
+    // === 结果输出 (Output) ===
+    if (cfg->is_output_split_dir) {
+        printf("\n[落盘状态]\n");
+        printf("当前分片: " OUTPUT_SLICE_FORMAT " (行数: %lu / %lu)\n", 
+               state->output_slice_num, state->output_line_count, cfg->output_slice_lines);
+        printf("总产出量: %lu 文件\n", state->file_count);
+    } else {
+        printf("\n[落盘状态]\n");
+        printf("总产出量: %lu 文件\n", state->file_count);
+    }
+
+    // === 断点进度 (Progress) ===
     if (cfg->continue_mode) {
-        printf("正在写入分片号: " PROGRESS_SLICE_FORMAT "\n", state->write_slice_index);
-        printf("正在写入分片行数: %lu\n", state->line_count % DEFAULT_PROGRESS_SLICE_LINES);
-        printf("正在处理分片号: " PROGRESS_SLICE_FORMAT "\n", state->process_slice_index);
-        printf("已处理分片行数: %lu\n", state->completed_count % DEFAULT_PROGRESS_SLICE_LINES );
+        printf("\n[断点保护]\n");
+        // 这里必须清晰：这代表“目录扫描进度”，不代表“文件写入进度”
+        printf("进度记录: 分片 " PROGRESS_SLICE_FORMAT " (已记录目录数: %lu)\n", 
+               state->write_slice_index, state->line_count % DEFAULT_PROGRESS_SLICE_LINES);
     }
     
-    // 当前处理路径
-    printf("当前处理: %s\n", state->current_path ? state->current_path : "无");
-
-    // 下三个待处理路径
-    printf("下三个待处理: \n");
-    QueueEntry *current = queue->active_front;
-    int count = 0;
-    while (current && count < 3) {
-        if (count > 0) printf("\n");
-        printf("%s", current->path);
-        current = current->next;
-        count++;
-    }
-    if (count == 0) printf("无");
-    printf("\n");
-
+    // === 实时预览 ===
+    printf("\n当前扫描目录: %s\n", state->current_path ? state->current_path : "...");
+    
     // 刷新输出
     fflush(stdout);
 }
-
 
 // 线程函数
 void *status_thread_func(void *arg) {

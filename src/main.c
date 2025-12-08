@@ -5,6 +5,7 @@
 #include "output.h"
 #include "idempotency.h"
 #include "smart_queue.h"
+#include "async_worker.h"
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -215,47 +216,90 @@ void init_config(Config *cfg) {
 bool is_absolute_path(const char* path) {
     return path != NULL && path[0] == '/';
 }
-static void process_directory( Config* cfg, RuntimeState* state, SmartQueue* queue, const char* dir_path) {
+static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queue, const char* dir_path) {
     DIR *dir = opendir(dir_path);
     if (!dir) {
         verbose_printf(cfg, 1, "无法打开目录: %s\n", dir_path);
-        return ;
+        return;
     }
 
-    // === 原 process_directory 的逻辑被移到这里 ===
     struct dirent *child_entry;
     while ((child_entry = readdir(dir)) != NULL) {
-        if (strcmp(child_entry->d_name, ".") == 0 || 
-            strcmp(child_entry->d_name, "..") == 0) {
-            continue;
-        }
-        
-        char full_path[MAX_PATH_LENGTH];
-        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, child_entry->d_name);
-        
-        // 对每个子条目，只执行一次 lstat
-        struct stat info;
-        if (lstat(full_path, &info) != 0) {
-            verbose_printf(cfg, 1, "无法获取文件状态: %s\n", full_path);
+        // 跳过 . 和 ..
+        if (child_entry->d_name[0] == '.' && 
+           (child_entry->d_name[1] == '\0' || (child_entry->d_name[1] == '.' && child_entry->d_name[2] == '\0'))) {
             continue;
         }
 
-        // 根据 lstat 结果进行处理
-        if (S_ISDIR(info.st_mode)) {
-            // 如果是目录，则将其路径入队，等待后续处理
+        // 拼凑全路径 (这个是纯内存操作，很快)
+        char full_path[MAX_PATH_LENGTH];
+        // 优化：尽量避免 snprintf，它稍微慢一点，但在路径拼接上还行。如果追求极致，可用 memcpy。
+        int n = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, child_entry->d_name);
+        if (n >= MAX_PATH_LENGTH) continue; // 路径太长保护
+
+        // === 优化核心开始 ===
+        
+        bool is_dir = false;
+        bool need_stat = false;
+        struct stat info;
+        memset(&info, 0, sizeof(info)); // 初始化防止垃圾数据
+
+        // 1. 判断是否真的需要 stat
+        // 如果用户要求显示 size, time, user, group，或者开启了断点续传(需要dev/ino做去重)，那就必须 stat
+        if (cfg->size || cfg->mtime || cfg->atime || cfg->user || cfg->group || cfg->continue_mode) {
+            need_stat = true;
+        }
+
+        // 2. 利用 d_type 预判，省掉 stat
+        if (child_entry->d_type != DT_UNKNOWN) {
+            if (child_entry->d_type == DT_DIR) {
+                is_dir = true;
+            }
+            // 如果不需要元数据，且我们已经知道它是不是目录，就不需要 stat 了！
+            if (!need_stat) {
+                // Do nothing here, we skip lstat
+            } else {
+                // 如果需要元数据，还是得 stat
+                if (lstat(full_path, &info) != 0) {
+                    verbose_printf(cfg, 1, "无法获取文件状态: %s\n", full_path);
+                    continue;
+                }
+            }
+        } else {
+            // 如果 d_type 是 UNKNOWN (某些文件系统不支持)，那必须 stat
+            if (lstat(full_path, &info) != 0) {
+                continue;
+            }
+            if (S_ISDIR(info.st_mode)) {
+                is_dir = true;
+            }
+        }
+
+        // 3. 分流处理
+        if (is_dir) {
+            // 目录处理
+            // 注意：如果 continue_mode 开启，smart_enqueue 内部可能还需要 stat 里的 st_dev/st_ino
+            // 所以上面强制了 continue_mode -> need_stat = true
+            
+            // 如果之前没 stat (因为不需要元数据)，但 enqueue 可能需要 info (尽管 info 是空的)
+            // 这里我们需要确保 smart_enqueue 能处理空的 info，或者只传路径
             smart_enqueue(cfg, queue, full_path, &info);
+            
             if (cfg->continue_mode) {
                 record_path(cfg, state, full_path, &info);
             }
-            // 2. 遵循 print_dir 逻辑，输出到目录信息流
             state->dir_count++;
             if (cfg->print_dir) {
                 fprintf(state->dir_info_fp, "目录: %s\n", full_path);
             }
         } else {
-            state->file_count++;
-            format_output(cfg, state, full_path, &info);
+            // === 变化在这里 ===
+            // 以前是：lstat -> format_output
+            // 现在是：直接扔进队列，马上回头处理下一个
+            async_worker_push_file(full_path);
+            // state->file_count++; // 这个计数器最好移到 worker 里加，或者这里加表示“扫描数”，worker 里加表示“落盘数”
         }
+        // === 优化核心结束 ===
     }
     
     closedir(dir);
