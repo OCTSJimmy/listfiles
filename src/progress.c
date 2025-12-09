@@ -205,7 +205,7 @@ void restore_progress(const Config *cfg, SmartQueue *queue, RuntimeState *state)
             }
             path_buffer[path_len] = '\0'; // 添加字符串结束符
             
-            QueueEntry *entry = safe_malloc(sizeof(QueueEntry));
+            ScanNode *entry = safe_malloc(sizeof(ScanNode));
             entry->path = strdup(path_buffer);
             entry->next = NULL;
             add_to_buffer(queue, entry);

@@ -12,7 +12,7 @@
 #include <errno.h>    // for ETIMEDOUT
 
 static struct {
-    AsyncNode *head, *tail;
+    WriteNode *head, *tail;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     bool stop_flag;
@@ -77,7 +77,7 @@ static void *worker_thread_func(void *arg) {
     g_worker.last_flush_time = time(NULL);
 
     while (true) {
-        AsyncNode *node = NULL;
+        WriteNode *node = NULL;
         pthread_mutex_lock(&g_worker.mutex);
         
         while (g_worker.head == NULL && !g_worker.stop_flag) {
@@ -136,7 +136,7 @@ static void *worker_thread_func(void *arg) {
                 // verbose_printf(g_worker.cfg, 2, "Checkpoint saved: slice %lu, count %lu\n", 
                 //                node->progress.process_slice_index, node->progress.processed_count);
             }
-            
+            free(node->path);
             free(node);
         }
 
@@ -168,8 +168,8 @@ void async_worker_init(const Config *cfg, RuntimeState *state) {
     pthread_detach(tid); 
 }
 
-void async_worker_push_file(const char *path) {
-    AsyncNode *node = safe_malloc(sizeof(AsyncNode));
+void push_write_task_file(const char *path) {
+    WriteNode *node = safe_malloc(sizeof(WriteNode));
     node->type = NODE_TYPE_FILE;
     node->path = strdup(path); 
     node->next = NULL;
@@ -185,8 +185,8 @@ void async_worker_push_file(const char *path) {
     pthread_cond_signal(&g_worker.cond);
     pthread_mutex_unlock(&g_worker.mutex);
 }
-void async_worker_push_checkpoint(const RuntimeState *current_state) {
-    AsyncNode *node = safe_malloc(sizeof(AsyncNode));
+void push_write_task_checkpoint(const RuntimeState *current_state) {
+    WriteNode *node = safe_malloc(sizeof(WriteNode));
     node->type = NODE_TYPE_CHECKPOINT;
     node->path = NULL;
     

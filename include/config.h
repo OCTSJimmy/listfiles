@@ -81,17 +81,20 @@ typedef struct GroupCacheEntry {
     struct GroupCacheEntry *next;
 } GroupCacheEntry;
 
-// 智能队列项
-typedef struct QueueEntry {
+// ===【重命名：QueueEntry -> ScanNode】===
+// 这是一个“扫描任务节点”，用于目录遍历队列
+typedef struct ScanNode {
     char *path;
-    struct QueueEntry *next;
-} QueueEntry;
+    struct ScanNode *next;
+} ScanNode;
 
 // 智能队列结构
 typedef struct {
-    QueueEntry *active_front, *active_rear;
-    QueueEntry *buffer_front, *buffer_rear;
+    // 队列指针全部改为 ScanNode
+    ScanNode *active_front, *active_rear;
+    ScanNode *buffer_front, *buffer_rear;
     size_t active_count, buffer_count, disk_count;
+    
     FILE *overflow_file;
     char overflow_name[256];
     size_t max_mem_items, low_watermark;
@@ -101,9 +104,10 @@ typedef struct {
     int overflow_file_count;
     size_t items_per_file;
     size_t current_file_items;
-// === 新增：空闲节点池 ===
-    QueueEntry *free_list_head;  // 回收站的链表头
-    size_t free_list_count;      // (可选) 统计池子里有多少闲置节点，防止无限膨胀
+
+    // 空闲节点池
+    ScanNode *free_list_head; 
+    size_t free_list_count;
 } SmartQueue;
 
 // 全局配置

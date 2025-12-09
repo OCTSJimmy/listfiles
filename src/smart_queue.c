@@ -14,20 +14,20 @@
 
 
 // 从池中获取一个节点
-QueueEntry* alloc_node(SmartQueue *queue) {
+ScanNode* alloc_node(SmartQueue *queue) {
     if (queue->free_list_head) {
         // 1. 命中缓存：从回收站头部取下一个
-        QueueEntry *node = queue->free_list_head;
+        ScanNode *node = queue->free_list_head;
         queue->free_list_head = node->next; // 链表头后移
         queue->free_list_count--;
         return node;
     } else {
         // 2. 未命中：找系统申请
-        return safe_malloc(sizeof(QueueEntry));
+        return safe_malloc(sizeof(ScanNode));
     }
 }
 
-void recycle_node(SmartQueue *queue, QueueEntry *node) {
+void recycle_scan_node(SmartQueue *queue, ScanNode *node) {
     // 策略：如果池子太大（比如存了10万个闲置节点），可以真 free 掉一部分
     // 这里简单起见，全部回收
     
@@ -44,7 +44,7 @@ void recycle_node(SmartQueue *queue, QueueEntry *node) {
 }
 
 // 将条目加入缓存区(内部函数)
-void add_to_buffer(SmartQueue *queue, QueueEntry *entry) {
+void add_to_buffer(SmartQueue *queue, ScanNode *entry) {
     entry->next = NULL;
     if (!queue->buffer_rear) {
         queue->buffer_front = queue->buffer_rear = entry;
@@ -56,7 +56,7 @@ void add_to_buffer(SmartQueue *queue, QueueEntry *entry) {
 }
 
 // 将条目加入执行区(内部函数)
-void add_to_active(SmartQueue *queue, QueueEntry *entry) {
+void add_to_active(SmartQueue *queue, ScanNode *entry) {
     entry->next = NULL;
     if (!queue->active_rear) {
         queue->active_front = queue->active_rear = entry;
@@ -128,8 +128,8 @@ void flush_buffer_to_disk(const Config *cfg, SmartQueue *queue) {
     }
 
     // 批量写入缓存区所有条目
-    QueueEntry *current = queue->buffer_front;
-    QueueEntry *next_entry;
+    ScanNode *current = queue->buffer_front;
+    ScanNode *next_entry;
     while (current) {
         size_t path_len = strlen(current->path);
 
@@ -232,7 +232,7 @@ void load_batch_from_disk(const Config *cfg, SmartQueue *queue) {
     while (loaded < batch_size && queue->disk_count > 0 && 
            fread(&path_len, sizeof(size_t), 1, queue->overflow_file) == 1) {
         
-        QueueEntry *entry = safe_malloc(sizeof(QueueEntry));
+        ScanNode *entry = safe_malloc(sizeof(ScanNode));
         entry->path = safe_malloc(path_len + 1); // 为 '\0' 分配空间
 
         // 读取路径字符串和 stat 结构体
@@ -372,7 +372,7 @@ void smart_enqueue(const Config *cfg, SmartQueue *queue, const char *path, const
     }
 
     // verbose_printf(cfg, 5, "智能入队: %s\n", path);
-    QueueEntry *entry = alloc_node(queue);
+    ScanNode *entry = alloc_node(queue);
     if (!entry) {
         perror("分配节点失败");
         return;
@@ -393,7 +393,7 @@ void smart_enqueue(const Config *cfg, SmartQueue *queue, const char *path, const
 
 
 // 智能出队(优化版)
-QueueEntry *smart_dequeue(const Config *cfg, SmartQueue *queue, RuntimeState *state) {
+ScanNode *smart_dequeue(const Config *cfg, SmartQueue *queue, RuntimeState *state) {
     // 仅当 active 队列低于低水位线时，才尝试补充
     if (queue->active_count < queue->low_watermark) {
         refill_active(cfg, queue);
@@ -405,7 +405,7 @@ QueueEntry *smart_dequeue(const Config *cfg, SmartQueue *queue, RuntimeState *st
     }
 
     // 从 active 队列头部取出一个条目
-    QueueEntry *entry = queue->active_front;
+    ScanNode *entry = queue->active_front;
     queue->active_front = entry->next;
     if (!queue->active_front) {
         queue->active_rear = NULL;
@@ -424,14 +424,14 @@ QueueEntry *smart_dequeue(const Config *cfg, SmartQueue *queue, RuntimeState *st
 // 清理智能队列(优化版)
 void cleanup_smart_queue(SmartQueue *queue) {
     while (queue->active_front) {
-        QueueEntry *entry = queue->active_front;
+        ScanNode *entry = queue->active_front;
         queue->active_front = entry->next;
         free(entry->path);
         free(entry);
     }
     
     while (queue->buffer_front) {
-        QueueEntry *entry = queue->buffer_front;
+        ScanNode *entry = queue->buffer_front;
         queue->buffer_front = entry->next;
         free(entry->path);
         free(entry);
@@ -465,7 +465,7 @@ void cleanup_smart_queue(SmartQueue *queue) {
         queue->temp_dir = NULL;
     }
     while (queue->free_list_head) {
-        QueueEntry *next = queue->free_list_head->next;
+        ScanNode *next = queue->free_list_head->next;
         free(queue->free_list_head); // 这里的 path 已经是 NULL 了
         queue->free_list_head = next;
     }

@@ -224,6 +224,7 @@ void init_config(Config *cfg) {
 bool is_absolute_path(const char* path) {
     return path != NULL && path[0] == '/';
 }
+
 static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queue, const char* dir_path) {
     DIR *dir = opendir(dir_path);
     if (!dir) {
@@ -307,9 +308,9 @@ static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queu
             }
         } else {
             // 直接推给 Worker，stat 信息已在 info 中（如果 need_stat 为真）
-            // 注意：目前的 async_worker_push_file 只接受 path，worker 内部会再次 lstat
+            // 注意：目前的 push_write_task_file 只接受 path，worker 内部会再次 lstat
             // 为了保持架构一致，这里暂不传递 info，如果追求极致性能，以后可以改造 worker 接受 info
-            async_worker_push_file(full_path);
+            push_write_task_file(full_path);
         }
     }
     
@@ -362,11 +363,11 @@ void traverse_files(Config *cfg, RuntimeState *state) {
     } else {
         state->file_count++;
         // 这里如果是单文件，直接走同步输出或推给 worker 均可，这里推给 worker 保持一致
-        async_worker_push_file(cfg->target_path); 
+        push_write_task_file(cfg->target_path); 
     }
 
     while (true) {
-        QueueEntry *entry = smart_dequeue(cfg, &queue, state);
+        ScanNode *entry = smart_dequeue(cfg, &queue, state);
         if (!entry) break;
 
         state->current_path = entry->path;
@@ -377,10 +378,10 @@ void traverse_files(Config *cfg, RuntimeState *state) {
         // 这个检查点携带了当前的 state->process_slice_index 等进度信息
         // 它会进入队列排队，排在刚才 process_directory 产生的所有文件之后
         if (cfg->continue_mode) {
-            async_worker_push_checkpoint(state);
+            push_write_task_checkpoint(state);
         }
 
-        recycle_node(&queue, entry);
+        recycle_scan_node(&queue, entry);
     }
     verbose_printf(cfg, 1, "遍历完成，等待数据落盘...\n");
 

@@ -5,17 +5,17 @@
 typedef enum {
     NODE_TYPE_FILE,
     NODE_TYPE_CHECKPOINT
-} AsyncNodeType;
+} WriteNodeType;
 
 // 初始化异步工作线程
 void async_worker_init(const Config *cfg, RuntimeState *state);
 
 // 提交一个文件路径 (主线程调用)
-void async_worker_push_file(const char *path);
+void push_write_task_file(const char *path);
 
 // 提交一个进度检查点 (主线程调用)
 // 这意味着：在此之前的所有文件都必须落盘，然后保存 state 中的进度
-void async_worker_push_checkpoint(const RuntimeState *current_state);
+void push_write_task_checkpoint(const RuntimeState *current_state);
 
 // 等待处理完毕并关闭
 void async_worker_shutdown();
@@ -29,12 +29,12 @@ typedef struct {
     unsigned long output_line_count;
 } ProgressSnapshot;
 
-typedef struct AsyncNode {
-    AsyncNodeType type;
+typedef struct WriteNode {
+    WriteNodeType type;
     char *path;               // 仅 TYPE_FILE 有效
     ProgressSnapshot progress; // 仅 TYPE_CHECKPOINT 有效
-    struct AsyncNode *next;
-} AsyncNode;
+    struct WriteNode *next;
+} WriteNode;
 
 
 #endif
