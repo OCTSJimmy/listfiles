@@ -13,4 +13,6 @@ void async_worker_push_file(const char *path);
 // 等待所有任务处理完毕并关闭 (主线程调用)
 void async_worker_shutdown();
 size_t async_worker_get_queue_size();
+void get_next_timeout(struct timespec *ts);
+
 #endif

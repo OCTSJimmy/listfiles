@@ -56,12 +56,6 @@ static void perform_flush() {
     }
 }
 
-// 辅助函数：计算下一次超时的绝对时间
-static void get_next_timeout(struct timespec *ts) {
-    clock_gettime(CLOCK_REALTIME, ts);
-    ts->tv_sec += FLUSH_INTERVAL_SEC;
-}
-
 // Getter (保持不变)
 size_t async_worker_get_queue_size() {
     pthread_mutex_lock(&g_worker.mutex);
@@ -100,7 +94,8 @@ static void *worker_thread_func(void *arg) {
                 // 已经超时了，不要睡了，直接去刷盘（通过跳出循环）
                 break; 
             } else {
-                ts.tv_sec = next_flush; // 设置绝对截止时间
+                // 使用基于上次刷盘时间计算的超时时间
+                ts.tv_sec = next_flush;
             }
 
             int rc = pthread_cond_timedwait(&g_worker.cond, &g_worker.mutex, &ts);
@@ -158,6 +153,7 @@ static void *worker_thread_func(void *arg) {
         }
 
 check_flush:
+        ; // 添加空语句解决标签后直接声明变量的问题
         // === 双轨并行检测 ===
         // 1. 数量检测
         bool need_flush_by_count = (g_worker.pending_count >= BATCH_FLUSH_SIZE);
