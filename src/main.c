@@ -29,7 +29,7 @@ void show_help() {
     printf("  -V, --version          显示版本信息\n");
     printf("  -F, --format=格式      自定义输出格式,支持占位符:\n");
     printf("                          %%p = 路径, %%s = 大小, %%u = 用户, %%g = 组\n");
-    printf("                          %%m = 修改时间, %%a = 访问时间\n\n");
+    printf("                          %%m = 修改时间, %%a = 访问时间, %%M = 模式\n\n");
     printf("  -o, --output=文件      将结果写入指定文件 (默认: %s)\n", DEFAULT_OUTPUT_FILE);
     printf("  -O, --output-split=目录 将结果按行拆分到指定目录 (默认: %lu)\n",(long unsigned int) DEFAULT_OUTPUT_SPLIT_DIR);
     printf("      --max-slice=行数   每个输出切片的最大行数 (默认: %lu)\n", (long unsigned int) DEFAULT_OUTPUT_SLICE_LINES);
@@ -47,6 +47,7 @@ void show_help() {
     printf("  --mtime                包含修改时间\n");
     printf("  --atime                包含访问时间\n");
     printf("  --follow-symlinks      跟踪符号链接\n\n");
+    printf("  --mode                包含文件模式 (八进制, 如 100644)\n\n");
     printf("示例:\n");
     printf("  listfiles -p /data --continue --format=\"%%p|%%s|%%u|%%m\"\n");
     printf("  listfiles -p /home --size --user --mtime > 文件列表.csv\n");

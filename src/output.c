@@ -150,6 +150,7 @@ void precompile_format(Config *cfg) {
                 case 'g': seg.type = FMT_GROUP; break;
                 case 'm': seg.type = FMT_MTIME; break;
                 case 'a': seg.type = FMT_ATIME; break;
+                case 'M': seg.type = FMT_MODE; break;
                 default:  // 无效占位符当作普通文本
                     seg.type = FMT_TEXT;
                     seg.text = safe_malloc(3);
@@ -346,6 +347,11 @@ void format_output(const Config *cfg, RuntimeState *state, const char *path, con
                     break;
                 case FMT_ATIME:
                     fputs(format_time(info->st_atime), output);
+                    break;
+                case FMT_MODE:  // <--- 新增这块逻辑
+                    // 输出完整的 st_mode (类型 + 权限)
+                    // 使用 %06o 保证格式对齐，例如 100644 (文件), 040755 (目录), 120777 (软链)
+                    fprintf(output, "%06o", info->st_mode); 
                     break;
             }
         }

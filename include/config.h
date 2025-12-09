@@ -47,7 +47,8 @@ typedef enum {
     FMT_USER,
     FMT_GROUP,
     FMT_MTIME,
-    FMT_ATIME
+    FMT_ATIME,
+    FMT_MODE
 } FormatType;
 
 // =======================================================
