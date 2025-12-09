@@ -31,5 +31,6 @@ int acquire_lock(const Config *cfg, RuntimeState *state);
 void release_lock(RuntimeState *state);
 
 void save_config_to_disk(const Config* cfg);
+char *get_index_filename(const char *base);
 
 #endif // PROGRESS_H

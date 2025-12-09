@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <dirent.h>
+#include <sys/time.h>
 
 void show_version() {
     printf("listfiles 版本 %s\n", VERSION);
@@ -51,6 +52,12 @@ void show_help() {
     printf("示例:\n");
     printf("  listfiles -p /data --continue --format=\"%%p|%%s|%%u|%%m\"\n");
     printf("  listfiles -p /home --size --user --mtime > 文件列表.csv\n");
+}
+// === QoS 辅助函数 ===
+static long long current_timestamp() {
+    struct timeval te; 
+    gettimeofday(&te, NULL); // gettimeofday 开销极小
+    return te.tv_sec*1000000LL + te.tv_usec;
 }
 
 // =======================================================
@@ -224,68 +231,73 @@ static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queu
         return;
     }
 
+    // === QoS 状态变量 ===
+    long long current_sleep = START_SLEEP_US; 
+    long long op_start, op_end, duration;
+    
     struct dirent *child_entry;
-    while ((child_entry = readdir(dir)) != NULL) {
+    while (true) {
+        // QoS: 测量 readdir 耗时作为压力探针
+        op_start = current_timestamp();
+        child_entry = readdir(dir);
+        op_end = current_timestamp();
+
+        if (child_entry == NULL) break;
+
+        // QoS: 动态反馈调节
+        duration = op_end - op_start;
+        if (duration < 2000) { 
+            // <2ms: 存储很闲，加速 (减少5%睡眠)
+            current_sleep = current_sleep * 0.95;
+            if (current_sleep < MIN_SLEEP_US) current_sleep = MIN_SLEEP_US;
+        } else if (duration > 100000) { 
+            // >100ms: 存储卡了，急刹车 (翻倍+50ms)
+            current_sleep = (current_sleep * 2) + 50000;
+        } else if (duration > 10000) {
+            // >10ms: 有点压力，缓慢减速 (增加10%)
+            current_sleep = current_sleep * 1.1;
+        }
+        if (current_sleep > MAX_SLEEP_US) current_sleep = MAX_SLEEP_US;
+
+        // 执行限流
+        if (current_sleep > 0) usleep(current_sleep);
+
+
         // 跳过 . 和 ..
         if (child_entry->d_name[0] == '.' && 
            (child_entry->d_name[1] == '\0' || (child_entry->d_name[1] == '.' && child_entry->d_name[2] == '\0'))) {
             continue;
         }
 
-        // 拼凑全路径 (这个是纯内存操作，很快)
         char full_path[MAX_PATH_LENGTH];
-        // 优化：尽量避免 snprintf，它稍微慢一点，但在路径拼接上还行。如果追求极致，可用 memcpy。
         int n = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, child_entry->d_name);
-        if (n >= MAX_PATH_LENGTH) continue; // 路径太长保护
+        if (n >= MAX_PATH_LENGTH) continue;
 
-        // === 优化核心开始 ===
-        
         bool is_dir = false;
         bool need_stat = false;
         struct stat info;
-        memset(&info, 0, sizeof(info)); // 初始化防止垃圾数据
+        memset(&info, 0, sizeof(info));
 
-        // 1. 判断是否真的需要 stat
-        // 如果用户要求显示 size, time, user, group，或者开启了断点续传(需要dev/ino做去重)，那就必须 stat
-        if (cfg->size || cfg->mtime || cfg->atime || cfg->user || cfg->group || cfg->continue_mode) {
+        if (cfg->size || cfg->mtime || cfg->atime || cfg->user || cfg->group || cfg->continue_mode || cfg->format) {
             need_stat = true;
         }
 
-        // 2. 利用 d_type 预判，省掉 stat
+        // d_type 优化
         if (child_entry->d_type != DT_UNKNOWN) {
-            if (child_entry->d_type == DT_DIR) {
-                is_dir = true;
-            }
-            // 如果不需要元数据，且我们已经知道它是不是目录，就不需要 stat 了！
-            if (!need_stat) {
-                // Do nothing here, we skip lstat
-            } else {
-                // 如果需要元数据，还是得 stat
+            if (child_entry->d_type == DT_DIR) is_dir = true;
+            if (need_stat) {
                 if (lstat(full_path, &info) != 0) {
                     verbose_printf(cfg, 1, "无法获取文件状态: %s\n", full_path);
                     continue;
                 }
             }
         } else {
-            // 如果 d_type 是 UNKNOWN (某些文件系统不支持)，那必须 stat
-            if (lstat(full_path, &info) != 0) {
-                continue;
-            }
-            if (S_ISDIR(info.st_mode)) {
-                is_dir = true;
-            }
+            if (lstat(full_path, &info) != 0) continue;
+            if (S_ISDIR(info.st_mode)) is_dir = true;
         }
 
-        // 3. 分流处理
         if (is_dir) {
-            // 目录处理
-            // 注意：如果 continue_mode 开启，smart_enqueue 内部可能还需要 stat 里的 st_dev/st_ino
-            // 所以上面强制了 continue_mode -> need_stat = true
-            
-            // 如果之前没 stat (因为不需要元数据)，但 enqueue 可能需要 info (尽管 info 是空的)
-            // 这里我们需要确保 smart_enqueue 能处理空的 info，或者只传路径
             smart_enqueue(cfg, queue, full_path, &info);
-            
             if (cfg->continue_mode) {
                 record_path(cfg, state, full_path, &info);
             }
@@ -294,17 +306,16 @@ static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queu
                 fprintf(state->dir_info_fp, "目录: %s\n", full_path);
             }
         } else {
-            // === 变化在这里 ===
-            // 以前是：lstat -> format_output
-            // 现在是：直接扔进队列，马上回头处理下一个
+            // 直接推给 Worker，stat 信息已在 info 中（如果 need_stat 为真）
+            // 注意：目前的 async_worker_push_file 只接受 path，worker 内部会再次 lstat
+            // 为了保持架构一致，这里暂不传递 info，如果追求极致性能，以后可以改造 worker 接受 info
             async_worker_push_file(full_path);
-            // state->file_count++; // 这个计数器最好移到 worker 里加，或者这里加表示“扫描数”，worker 里加表示“落盘数”
         }
-        // === 优化核心结束 ===
     }
     
     closedir(dir);
 }
+
 /**********************
  * 主遍历函数
  **********************/
@@ -312,22 +323,23 @@ static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queu
 void traverse_files(Config *cfg, RuntimeState *state) {
     SmartQueue queue;
     init_smart_queue(&queue);
-    // 初始化线程共享状态
+
+    // ===【修复点1：启动异步线程】===
+    // 必须在开始生产数据前启动消费者
+    verbose_printf(cfg, 1, "启动异步写入流水线...\n");
+    async_worker_init(cfg, state);
+
     ThreadSharedState shared = {
         .cfg = cfg,
         .state = state,
         .queue = &queue,
         .running = 1
     };
-    // pthread_mutex_init(&shared.mutex, NULL);
-     // 创建监控线程
     pthread_t status_thread;
     int thread_rc = pthread_create(&status_thread, NULL, status_thread_func, &shared);
     if (thread_rc != 0) {
         fprintf(stderr, "创建监控线程失败: %d\n", thread_rc);
         shared.running = 0;
-    } else {
-        verbose_printf(cfg, 1, "监控线程已启动\n");
     }
 
     if (cfg->continue_mode) {
@@ -341,50 +353,42 @@ void traverse_files(Config *cfg, RuntimeState *state) {
         exit(EXIT_FAILURE);
     }
 
-    // 检查根路径本身是文件还是目录
     if (S_ISDIR(root_info.st_mode)) {
         state->dir_count++;
-        // 如果是目录，则遵循 print_dir 逻辑
-        if (cfg->print_dir) {
-            fprintf(state->dir_info_fp, "目录: %s\n", cfg->target_path);
-        }
-        // 将其作为第一个要扫描的目录入队
         smart_enqueue(cfg, &queue, cfg->target_path, &root_info);
         if (cfg->continue_mode) {
             record_path(cfg, state, cfg->target_path, &root_info);
         }
     } else {
-        // 如果根路径本身就是个文件，直接输出它
         state->file_count++;
-        format_output(cfg, state, cfg->target_path, &root_info );
+        // 这里如果是单文件，直接走同步输出或推给 worker 均可，这里推给 worker 保持一致
+        async_worker_push_file(cfg->target_path); 
     }
 
-    // FILE *dir_output = state->dir_info_fp ? state->dir_info_fp : stderr;
-    // 主循环：不断从队列中取出目录进行扫描
     while (true) {
         QueueEntry *entry = smart_dequeue(cfg, &queue, state);
-        if (!entry) break; // 队列为空，遍历完成
+        if (!entry) break;
 
-        char *dir_path = entry->path;
-        state->current_path = dir_path;
+        state->current_path = entry->path;
         process_directory(cfg, state, &queue, entry->path);
         
-        // free(entry->path);
-        // free(entry);
+        // ===【架构修改：提交进度快照】===
+        // 当一个目录处理完，且 continue_mode 开启时，我们生成一个检查点
+        // 这个检查点携带了当前的 state->process_slice_index 等进度信息
+        // 它会进入队列排队，排在刚才 process_directory 产生的所有文件之后
+        if (cfg->continue_mode) {
+            async_worker_push_checkpoint(state);
+        }
+
         recycle_node(&queue, entry);
     }
-    verbose_printf(cfg, 1, "完成: %lu 目录, %lu 文件\n", 
-               state->dir_count, state->file_count);
-    
+    verbose_printf(cfg, 1, "遍历完成，等待数据落盘...\n");
 
-        // 停止监控线程
+    // ===【修复点2：关闭并刷盘】===
+    async_worker_shutdown();
+
     shared.running = 0;
-    if (thread_rc == 0) {
-        pthread_join(status_thread, NULL);
-        verbose_printf(cfg, 1, "监控线程已结束\n");
-    }
-
-    // pthread_mutex_destroy(&shared.mutex);
+    if (thread_rc == 0) pthread_join(status_thread, NULL);
 
     cleanup_smart_queue(&queue);
     cleanup_cache(state);
@@ -393,7 +397,6 @@ void traverse_files(Config *cfg, RuntimeState *state) {
         cleanup_progress(cfg, state);
         release_lock(state);
     }
-
 }
 
 
@@ -431,8 +434,6 @@ int main(int argc, char *argv[]) {
     init_output_files(&cfg, &state);
     // ===【核心修复点：在这里启动异步写入线程！】===
     // 必须在开始遍历之前启动，否则数据全堆在内存里发不出去
-    verbose_printf(&cfg, 1, "启动异步写入线程...\n");
-    async_worker_init(&cfg, &state); 
     // ===========================================
 
     setvbuf(stdout, NULL, _IONBF, 0); // (这行之前建议删掉，如果没删也没事，因为现在主要靠 async_worker 写文件)
@@ -442,8 +443,6 @@ int main(int argc, char *argv[]) {
 
     // ===【核心修复点：在这里关闭并等待刷盘！】===
     // 遍历结束后，必须通知工人下班，并把最后残留在内存里的数据刷入磁盘
-    verbose_printf(&cfg, 1, "等待异步写入完成...\n");
-    async_worker_shutdown();
     // ===========================================
 
     // 4. 清理工作

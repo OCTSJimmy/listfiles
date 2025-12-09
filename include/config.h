@@ -31,6 +31,12 @@
 #define UID_CACHE_SIZE 4096
 #define GID_CACHE_SIZE 4096
 #define HASH_SET_INITIAL_SIZE 2000003 
+// 定义初始休眠时间：50ms (极度保守，探测冰面)
+#define START_SLEEP_US 50000 
+#define MIN_SLEEP_US 0
+#define MAX_SLEEP_US 500000
+#define BATCH_FLUSH_SIZE 5000 
+#define FLUSH_INTERVAL_SEC 5
 
 #define min_size(a, b) ((a) < (b) ? (a) : (b))
 #define max_size(a, b) ((a) > (b) ? (a) : (b))
