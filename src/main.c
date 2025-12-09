@@ -429,9 +429,22 @@ int main(int argc, char *argv[]) {
 
     save_config_to_disk(&cfg);
     init_output_files(&cfg, &state);
-    setvbuf(stdout, NULL, _IONBF, 0);
+    // ===【核心修复点：在这里启动异步写入线程！】===
+    // 必须在开始遍历之前启动，否则数据全堆在内存里发不出去
+    verbose_printf(&cfg, 1, "启动异步写入线程...\n");
+    async_worker_init(&cfg, &state); 
+    // ===========================================
+
+    setvbuf(stdout, NULL, _IONBF, 0); // (这行之前建议删掉，如果没删也没事，因为现在主要靠 async_worker 写文件)
     
+    // 开始干活
     traverse_files(&cfg, &state);
+
+    // ===【核心修复点：在这里关闭并等待刷盘！】===
+    // 遍历结束后，必须通知工人下班，并把最后残留在内存里的数据刷入磁盘
+    verbose_printf(&cfg, 1, "等待异步写入完成...\n");
+    async_worker_shutdown();
+    // ===========================================
 
     // 4. 清理工作
     if (cfg.format) {
