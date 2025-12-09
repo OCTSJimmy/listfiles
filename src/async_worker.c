@@ -77,7 +77,7 @@ static void *worker_thread_func(void *arg) {
     g_worker.last_flush_time = time(NULL);
 
     while (true) {
-        WriteNode *node = NULL;
+        WriteNode *writeNode = NULL;
         pthread_mutex_lock(&g_worker.mutex);
         
         while (g_worker.head == NULL && !g_worker.stop_flag) {
@@ -93,8 +93,8 @@ static void *worker_thread_func(void *arg) {
         }
 
         if (g_worker.head != NULL) {
-            node = g_worker.head;
-            g_worker.head = node->next;
+            writeNode = g_worker.head;
+            g_worker.head = writeNode->next;
             if (g_worker.head == NULL) g_worker.tail = NULL;
             g_worker.queue_count--; 
         } else if (g_worker.stop_flag) {
@@ -103,8 +103,8 @@ static void *worker_thread_func(void *arg) {
         }
         pthread_mutex_unlock(&g_worker.mutex);
 
-        if (node) {
-            if (node->type == NODE_TYPE_FILE) {
+        if (writeNode) {
+            if (writeNode->type == NODE_TYPE_FILE) {
                 // === 处理文件 ===
                 struct stat info;
                 bool stat_success = false;
@@ -112,7 +112,7 @@ static void *worker_thread_func(void *arg) {
                 // 只有需要元数据时才 lstat
                 if (g_worker.cfg->size || g_worker.cfg->user || g_worker.cfg->mtime || 
                     g_worker.cfg->group || g_worker.cfg->atime || g_worker.cfg->format) {
-                    if (lstat(node->path, &info) == 0) stat_success = true;
+                    if (lstat(writeNode->path, &info) == 0) stat_success = true;
                 } else {
                     memset(&info, 0, sizeof(info));
                     stat_success = true; 
@@ -120,25 +120,25 @@ static void *worker_thread_func(void *arg) {
 
                 if (stat_success) {
                     g_worker.state->file_count++; // Worker 更新文件产出计数
-                    format_output(g_worker.cfg, g_worker.state, node->path, &info);
+                    format_output(g_worker.cfg, g_worker.state, writeNode->path, &info);
                     g_worker.pending_count++;
                 }
-                free(node->path);
+                free(writeNode->path);
 
-            } else if (node->type == NODE_TYPE_CHECKPOINT) {
+            } else if (writeNode->type == NODE_TYPE_CHECKPOINT) {
                 // === 处理检查点 (进度3) ===
                 // 1. 先强制刷盘 Output，确保之前的文件物理落盘
                 perform_flush_output();
                 
                 // 2. 然后保存进度索引
-                perform_save_progress(&node->progress);
-                if (node->path) {
-                    free(node->path);
+                perform_save_progress(&writeNode->progress);
+                if (writeNode->path) {
+                    free(writeNode->path);
                 }
                 // verbose_printf(g_worker.cfg, 2, "Checkpoint saved: slice %lu, count %lu\n", 
-                //                node->progress.process_slice_index, node->progress.processed_count);
+                //                writeNode->progress.process_slice_index, writeNode->progress.processed_count);
             }
-            free(node);
+            free(writeNode);
         }
 
         // 自动刷盘逻辑 (仅针对 Output)
@@ -170,42 +170,42 @@ void async_worker_init(const Config *cfg, RuntimeState *state) {
 }
 
 void push_write_task_file(const char *path) {
-    WriteNode *node = safe_malloc(sizeof(WriteNode));
-    node->type = NODE_TYPE_FILE;
-    node->path = strdup(path); 
-    node->next = NULL;
+    WriteNode *writeNode = safe_malloc(sizeof(WriteNode));
+    writeNode->type = NODE_TYPE_FILE;
+    writeNode->path = strdup(path); 
+    writeNode->next = NULL;
 
     pthread_mutex_lock(&g_worker.mutex);
     if (g_worker.tail) {
-        g_worker.tail->next = node;
-        g_worker.tail = node;
+        g_worker.tail->next = writeNode;
+        g_worker.tail = writeNode;
     } else {
-        g_worker.head = g_worker.tail = node;
+        g_worker.head = g_worker.tail = writeNode;
     }
     g_worker.queue_count++;
     pthread_cond_signal(&g_worker.cond);
     pthread_mutex_unlock(&g_worker.mutex);
 }
 void push_write_task_checkpoint(const RuntimeState *current_state) {
-    WriteNode *node = safe_malloc(sizeof(WriteNode));
-    node->type = NODE_TYPE_CHECKPOINT;
-    node->path = NULL;
+    WriteNode *writeNode = safe_malloc(sizeof(WriteNode));
+    writeNode->type = NODE_TYPE_CHECKPOINT;
+    writeNode->path = NULL;
     
     // 捕获当前的进度状态快照
-    node->progress.process_slice_index = current_state->process_slice_index;
-    node->progress.processed_count     = current_state->processed_count;
-    node->progress.write_slice_index   = current_state->write_slice_index;
-    node->progress.output_slice_num    = current_state->output_slice_num;
-    node->progress.output_line_count   = current_state->output_line_count;
+    writeNode->progress.process_slice_index = current_state->process_slice_index;
+    writeNode->progress.processed_count     = current_state->processed_count;
+    writeNode->progress.write_slice_index   = current_state->write_slice_index;
+    writeNode->progress.output_slice_num    = current_state->output_slice_num;
+    writeNode->progress.output_line_count   = current_state->output_line_count;
     
-    node->next = NULL;
+    writeNode->next = NULL;
 
     pthread_mutex_lock(&g_worker.mutex);
     if (g_worker.tail) {
-        g_worker.tail->next = node;
-        g_worker.tail = node;
+        g_worker.tail->next = writeNode;
+        g_worker.tail = writeNode;
     } else {
-        g_worker.head = g_worker.tail = node;
+        g_worker.head = g_worker.tail = writeNode;
     }
     g_worker.queue_count++;
     pthread_cond_signal(&g_worker.cond);
