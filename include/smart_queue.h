@@ -20,5 +20,7 @@ void flush_buffer_to_disk(const Config *cfg, SmartQueue *queue);
 void load_batch_from_disk(const Config *cfg, SmartQueue *queue);
 void append_buffer_to_active_O1(SmartQueue *queue);
 void refill_active(const Config *cfg, SmartQueue *queue);
+QueueEntry* alloc_node(SmartQueue *queue);
+void recycle_node(SmartQueue *queue, QueueEntry *node);
 
 #endif // SMART_QUEUE_H

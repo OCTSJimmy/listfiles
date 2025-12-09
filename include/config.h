@@ -12,8 +12,8 @@
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "7.2"
-#define MAX_PATH_LENGTH 65534
+#define VERSION "7.4"
+#define MAX_PATH_LENGTH 2046
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
 #define MAX_SYMLINK_DEPTH 8
@@ -95,6 +95,9 @@ typedef struct {
     int overflow_file_count;
     size_t items_per_file;
     size_t current_file_items;
+// === 新增：空闲节点池 ===
+    QueueEntry *free_list_head;  // 回收站的链表头
+    size_t free_list_count;      // (可选) 统计池子里有多少闲置节点，防止无限膨胀
 } SmartQueue;
 
 // 全局配置

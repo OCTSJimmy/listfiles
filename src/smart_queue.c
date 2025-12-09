@@ -13,6 +13,36 @@
 #include "idempotency.h" // smart_enqueue 需要使用
 
 
+// 从池中获取一个节点
+QueueEntry* alloc_node(SmartQueue *queue) {
+    if (queue->free_list_head) {
+        // 1. 命中缓存：从回收站头部取下一个
+        QueueEntry *node = queue->free_list_head;
+        queue->free_list_head = node->next; // 链表头后移
+        queue->free_list_count--;
+        return node;
+    } else {
+        // 2. 未命中：找系统申请
+        return safe_malloc(sizeof(QueueEntry));
+    }
+}
+
+void recycle_node(SmartQueue *queue, QueueEntry *node) {
+    // 策略：如果池子太大（比如存了10万个闲置节点），可以真 free 掉一部分
+    // 这里简单起见，全部回收
+    
+    // 释放节点挂载的路径字符串 (path 是变长的，不好池化，直接释放)
+    if (node->path) {
+        free(node->path);
+        node->path = NULL;
+    }
+    
+    // 头插法放入回收站
+    node->next = queue->free_list_head;
+    queue->free_list_head = node;
+    queue->free_list_count++;
+}
+
 // 将条目加入缓存区(内部函数)
 void add_to_buffer(SmartQueue *queue, QueueEntry *entry) {
     entry->next = NULL;
@@ -317,6 +347,10 @@ void init_smart_queue(SmartQueue *queue) {
     queue->overflow_file_count = 0;
     queue->items_per_file = 100000;  // 每个文件最多10万条记录
     queue->current_file_items = 0;
+    
+    // === 新增：空闲节点池 ===
+    queue->free_list_head = NULL;  // 回收站的链表头
+    queue->free_list_count = 0;      // (可选) 统计池子里有多少闲置节点，防止无限膨胀
 }
 
 
@@ -338,7 +372,11 @@ void smart_enqueue(const Config *cfg, SmartQueue *queue, const char *path, const
     }
 
     // verbose_printf(cfg, 5, "智能入队: %s\n", path);
-    QueueEntry *entry = safe_malloc(sizeof(QueueEntry));
+    QueueEntry *entry = alloc_node(queue);
+    if (!entry) {
+        perror("分配节点失败");
+        return;
+    }
     entry->path = safe_malloc(strlen(path)+1);
     safe_strcpy(entry->path, path, strlen(path)+1);
     // memcpy(&entry->info, info, sizeof(struct stat));
@@ -425,5 +463,10 @@ void cleanup_smart_queue(SmartQueue *queue) {
         remove(queue->temp_dir);
         free(queue->temp_dir);
         queue->temp_dir = NULL;
+    }
+    while (queue->free_list_head) {
+        QueueEntry *next = queue->free_list_head->next;
+        free(queue->free_list_head); // 这里的 path 已经是 NULL 了
+        queue->free_list_head = next;
     }
 }

@@ -369,8 +369,9 @@ void traverse_files(Config *cfg, RuntimeState *state) {
         state->current_path = dir_path;
         process_directory(cfg, state, &queue, entry->path);
         
-        free(entry->path);
-        free(entry);
+        // free(entry->path);
+        // free(entry);
+        recycle_node(&queue, entry);
     }
     verbose_printf(cfg, 1, "完成: %lu 目录, %lu 文件\n", 
                state->dir_count, state->file_count);
