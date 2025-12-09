@@ -132,11 +132,12 @@ static void *worker_thread_func(void *arg) {
                 
                 // 2. 然后保存进度索引
                 perform_save_progress(&node->progress);
-                
+                if (node->path) {
+                    free(node->path);
+                }
                 // verbose_printf(g_worker.cfg, 2, "Checkpoint saved: slice %lu, count %lu\n", 
                 //                node->progress.process_slice_index, node->progress.processed_count);
             }
-            free(node->path);
             free(node);
         }
 
