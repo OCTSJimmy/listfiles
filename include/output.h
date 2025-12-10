@@ -24,6 +24,6 @@ void *status_thread_func(void *arg);
 void cleanup_cache(RuntimeState *state);
 void close_output_file(FILE *fp);
 void format_mode_str(mode_t mode, char *buf);
-
+double calculate_rate(time_t start_time, unsigned long count);
 
 #endif // OUTPUT_H

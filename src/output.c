@@ -36,6 +36,61 @@ void format_mode_str(mode_t mode, char *buf) {
 // =======================================================
 // lsattr 探测与缓存 (基于 RuntimeState)
 // =======================================================
+// === 新增：更新统计数据 ===
+// 注意：此函数修改了 state，因此需要转换 const 指针
+static void update_statistics(const RuntimeState *c_state) {
+    RuntimeState *state = (RuntimeState *)c_state; // 移除 const
+    Statistics *st = &state->stats;
+    
+    time_t now = time(NULL);
+    
+    // 限制采样频率：每秒只采一次，避免计算过于抖动
+    if (now - st->last_sample_time < 1) {
+        return;
+    }
+    
+    // 1. 存入新样本 (Ring Buffer)
+    st->head_idx = (st->head_idx + 1) % RATE_WINDOW_SIZE;
+    if (st->head_idx == 0 && st->samples[0].timestamp != 0) {
+        st->filled = true;
+    }
+    
+    st->samples[st->head_idx].timestamp = now;
+    st->samples[st->head_idx].dir_count = state->dir_count;
+    st->samples[st->head_idx].file_count = state->file_count;
+    st->last_sample_time = now;
+
+    // 2. 寻找对比样本 (窗口尾部)
+    int tail_idx;
+    if (st->filled) {
+        tail_idx = (st->head_idx + 1) % RATE_WINDOW_SIZE; // 最旧的一个
+    } else {
+        tail_idx = 0; // 刚开始跑，取第一个
+    }
+    
+    // 3. 计算滑动窗口速率
+    RateSample *new_s = &st->samples[st->head_idx];
+    RateSample *old_s = &st->samples[tail_idx];
+    
+    double time_diff = difftime(new_s->timestamp, old_s->timestamp);
+    
+    if (time_diff >= 1.0) {
+        // 目录速率
+        unsigned long dir_diff = new_s->dir_count - old_s->dir_count;
+        st->current_dir_rate = (double)dir_diff / time_diff;
+        if (st->current_dir_rate > st->max_dir_rate) st->max_dir_rate = st->current_dir_rate;
+
+        // 文件速率
+        unsigned long file_diff = new_s->file_count - old_s->file_count;
+        st->current_file_rate = (double)file_diff / time_diff;
+        if (st->current_file_rate > st->max_file_rate) st->max_file_rate = st->current_file_rate;
+    } else {
+        // 刚启动不足1秒，使用全局平均兜底
+        // calculate_rate 是原来的全局算法，可以保留作为 fallback
+        st->current_dir_rate = calculate_rate(state->start_time, state->dir_count);
+        st->current_file_rate = calculate_rate(state->start_time, state->file_count);
+    }
+}
 
 // 查找设备状态 (线程安全)
 static DeviceStatus get_device_status(dev_t dev, RuntimeState *state) {
@@ -146,13 +201,21 @@ const char *get_username(uid_t uid, RuntimeState *state) {
     
     // 缓存未命中,查询系统
     struct passwd *pw = getpwuid(uid);
-    const char *name = pw ? pw->pw_name : "unknown";
+char temp_buf[256]; // 临时缓冲区，足够容纳 name(uid)
+
+    if (pw) {
+        // 找到了：格式化为 "root(0)" 或 "www-data(33)"
+        snprintf(temp_buf, sizeof(temp_buf), "%s(%u)", pw->pw_name, (unsigned int)uid);
+    } else {
+        // 没找到：直接保留原始 UID，例如 "1005"
+        snprintf(temp_buf, sizeof(temp_buf), "%u", (unsigned int)uid);
+    }
     
     // 创建新缓存项
     UserCacheEntry *new_entry = safe_malloc(sizeof(UserCacheEntry));
     new_entry->uid = uid;
-    new_entry->name = safe_malloc(strlen(name) + 1);
-    strcpy(new_entry->name, name);
+    new_entry->name = safe_malloc(strlen(temp_buf) + 1);
+    strcpy(new_entry->name, temp_buf);
     
     // 添加到桶的头部
     new_entry->next = state->uid_cache[bucket];
@@ -178,13 +241,20 @@ const char *get_groupname(gid_t gid, RuntimeState *state) {
     
     // 缓存未命中,查询系统
     struct group *gr = getgrgid(gid);
-    const char *name = gr ? gr->gr_name : "unknown";
+    char temp_buf[256];
+    if (gr) {
+        // 找到了：格式化为 "root(0)"
+        snprintf(temp_buf, sizeof(temp_buf), "%s(%u)", gr->gr_name, (unsigned int)gid);
+    } else {
+        // 没找到：保留原始 GID，例如 "1005"
+        snprintf(temp_buf, sizeof(temp_buf), "%u", (unsigned int)gid);
+    }
     
     // 创建新缓存项
     GroupCacheEntry *new_entry = safe_malloc(sizeof(GroupCacheEntry));
     new_entry->gid = gid;
-    new_entry->name = safe_malloc(strlen(name) + 1);
-    strcpy(new_entry->name, name);
+    new_entry->name = safe_malloc(strlen(temp_buf) + 1);
+    strcpy(new_entry->name, temp_buf);
     
     // 添加到桶的头部
     new_entry->next = state->gid_cache[bucket];
@@ -590,40 +660,36 @@ void display_status(const ThreadSharedState *shared) {
     if (!cfg->is_output_file && !cfg->is_output_split_dir) {
         return;
     }
-
+    // === 核心修改：驱动统计更新 ===
+    update_statistics(state);
+    // ==========================
     // 获取消费者（文件写入）队列的积压量
-    size_t async_pending = async_worker_get_queue_size();
+size_t async_pending = async_worker_get_queue_size();
 
-    // ANSI转义序列：移动到行首, 清除屏幕
     printf("\033[0;0H\033[J");
-
-    // === 标题栏 ===
     printf("===== 异步流水线状态 (v%s) =====\n", VERSION);
     
     char time_str[32];
     format_elapsed_time(state->start_time, time_str, sizeof(time_str));
     printf("运行时间: %s\n", time_str);
 
-    // === 核心：双队列监控 ===
-    // 1. 生产者状态 (目录扫描)
+    // === 生产者状态 ===
     size_t dir_queued = queue->active_count + queue->buffer_count + queue->disk_count;
     printf("\n[生产者: 目录扫描]\n");
     printf("├── 目录队列堆积: %zu (内存:%zu, 磁盘:%zu)\n", 
            dir_queued, queue->active_count + queue->buffer_count, queue->disk_count);
     
-    // 计算目录发现速率
-    double dir_rate = calculate_rate(state->start_time, state->dir_count);
-    printf("└── 目录发现速率: %.2f 个/秒\n", dir_rate);
+    // 修改：显示 1m 均值和峰值
+    printf("└── 目录发现速率: %.2f 个/秒 (峰值: %.2f)\n", 
+           state->stats.current_dir_rate, state->stats.max_dir_rate);
 
-    // 2. 消费者状态 (文件处理 & 落盘)
+    // === 消费者状态 ===
     printf("\n[消费者: 结果写入]\n");
-    // async_pending 越大，说明 lstat/写入 慢于 扫描，瓶颈在 IO/Worker
-    // async_pending 接近 0，说明 扫描 慢于 写入，瓶颈在 readdir
     printf("├── 待写入文件数: %zu (Output Buffer)\n", async_pending);
     
-    // 计算文件处理完成速率 (基于 state->file_count，这个值现在由 Worker 增加)
-    double file_rate = calculate_rate(state->start_time, state->file_count);
-    printf("└── 文件产出速率: %.2f 个/秒\n", file_rate);
+    // 修改：显示 1m 均值和峰值
+    printf("└── 文件产出速率: %.2f 个/秒 (峰值: %.2f)\n", 
+           state->stats.current_file_rate, state->stats.max_file_rate);
 
     // === 结果输出 (Output) ===
     if (cfg->is_output_split_dir) {

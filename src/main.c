@@ -37,6 +37,7 @@ void show_help() {
     printf("  -Z, --archive          压缩已处理的进度文件切片, 归档后会删掉原文件\n");
     printf("  -C, --clean            删除已处理的进度文件切片, 不归档\n");
     printf("      --decompress       解压缩归档文件并输出内容\n");
+    printf("  -D, --dirs            在输出结果中包含目录 (默认仅包含文件)\n\n");
     printf("注意: -o与-O互斥, -Z与-C互斥\n");
     printf("verbose控制:\n");
     printf("  --verbose-type=类型    控制verbose输出类型 (0/1,0: Full, 1:Versioned, Default: 0)\n");
@@ -93,10 +94,11 @@ static int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"mode", no_argument, 0, 10},
         {"xattr", no_argument, 0, 11},
         {"quote", no_argument, 0, 'Q'},
+        {"dirs", no_argument, 0, 'D'},
         {0, 0, 0, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:cf:dvVF:ZCX:hO:o:Q", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:cf:dvVF:ZCX:hO:o:QD", long_options, NULL)) != -1) {
         switch (opt) {
             case 'p': 
                 cfg->target_path = strdup(optarg);
@@ -185,6 +187,9 @@ static int parse_arguments(int argc, char *argv[], Config *cfg) {
                 break;
             case 'Q': 
                 cfg->quote = true;
+                break;
+            case 'D': // --dirs
+                cfg->include_dir = true;
                 break;
             case 'h':
             default:
@@ -324,6 +329,9 @@ static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queu
             if (cfg->print_dir) {
                 fprintf(state->dir_info_fp, "目录: %s\n", full_path);
             }
+            if (cfg->include_dir) {
+                push_write_task_file(full_path);
+            }
         } else {
             // 直接推给 Worker，stat 信息已在 info 中（如果 need_stat 为真）
             // 注意：目前的 push_write_task_file 只接受 path，worker 内部会再次 lstat
@@ -377,6 +385,10 @@ void traverse_files(Config *cfg, RuntimeState *state) {
         smart_enqueue(cfg, &queue, cfg->target_path, &root_info);
         if (cfg->continue_mode) {
             record_path(cfg, state, cfg->target_path, &root_info);
+        }
+        // 根目录自己也要输出
+        if (cfg->include_dir) {
+            push_write_task_file(cfg->target_path);
         }
     } else {
         state->file_count++;

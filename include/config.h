@@ -38,6 +38,9 @@
 #define BATCH_FLUSH_SIZE 5000 
 #define FLUSH_INTERVAL_SEC 5
 #define MAX_DEV_CACHE 64
+#define RATE_WINDOW_SIZE 60 // 采样窗口大小 (60次采样)
+#define SAMPLE_INTERVAL_MS 1000 // 采样间隔 1000ms
+
 
 #define min_size(a, b) ((a) < (b) ? (a) : (b))
 #define max_size(a, b) ((a) > (b) ? (a) : (b))
@@ -64,6 +67,27 @@ typedef enum {
     DEV_STATUS_SUPPORTED,
     DEV_STATUS_UNSUPPORTED
 } DeviceStatus;
+
+// === 新增：速率采样点 ===
+typedef struct {
+    time_t timestamp;
+    unsigned long dir_count;
+    unsigned long file_count;
+} RateSample;
+
+// === 新增：统计状态 ===
+typedef struct {
+    RateSample samples[RATE_WINDOW_SIZE];
+    int head_idx;           // 环形缓冲区头指针
+    bool filled;            // 是否已填满一圈
+    time_t last_sample_time;
+    
+    double current_dir_rate;
+    double max_dir_rate;
+    
+    double current_file_rate;
+    double max_file_rate;
+} Statistics;
 
 typedef struct {
     dev_t dev;
@@ -138,6 +162,7 @@ typedef struct {
     bool xattr;
     bool mode;
     bool quote;
+    bool include_dir;
 } Config;
 
 // 运行时状态
@@ -159,6 +184,8 @@ typedef struct {
     DeviceCapEntry dev_cache[MAX_DEV_CACHE];
     size_t dev_cache_count;
     pthread_mutex_t dev_cache_mutex;
+    // === 新增：统计模块 ===
+    Statistics stats;
 } RuntimeState;
 
 // 线程共享状态结构体
