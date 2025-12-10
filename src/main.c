@@ -261,7 +261,6 @@ bool is_absolute_path(const char* path) {
 }
 
 // 从文件列表加载任务
-// === 核心修改：load_resume_file ===
 static void load_resume_file(const Config *cfg, SmartQueue *queue) {
     FILE *fp = fopen(cfg->resume_file, "r");
     if (!fp) {
@@ -274,43 +273,64 @@ static void load_resume_file(const Config *cfg, SmartQueue *queue) {
     char line[MAX_PATH_LENGTH + 256];
     unsigned long loaded_count = 0;
     char path_buf[MAX_PATH_LENGTH]; 
-    
-    // 提前计算前缀长度，避免循环内重复计算
     size_t prefix_len = strlen(OUTPUT_DIR_PREFIX);
 
+    // === QoS 初始化 ===
+    long long current_sleep = START_SLEEP_US; 
+    long long op_start, op_end, duration;
+    // =================
+
     while (fgets(line, sizeof(line), fp)) {
+        // === QoS 执行限流 ===
+        if (current_sleep > 0) usleep(current_sleep);
+        // ===================
+
         // 1. 去除尾部换行符
         line[strcspn(line, "\n")] = 0;
         
         char *path_start = line;
-        
-        // 2. 跳过行首空白 (兼容缩进)
         while (isspace((unsigned char)*path_start)) path_start++;
 
-        // 3. 【核心逻辑】尝试匹配并剥离前缀
-        // 直接比较开头，如果有前缀就跳过，没有就认为是纯路径
         if (strncmp(path_start, OUTPUT_DIR_PREFIX, prefix_len) == 0) {
             path_start += prefix_len;
         }
 
-        // 4. 去除引号 (兼容 -Q 输出或 CSV 格式)
-        // 这一步必须在前缀剥离之后做，因为引号通常包裹在路径外层 (或者前缀之后)
         size_t len = strlen(path_start);
         if (len > 1 && path_start[0] == '"' && path_start[len-1] == '"') {
             size_t inner_len = len - 2;
             if (inner_len >= sizeof(path_buf)) inner_len = sizeof(path_buf) - 1;
-            
             strncpy(path_buf, path_start + 1, inner_len);
             path_buf[inner_len] = '\0';
             path_start = path_buf;
         }
 
-        // 5. 有效性检查与入队
         if (*path_start == '\0') continue;
 
         struct stat info;
-        // 仍然建议做 lstat 检查，防止将无效路径加入队列导致 Worker 空转报错
-        if (lstat(path_start, &info) == 0) {
+        
+        // === QoS: 测量 lstat 耗时 ===
+        op_start = current_timestamp();
+        int lstat_ret = lstat(path_start, &info);
+        op_end = current_timestamp();
+        // ==========================
+
+        // === QoS: 动态反馈调节 ===
+        duration = op_end - op_start;
+        if (duration < 2000) { 
+            // <2ms: 存储很闲，加速
+            current_sleep = current_sleep * 0.95;
+            if (current_sleep < MIN_SLEEP_US) current_sleep = MIN_SLEEP_US;
+        } else if (duration > 100000) { 
+            // >100ms: 存储卡了，急刹车
+            current_sleep = (current_sleep * 2) + 50000;
+        } else if (duration > 10000) {
+            // >10ms: 有点压力，缓慢减速
+            current_sleep = current_sleep * 1.1;
+        }
+        if (current_sleep > MAX_SLEEP_US) current_sleep = MAX_SLEEP_US;
+        // ========================
+
+        if (lstat_ret == 0) {
             if (S_ISDIR(info.st_mode)) {
                 smart_enqueue(cfg, queue, path_start, &info);
                 loaded_count++;
