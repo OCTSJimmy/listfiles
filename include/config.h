@@ -40,7 +40,7 @@
 #define MAX_DEV_CACHE 64
 #define RATE_WINDOW_SIZE 60 // 采样窗口大小 (60次采样)
 #define SAMPLE_INTERVAL_MS 1000 // 采样间隔 1000ms
-
+#define OUTPUT_DIR_PREFIX "目录: "
 
 #define min_size(a, b) ((a) < (b) ? (a) : (b))
 #define max_size(a, b) ((a) > (b) ? (a) : (b))
@@ -163,6 +163,7 @@ typedef struct {
     bool mode;
     bool quote;
     bool include_dir;
+    char *resume_file;
 } Config;
 
 // 运行时状态

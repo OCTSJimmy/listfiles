@@ -12,6 +12,7 @@
 #include <getopt.h>
 #include <dirent.h>
 #include <sys/time.h>
+#include <ctype.h>
 
 void show_version() {
     printf("listfiles 版本 %s\n", VERSION);
@@ -38,6 +39,7 @@ void show_help() {
     printf("  -C, --clean            删除已处理的进度文件切片, 不归档\n");
     printf("      --decompress       解压缩归档文件并输出内容\n");
     printf("  -D, --dirs            在输出结果中包含目录 (默认仅包含文件)\n\n");
+    printf("  -R, --resume-from=文件 从指定的目录列表文件(如output.dir)恢复任务 (跳过根目录扫描)\n\n");
     printf("注意: -o与-O互斥, -Z与-C互斥\n");
     printf("verbose控制:\n");
     printf("  --verbose-type=类型    控制verbose输出类型 (0/1,0: Full, 1:Versioned, Default: 0)\n");
@@ -95,6 +97,7 @@ static int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"xattr", no_argument, 0, 11},
         {"quote", no_argument, 0, 'Q'},
         {"dirs", no_argument, 0, 'D'},
+        {"resume-from", required_argument, 0, 'R'},
         {0, 0, 0, 0}
     };
     int opt;
@@ -191,6 +194,15 @@ static int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 'D': // --dirs
                 cfg->include_dir = true;
                 break;
+            case 'R': // <--- 新增
+                cfg->resume_file = strdup(optarg);
+                // 强制开启断点续传模式，否则无法利用 HashSet 进行父子关系去重
+                if (!cfg->continue_mode) {
+                    cfg->continue_mode = true;
+                    // 如果用户没指定进度文件基名，给个默认的，防止逻辑错误
+                    if (!cfg->progress_base) cfg->progress_base = "resume_task";
+                }
+                break;
             case 'h':
             default:
                 show_help();
@@ -246,6 +258,74 @@ void init_config(Config *cfg) {
 // 判断是否为绝对路径(Windows平台)
 bool is_absolute_path(const char* path) {
     return path != NULL && path[0] == '/';
+}
+
+// 从文件列表加载任务
+// === 核心修改：load_resume_file ===
+static void load_resume_file(const Config *cfg, SmartQueue *queue) {
+    FILE *fp = fopen(cfg->resume_file, "r");
+    if (!fp) {
+        perror("无法打开恢复列表文件");
+        exit(EXIT_FAILURE);
+    }
+
+    verbose_printf(cfg, 1, "正在从 %s 加载任务列表...\n", cfg->resume_file);
+
+    char line[MAX_PATH_LENGTH + 256];
+    unsigned long loaded_count = 0;
+    char path_buf[MAX_PATH_LENGTH]; 
+    
+    // 提前计算前缀长度，避免循环内重复计算
+    size_t prefix_len = strlen(OUTPUT_DIR_PREFIX);
+
+    while (fgets(line, sizeof(line), fp)) {
+        // 1. 去除尾部换行符
+        line[strcspn(line, "\n")] = 0;
+        
+        char *path_start = line;
+        
+        // 2. 跳过行首空白 (兼容缩进)
+        while (isspace((unsigned char)*path_start)) path_start++;
+
+        // 3. 【核心逻辑】尝试匹配并剥离前缀
+        // 直接比较开头，如果有前缀就跳过，没有就认为是纯路径
+        if (strncmp(path_start, OUTPUT_DIR_PREFIX, prefix_len) == 0) {
+            path_start += prefix_len;
+        }
+
+        // 4. 去除引号 (兼容 -Q 输出或 CSV 格式)
+        // 这一步必须在前缀剥离之后做，因为引号通常包裹在路径外层 (或者前缀之后)
+        size_t len = strlen(path_start);
+        if (len > 1 && path_start[0] == '"' && path_start[len-1] == '"') {
+            size_t inner_len = len - 2;
+            if (inner_len >= sizeof(path_buf)) inner_len = sizeof(path_buf) - 1;
+            
+            strncpy(path_buf, path_start + 1, inner_len);
+            path_buf[inner_len] = '\0';
+            path_start = path_buf;
+        }
+
+        // 5. 有效性检查与入队
+        if (*path_start == '\0') continue;
+
+        struct stat info;
+        // 仍然建议做 lstat 检查，防止将无效路径加入队列导致 Worker 空转报错
+        if (lstat(path_start, &info) == 0) {
+            if (S_ISDIR(info.st_mode)) {
+                smart_enqueue(cfg, queue, path_start, &info);
+                loaded_count++;
+            }
+        } else {
+            verbose_printf(cfg, 2, "跳过无效路径: %s\n", path_start);
+        }
+    }
+
+    fclose(fp);
+    verbose_printf(cfg, 1, "恢复列表加载完成，共加入 %lu 个目录任务。\n", loaded_count);
+    
+    if (loaded_count == 0) {
+        fprintf(stderr, "警告: 未能从文件中加载任何有效目录。请检查文件格式或路径是否正确。\n");
+    }
 }
 
 static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queue, const char* dir_path) {
@@ -327,7 +407,7 @@ static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queu
             }
             state->dir_count++;
             if (cfg->print_dir) {
-                fprintf(state->dir_info_fp, "目录: %s\n", full_path);
+                fprintf(state->dir_info_fp, OUTPUT_DIR_PREFIX "%s\n", full_path);
             }
             if (cfg->include_dir) {
                 push_write_task_file(full_path);
@@ -380,22 +460,28 @@ void traverse_files(Config *cfg, RuntimeState *state) {
         exit(EXIT_FAILURE);
     }
 
-    if (S_ISDIR(root_info.st_mode)) {
-        state->dir_count++;
-        smart_enqueue(cfg, &queue, cfg->target_path, &root_info);
-        if (cfg->continue_mode) {
-            record_path(cfg, state, cfg->target_path, &root_info);
+    if (cfg->resume_file) {
+        load_resume_file(cfg, &queue);
+    } else {   
+         if (S_ISDIR(root_info.st_mode)) {
+            state->dir_count++;
+            smart_enqueue(cfg, &queue, cfg->target_path, &root_info);
+            if (cfg->continue_mode) {
+                record_path(cfg, state, cfg->target_path, &root_info);
+            }
+            if (cfg->print_dir) {
+                fprintf(state->dir_info_fp, OUTPUT_DIR_PREFIX "%s\n", cfg->target_path);
+            }
+            // 根目录自己也要输出
+            if (cfg->include_dir) {
+                push_write_task_file(cfg->target_path);
+            }
+        } else {
+            state->file_count++;
+            // 这里如果是单文件，直接走同步输出或推给 worker 均可，这里推给 worker 保持一致
+            push_write_task_file(cfg->target_path); 
         }
-        // 根目录自己也要输出
-        if (cfg->include_dir) {
-            push_write_task_file(cfg->target_path);
-        }
-    } else {
-        state->file_count++;
-        // 这里如果是单文件，直接走同步输出或推给 worker 均可，这里推给 worker 保持一致
-        push_write_task_file(cfg->target_path); 
     }
-
     while (true) {
         ScanNode *entry = smart_dequeue(cfg, &queue, state);
         if (!entry) break;
