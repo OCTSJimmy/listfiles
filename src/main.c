@@ -200,7 +200,11 @@ static int parse_arguments(int argc, char *argv[], Config *cfg) {
         fprintf(stderr, "错误: -Z/--archive与-C/--clean选项不能同时使用\n");
         return -1;
     }
-
+    // 如果用户指定了格式字符串，必须先编译它，否则 output 模块无法识别
+    if (cfg->format) {
+        verbose_printf(cfg, 1, "预编译输出格式: %s\n", cfg->format);
+        precompile_format(cfg);
+    }
     return 0; // 表示成功
 }
 
