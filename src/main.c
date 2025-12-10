@@ -50,6 +50,7 @@ void show_help() {
     printf("  --follow-symlinks      跟踪符号链接\n\n");
     printf("  --mode                包含文件模式 (如 -rw-r--r--)\n\n");
     printf("  --xattr           包含扩展属性 (lsattr格式, 失败显示 [error])\n\n");
+    printf("  -Q, --quote           给所有输出变量加上双引号 (如 \"/path/to/file\")\n\n"); // <--- 新增
     printf("示例:\n");
     printf("  listfiles -p /data --continue --format=\"%%p|%%s|%%u|%%m\"\n");
     printf("  listfiles -p /home --size --user --mtime > 文件列表.csv\n");
@@ -82,8 +83,6 @@ static int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"follow-symlinks", no_argument, 0, 6},
         {"help", no_argument, 0, 'h'},
         {"max-slice", required_argument, 0, 7},
-        {"mode", no_argument, 0, 10},
-        {"xattr", no_argument, 0, 11},
         {"archive", no_argument, 0, 'Z'},
         {"clean", no_argument, 0, 'C'},
         {"decompress", no_argument, 0, 'X'},
@@ -91,10 +90,13 @@ static int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"output-split", required_argument, 0, 'O'},
         {"verbose-type", required_argument, 0, 8},
         {"verbose-level", required_argument, 0, 9},
+        {"mode", no_argument, 0, 10},
+        {"xattr", no_argument, 0, 11},
+        {"quote", no_argument, 0, 'Q'},
         {0, 0, 0, 0}
     };
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:cf:dvVF:ZCX:hO:o:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:cf:dvVF:ZCX:hO:o:Q", long_options, NULL)) != -1) {
         switch (opt) {
             case 'p': 
                 cfg->target_path = strdup(optarg);
@@ -180,6 +182,9 @@ static int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 'O':
                 cfg->is_output_split_dir = true;
                 cfg->output_split_dir = strdup(optarg);
+                break;
+            case 'Q': 
+                cfg->quote = true;
                 break;
             case 'h':
             default:
@@ -438,8 +443,11 @@ int main(int argc, char *argv[]) {
     // 3. 核心业务逻辑
     RuntimeState state;
     memset(&state, 0, sizeof(RuntimeState));
-
+    // ===【新增：必须初始化锁！】===
+    pthread_mutex_init(&state.dev_cache_mutex, NULL);
+    // ===========================
     if (acquire_lock(&cfg, &state) == -1) {
+        pthread_mutex_destroy(&state.dev_cache_mutex); // 退出前清理
         fprintf(stderr, "无法获取锁,退出\n");
         return 1;
     }
@@ -476,7 +484,9 @@ int main(int argc, char *argv[]) {
         hash_set_destroy(g_history_object_set);
         g_history_object_set = NULL;
     }
-    
+    // ===【新增：程序结束前销毁锁】===
+    pthread_mutex_destroy(&state.dev_cache_mutex);
+    // =============================    
     printf("\033[11;0H");
     return 0;
 }

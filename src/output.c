@@ -445,60 +445,99 @@ void format_output(const Config *cfg, RuntimeState *state, const char *path, con
     // verbose_printf(cfg, 1, "输出装置：%s(%s)\n", state->output_fp ? "文件" : "屏幕", state->output_fp ? cfg->output_file : "stdout");
     // 使用预编译格式输出
 // 在写入文件前加写锁
-
+    bool q = cfg->quote;
     if (cfg->compiled_format) {
-        for (int i = 0; i < cfg->format_segment_count; i++) {
+for (int i = 0; i < cfg->format_segment_count; i++) {
             switch (cfg->compiled_format[i].type) {
                 case FMT_TEXT:
+                    // 文本段（分隔符）不加引号
                     fputs(cfg->compiled_format[i].text, output);
                     break;
                 case FMT_PATH:
+                    if (q) fputc('"', output);
                     fputs(path, output);
+                    if (q) fputc('"', output);
                     break;
                 case FMT_SIZE:
+                    if (q) fputc('"', output);
                     fprintf(output, "%lld", (long long)info->st_size);
+                    if (q) fputc('"', output);
                     break;
                 case FMT_USER:
+                    if (q) fputc('"', output);
                     fputs(get_username(info->st_uid, state), output);
+                    if (q) fputc('"', output);
                     break;
                 case FMT_GROUP:
+                    if (q) fputc('"', output);
                     fputs(get_groupname(info->st_gid, state), output);
+                    if (q) fputc('"', output);
                     break;
                 case FMT_MTIME:
+                    if (q) fputc('"', output);
                     fputs(format_time(info->st_mtime), output);
+                    if (q) fputc('"', output);
                     break;
                 case FMT_ATIME:
+                    if (q) fputc('"', output);
                     fputs(format_time(info->st_atime), output);
+                    if (q) fputc('"', output);
                     break;
-                case FMT_MODE:  // <--- 新增这块逻辑
-                    // 使用新的函数来格式化权限
-                    ;
+                case FMT_MODE: {
                     char mode_str[11];   
                     format_mode_str(info->st_mode, mode_str);
-                    fprintf(output, "%s", mode_str); 
-                    // 以前可能是：fprintf(fp, "%o", info->st_mode & 07777);
+                    if (q) fputc('"', output);
+                    fprintf(output, "%s", mode_str);
+                    if (q) fputc('"', output);
                     break;
-                case FMT_XATTR:
+                }
+                case FMT_XATTR: {
+                    char attr_str[32];
+                    get_xattr_str(state, path, info, attr_str);
+                    if (q) fputc('"', output);
+                    fputs(attr_str, output);
+                    if (q) fputc('"', output);
                     break;
+                }
             }
         }
         fputc('\n', output);
     } else {
-        fprintf(output, "%s", path);
-        if (cfg->size) fprintf(output, " %lld", (long long)info->st_size);
-        if (cfg->user) fprintf(output, " %s", get_username(info->st_uid, state));
-        if (cfg->group) fprintf(output, " %s", get_groupname(info->st_gid, state));
-        if (cfg->mtime) fprintf(output, " %s", format_time(info->st_mtime));
-        if (cfg->atime) fprintf(output, " %s", format_time(info->st_atime));
+// 默认模式：按需加引号
+        if (q) fprintf(output, "\"%s\"", path);
+        else fprintf(output, "%s", path);
+
+        if (cfg->size) {
+            if (q) fprintf(output, " \"%lld\"", (long long)info->st_size);
+            else fprintf(output, " %lld", (long long)info->st_size);
+        }
+        if (cfg->user) {
+            if (q) fprintf(output, " \"%s\"", get_username(info->st_uid, state));
+            else fprintf(output, " %s", get_username(info->st_uid, state));
+        }
+        if (cfg->group) {
+            if (q) fprintf(output, " \"%s\"", get_groupname(info->st_gid, state));
+            else fprintf(output, " %s", get_groupname(info->st_gid, state));
+        }
+        if (cfg->mtime) {
+            if (q) fprintf(output, " \"%s\"", format_time(info->st_mtime));
+            else fprintf(output, " %s", format_time(info->st_mtime));
+        }
+        if (cfg->atime) {
+            if (q) fprintf(output, " \"%s\"", format_time(info->st_atime));
+            else fprintf(output, " %s", format_time(info->st_atime));
+        }
         if (cfg->mode) {
             char mode_str[11];
             format_mode_str(info->st_mode, mode_str);
-            fprintf(output, " %s", mode_str);
+            if (q) fprintf(output, " \"%s\"", mode_str);
+            else fprintf(output, " %s", mode_str);
         }
         if (cfg->xattr) {
             char xattr_buf[32];
             get_xattr_str(state, path, info, xattr_buf);
-            fprintf(output, " %s", xattr_buf);
+            if (q) fprintf(output, " \"%s\"", xattr_buf);
+            else fprintf(output, " %s", xattr_buf);
         }
         fputc('\n', output);
     }

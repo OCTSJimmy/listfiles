@@ -137,6 +137,7 @@ typedef struct {
     bool decompress;
     bool xattr;
     bool mode;
+    bool quote;
 } Config;
 
 // 运行时状态
