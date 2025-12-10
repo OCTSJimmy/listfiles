@@ -23,5 +23,7 @@ void *status_thread_func(void *arg);
 
 void cleanup_cache(RuntimeState *state);
 void close_output_file(FILE *fp);
+void format_mode_str(mode_t mode, char *buf);
+
 
 #endif // OUTPUT_H

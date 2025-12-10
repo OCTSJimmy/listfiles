@@ -37,6 +37,7 @@
 #define MAX_SLEEP_US 500000
 #define BATCH_FLUSH_SIZE 5000 
 #define FLUSH_INTERVAL_SEC 5
+#define MAX_DEV_CACHE 64
 
 #define min_size(a, b) ((a) < (b) ? (a) : (b))
 #define max_size(a, b) ((a) > (b) ? (a) : (b))
@@ -54,8 +55,20 @@ typedef enum {
     FMT_GROUP,
     FMT_MTIME,
     FMT_ATIME,
-    FMT_MODE
+    FMT_MODE,
+    FMT_XATTR
 } FormatType;
+
+typedef enum {
+    DEV_STATUS_UNKNOWN = 0,
+    DEV_STATUS_SUPPORTED,
+    DEV_STATUS_UNSUPPORTED
+} DeviceStatus;
+
+typedef struct {
+    dev_t dev;
+    DeviceStatus status;
+} DeviceCapEntry;
 
 // =======================================================
 // 核心数据结构定义
@@ -122,6 +135,8 @@ typedef struct {
     char *output_file, *output_split_dir;
     unsigned long output_slice_lines;
     bool decompress;
+    bool xattr;
+    bool mode;
 } Config;
 
 // 运行时状态
@@ -140,6 +155,9 @@ typedef struct {
     unsigned long completed_count;
     const char *current_path;
     char *lock_file_path;
+    DeviceCapEntry dev_cache[MAX_DEV_CACHE];
+    size_t dev_cache_count;
+    pthread_mutex_t dev_cache_mutex;
 } RuntimeState;
 
 // 线程共享状态结构体

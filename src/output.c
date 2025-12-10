@@ -6,8 +6,129 @@
 #include <grp.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <sys/stat.h>
 #include "async_worker.h"
 
+// 辅助函数：将 st_mode 转换为 ls -l 格式的字符串
+void format_mode_str(mode_t mode, char *buf) {
+    strcpy(buf, "----------");
+    const char chars[] = "rwxrwxrwx";
+    if (S_ISREG(mode))  buf[0] = '-';
+    else if (S_ISDIR(mode))  buf[0] = 'd';
+    else if (S_ISLNK(mode))  buf[0] = 'l';
+    else if (S_ISCHR(mode))  buf[0] = 'c';
+    else if (S_ISBLK(mode))  buf[0] = 'b';
+    else if (S_ISFIFO(mode)) buf[0] = 'p';
+    else if (S_ISSOCK(mode)) buf[0] = 's';
+    else buf[0] = '?';
+
+    for (int i = 0; i < 9; i++) {
+        buf[i + 1] = (mode & (1 << (8 - i))) ? chars[i] : '-';
+    }
+    if (mode & S_ISUID) buf[3] = (mode & S_IXUSR) ? 's' : 'S';
+    if (mode & S_ISGID) buf[6] = (mode & S_IXGRP) ? 's' : 'S';
+    if (mode & S_ISVTX) buf[9] = (mode & S_IXOTH) ? 't' : 'T';
+    buf[10] = '\0';
+}
+// =======================================================
+// lsattr 探测与缓存 (基于 RuntimeState)
+// =======================================================
+
+// 查找设备状态 (线程安全)
+static DeviceStatus get_device_status(dev_t dev, RuntimeState *state) {
+    DeviceStatus status = DEV_STATUS_UNKNOWN;
+    
+    pthread_mutex_lock(&state->dev_cache_mutex);
+    for (size_t i = 0; i < state->dev_cache_count; i++) {
+        if (state->dev_cache[i].dev == dev) {
+            status = state->dev_cache[i].status;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&state->dev_cache_mutex);
+    
+    return status;
+}
+// 更新设备状态 (线程安全)
+static void set_device_status(dev_t dev, DeviceStatus status, RuntimeState *state) {
+    pthread_mutex_lock(&state->dev_cache_mutex);
+    
+    // 双重检查：防止在等待锁的过程中已经被别的线程更新了
+    for (size_t i = 0; i < state->dev_cache_count; i++) {
+        if (state->dev_cache[i].dev == dev) {
+            state->dev_cache[i].status = status;
+            pthread_mutex_unlock(&state->dev_cache_mutex);
+            return;
+        }
+    }
+
+    if (state->dev_cache_count < MAX_DEV_CACHE) {
+        state->dev_cache[state->dev_cache_count].dev = dev;
+        state->dev_cache[state->dev_cache_count].status = status;
+        state->dev_cache_count++;
+    }
+    
+    pthread_mutex_unlock(&state->dev_cache_mutex);
+}
+// 获取 lsattr 字符串 (传入 state)
+static void get_xattr_str(RuntimeState *state, const char *path, const struct stat *info, char *buf) {
+    // 1. 检查设备缓存
+    DeviceStatus ds = get_device_status(info->st_dev, state);
+    if (ds == DEV_STATUS_UNSUPPORTED) {
+        strcpy(buf, "[unsupported]   ");
+        return;
+    }
+
+    // 2. 尝试打开
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    if (fd == -1) {
+        strcpy(buf, "[access_denied] "); 
+        return;
+    }
+
+    // 3. 尝试 ioctl
+    int flags = 0;
+    if (ioctl(fd, FS_IOC_GETFLAGS, &flags) == 0) {
+        // 成功！说明设备支持。如果之前是未知状态，更新为支持
+        if (ds == DEV_STATUS_UNKNOWN) {
+            set_device_status(info->st_dev, DEV_STATUS_SUPPORTED, state);
+        }
+        
+        // 解析标志位
+        strcpy(buf, "----------------");
+        if (flags & FS_SECRM_FL)        buf[0] = 's';
+        if (flags & FS_UNRM_FL)         buf[1] = 'u';
+        if (flags & FS_COMPR_FL)        buf[2] = 'c';
+        if (flags & FS_SYNC_FL)         buf[3] = 'S';
+        if (flags & FS_IMMUTABLE_FL)    buf[4] = 'i';
+        if (flags & FS_APPEND_FL)       buf[5] = 'a';
+        if (flags & FS_NODUMP_FL)       buf[6] = 'd';
+        if (flags & FS_NOATIME_FL)      buf[7] = 'A';
+        if (flags & FS_DIRTY_FL)        buf[8] = 'D';
+        if (flags & FS_COMPRBLK_FL)     buf[9] = 'B';
+        if (flags & FS_NOCOMP_FL)       buf[10] = 'Z';
+        #ifdef FS_ECOMPR_FL
+        if (flags & FS_ECOMPR_FL)       buf[11] = 'E';
+        #endif
+        if (flags & FS_INDEX_FL)        buf[12] = 'I';
+        if (flags & FS_IMAGIC_FL)       buf[13] = 'i';
+        if (flags & FS_JOURNAL_DATA_FL) buf[14] = 'j';
+        if (flags & FS_NOTAIL_FL)       buf[15] = 't';
+    } else {
+        // ioctl 失败
+        if (errno == ENOTTY || errno == EOPNOTSUPP) {
+            // 明确不支持，更新缓存
+            set_device_status(info->st_dev, DEV_STATUS_UNSUPPORTED, state);
+            strcpy(buf, "[unsupported]   ");
+        } else {
+            strcpy(buf, "[ioctl_error]   ");
+        }
+    }
+    close(fd);
+}
 
 // 获取用户名(哈希表实现)
 const char *get_username(uid_t uid, RuntimeState *state) {
@@ -151,6 +272,7 @@ void precompile_format(Config *cfg) {
                 case 'm': seg.type = FMT_MTIME; break;
                 case 'a': seg.type = FMT_ATIME; break;
                 case 'M': seg.type = FMT_MODE; break;
+                case 'X': seg.type = FMT_XATTR; break;
                 default:  // 无效占位符当作普通文本
                     seg.type = FMT_TEXT;
                     seg.text = safe_malloc(3);
@@ -349,9 +471,14 @@ void format_output(const Config *cfg, RuntimeState *state, const char *path, con
                     fputs(format_time(info->st_atime), output);
                     break;
                 case FMT_MODE:  // <--- 新增这块逻辑
-                    // 输出完整的 st_mode (类型 + 权限)
-                    // 使用 %06o 保证格式对齐，例如 100644 (文件), 040755 (目录), 120777 (软链)
-                    fprintf(output, "%06o", info->st_mode); 
+                    // 使用新的函数来格式化权限
+                    ;
+                    char mode_str[11];   
+                    format_mode_str(info->st_mode, mode_str);
+                    fprintf(output, "%s", mode_str); 
+                    // 以前可能是：fprintf(fp, "%o", info->st_mode & 07777);
+                    break;
+                case FMT_XATTR:
                     break;
             }
         }
@@ -363,6 +490,16 @@ void format_output(const Config *cfg, RuntimeState *state, const char *path, con
         if (cfg->group) fprintf(output, " %s", get_groupname(info->st_gid, state));
         if (cfg->mtime) fprintf(output, " %s", format_time(info->st_mtime));
         if (cfg->atime) fprintf(output, " %s", format_time(info->st_atime));
+        if (cfg->mode) {
+            char mode_str[11];
+            format_mode_str(info->st_mode, mode_str);
+            fprintf(output, " %s", mode_str);
+        }
+        if (cfg->xattr) {
+            char xattr_buf[32];
+            get_xattr_str(state, path, info, xattr_buf);
+            fprintf(output, " %s", xattr_buf);
+        }
         fputc('\n', output);
     }
 
