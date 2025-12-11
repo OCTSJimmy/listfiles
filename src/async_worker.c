@@ -112,23 +112,22 @@ static void *worker_thread_func(void *arg) {
                 // 只有需要元数据时才 lstat
                 if (g_worker.cfg->size || g_worker.cfg->user || g_worker.cfg->mtime || 
                     g_worker.cfg->group || g_worker.cfg->atime || g_worker.cfg->format) {
-                    struct stat info;
-                    bool have_stat = false;
+                    
+                    // 【修复】：删除了内部的 struct stat info; 和 bool have_stat;
 
                     if (writeNode->has_cached_stat) {
-                        info = writeNode->cached_stat; // 直接用缓存！
-                        have_stat = true;
+                        info = writeNode->cached_stat; // 直接用缓存，写入外部 info
+                        stat_success = true;           // 更新外部 stat_success
                     } else {
-                        // 只有没缓存时才去 lstat (比如目录扫描发现的新文件，或者你为了代码整洁，目录扫描也可以传缓存)
-                        if (lstat(writeNode->path, &info) == 0) have_stat = true;
+                        // 只有没缓存时才去 lstat
+                        if (lstat(writeNode->path, &info) == 0) stat_success = true;
                     }
                 } else {
                     memset(&info, 0, sizeof(info));
                     stat_success = true; 
                 }
-
                 if (stat_success) {
-                    g_worker.state->file_count++; // Worker 更新文件产出计数
+                    g_worker.state->file_count++; 
                     format_output(g_worker.cfg, g_worker.state, writeNode->path, &info);
                     g_worker.pending_count++;
                 }

@@ -73,20 +73,25 @@ typedef struct {
     time_t timestamp;
     unsigned long dir_count;
     unsigned long file_count;
+    unsigned long dequeued_count;
 } RateSample;
 
 // === 新增：统计状态 ===
 typedef struct {
-    RateSample samples[RATE_WINDOW_SIZE];
-    int head_idx;           // 环形缓冲区头指针
-    bool filled;            // 是否已填满一圈
+RateSample samples[RATE_WINDOW_SIZE];
+    int head_idx;
+    bool filled;
     time_t last_sample_time;
     
-    double current_dir_rate;
+    double current_dir_rate;    // 发现速率
     double max_dir_rate;
     
-    double current_file_rate;
+    double current_file_rate;   // 产出速率
     double max_file_rate;
+
+    // === 新增 ===
+    double current_dequeue_rate; // 消费速率
+    double max_dequeue_rate;
 } Statistics;
 
 typedef struct {
@@ -172,7 +177,7 @@ typedef struct {
 typedef struct {
     FILE *progress_file, *index_file;
     int lock_fd;
-    unsigned long line_count, processed_count, dir_count, file_count;
+    unsigned long line_count, processed_count, dir_count, file_count, total_dequeued_count;
     UserCacheEntry *uid_cache[UID_CACHE_SIZE];
     size_t uid_cache_count;
     GroupCacheEntry *gid_cache[GID_CACHE_SIZE];
@@ -191,8 +196,7 @@ typedef struct {
     FILE *status_file_fp; 
     // ========================
     // === 新增：统计模块 ===
-    Statistics stats;
-    
+    Statistics stats;;
 } RuntimeState;
 
 // 线程共享状态结构体

@@ -59,22 +59,14 @@ static void update_statistics(const RuntimeState *c_state) {
     st->samples[st->head_idx].timestamp = now;
     st->samples[st->head_idx].dir_count = state->dir_count;
     st->samples[st->head_idx].file_count = state->file_count;
+    st->samples[st->head_idx].dequeued_count = state->total_dequeued_count; // <--- 记录出队数
     st->last_sample_time = now;
-
-    // 2. 寻找对比样本 (窗口尾部)
-    int tail_idx;
-    if (st->filled) {
-        tail_idx = (st->head_idx + 1) % RATE_WINDOW_SIZE; // 最旧的一个
-    } else {
-        tail_idx = 0; // 刚开始跑，取第一个
-    }
-    
-    // 3. 计算滑动窗口速率
+    int tail_idx = st->filled ? (st->head_idx + 1) % RATE_WINDOW_SIZE : 0;
     RateSample *new_s = &st->samples[st->head_idx];
     RateSample *old_s = &st->samples[tail_idx];
-    
     double time_diff = difftime(new_s->timestamp, old_s->timestamp);
     
+   
     if (time_diff >= 1.0) {
         // 目录速率
         unsigned long dir_diff = new_s->dir_count - old_s->dir_count;
@@ -85,6 +77,11 @@ static void update_statistics(const RuntimeState *c_state) {
         unsigned long file_diff = new_s->file_count - old_s->file_count;
         st->current_file_rate = (double)file_diff / time_diff;
         if (st->current_file_rate > st->max_file_rate) st->max_file_rate = st->current_file_rate;
+
+        unsigned long deq_diff = new_s->dequeued_count - old_s->dequeued_count;
+        st->current_dequeue_rate = (double)deq_diff / time_diff;
+        if (st->current_dequeue_rate > st->max_dequeue_rate) 
+            st->max_dequeue_rate = st->current_dequeue_rate;
     } else {
         // 刚启动不足1秒，使用全局平均兜底
         // calculate_rate 是原来的全局算法，可以保留作为 fallback
@@ -705,11 +702,21 @@ void display_status(const ThreadSharedState *shared) {
     format_elapsed_time(state->start_time, time_str, sizeof(time_str));
     fprintf(target, "运行时间: %s\n", time_str);
 
-    fprintf(target, "\n[生产者: 目录扫描]\n");
-    fprintf(target, "├── 目录队列堆积: %zu (内存:%zu, 磁盘:%zu)\n", 
+fprintf(target, "\n[生产者: 目录扫描]\n");
+    fprintf(target, "├── 队列堆积: %zu (内存:%zu, 磁盘:%zu)\n", 
            dir_queued, queue->active_count + queue->buffer_count, queue->disk_count);
-    fprintf(target, "└── 目录发现速率: %.2f 个/秒 (峰值: %.2f)\n", 
+    
+    // 显示 发现速率 vs 消费速率
+    fprintf(target, "├── 发现速率: %.2f 个/秒 (峰值: %.2f) [入队]\n", 
            state->stats.current_dir_rate, state->stats.max_dir_rate);
+    fprintf(target, "└── 消费速率: %.2f 个/秒 (峰值: %.2f) [出队]\n", 
+           state->stats.current_dequeue_rate, state->stats.max_dequeue_rate);
+
+    // 计算压力趋势
+    double trend = state->stats.current_dir_rate - state->stats.current_dequeue_rate;
+    fprintf(target, "    └── 压力趋势: %s%.2f/s %s\n", 
+            trend > 0 ? "+" : "", trend, 
+            trend > 0 ? "(积压中)" : "(消化中)");
 
     fprintf(target, "\n[消费者: 结果写入]\n");
     fprintf(target, "├── 待写入文件数: %zu (Output Buffer)\n", async_pending);

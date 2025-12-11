@@ -83,7 +83,7 @@ void traverse_files(Config *cfg, RuntimeState *state) {
     while (true) {
         ScanNode *entry = smart_dequeue(cfg, &queue, state);
         if (!entry) break;
-
+        state->total_dequeued_count++;
         // 运行时二次安检 (Lazy Validation)
         if (!entry->pre_checked) {
             struct stat info;
