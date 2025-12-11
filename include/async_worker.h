@@ -11,7 +11,7 @@ typedef enum {
 void async_worker_init(const Config *cfg, RuntimeState *state);
 
 // 提交一个文件路径 (主线程调用)
-void push_write_task_file(const char *path, const struct stat *info);
+void push_write_task_file(const char *path);
 
 // 提交一个进度检查点 (主线程调用)
 // 这意味着：在此之前的所有文件都必须落盘，然后保存 state 中的进度

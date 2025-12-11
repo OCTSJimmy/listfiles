@@ -178,7 +178,7 @@ void async_worker_init(const Config *cfg, RuntimeState *state) {
     pthread_detach(tid); 
 }
 
-void push_write_task_file(const char *path, const struct stat *info) {
+void push_write_task_file(const char *path) {
     WriteNode *writeNode = safe_malloc(sizeof(WriteNode));
     writeNode->type = NODE_TYPE_FILE;
     writeNode->path = strdup(path); 
