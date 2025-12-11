@@ -395,13 +395,13 @@ static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queu
                 fprintf(state->dir_info_fp, OUTPUT_DIR_PREFIX "%s\n", full_path);
             }
             if (cfg->include_dir) {
-                push_write_task_file(full_path);
+                push_write_task_file(full_path, &info);
             }
         } else {
             // 直接推给 Worker，stat 信息已在 info 中（如果 need_stat 为真）
             // 注意：目前的 push_write_task_file 只接受 path，worker 内部会再次 lstat
             // 为了保持架构一致，这里暂不传递 info，如果追求极致性能，以后可以改造 worker 接受 info
-            push_write_task_file(full_path);
+            push_write_task_file(full_path, &info);
         }
     }
     
@@ -523,7 +523,7 @@ void traverse_files(Config *cfg, RuntimeState *state) {
             // 4. 补做目录输出 (如果开启 -D)
             // 之前 blind_enqueue 没做这步
             if (cfg->include_dir) {
-                push_write_task_file(entry->path);
+                push_write_task_file(entry->path, &info);
             }
         }
         state->current_path = entry->path;

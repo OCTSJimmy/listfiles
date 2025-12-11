@@ -112,7 +112,16 @@ static void *worker_thread_func(void *arg) {
                 // 只有需要元数据时才 lstat
                 if (g_worker.cfg->size || g_worker.cfg->user || g_worker.cfg->mtime || 
                     g_worker.cfg->group || g_worker.cfg->atime || g_worker.cfg->format) {
-                    if (lstat(writeNode->path, &info) == 0) stat_success = true;
+                    struct stat info;
+                    bool have_stat = false;
+
+                    if (writeNode->has_cached_stat) {
+                        info = writeNode->cached_stat; // 直接用缓存！
+                        have_stat = true;
+                    } else {
+                        // 只有没缓存时才去 lstat (比如目录扫描发现的新文件，或者你为了代码整洁，目录扫描也可以传缓存)
+                        if (lstat(writeNode->path, &info) == 0) have_stat = true;
+                    }
                 } else {
                     memset(&info, 0, sizeof(info));
                     stat_success = true; 
@@ -169,7 +178,7 @@ void async_worker_init(const Config *cfg, RuntimeState *state) {
     pthread_detach(tid); 
 }
 
-void push_write_task_file(const char *path) {
+void push_write_task_file(const char *path, const struct stat *info) {
     WriteNode *writeNode = safe_malloc(sizeof(WriteNode));
     writeNode->type = NODE_TYPE_FILE;
     writeNode->path = strdup(path); 
