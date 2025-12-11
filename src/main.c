@@ -39,7 +39,8 @@ void show_help() {
     printf("  -C, --clean            删除已处理的进度文件切片, 不归档\n");
     printf("      --decompress       解压缩归档文件并输出内容\n");
     printf("  -D, --dirs            在输出结果中包含目录 (默认仅包含文件)\n\n");
-    printf("  -R, --resume-from=文件 从指定的目录列表文件(如output.dir)恢复任务 (跳过根目录扫描)\n\n");
+    printf("  -R, --resume-from=文件 从指定的目录列表文件(如output.dir)恢复任务 (覆盖旧进度)\n");
+    printf("  -M, --mute            静默模式，不输出到屏幕，而是刷新到 .status 文件\n\n");
     printf("注意: -o与-O互斥, -Z与-C互斥\n");
     printf("verbose控制:\n");
     printf("  --verbose-type=类型    控制verbose输出类型 (0/1,0: Full, 1:Versioned, Default: 0)\n");
@@ -203,6 +204,9 @@ static int parse_arguments(int argc, char *argv[], Config *cfg) {
                     if (!cfg->progress_base) cfg->progress_base = "resume_task";
                 }
                 break;
+            case 'M': // <--- 新增
+                cfg->mute = true;
+                break;
             case 'h':
             default:
                 show_help();
@@ -261,7 +265,7 @@ bool is_absolute_path(const char* path) {
 }
 
 // 从文件列表加载任务
-static void load_resume_file(const Config *cfg, SmartQueue *queue) {
+static void load_resume_file(const Config *cfg, SmartQueue *queue, RuntimeState *state) {
     FILE *fp = fopen(cfg->resume_file, "r");
     if (!fp) {
         perror("无法打开恢复列表文件");
@@ -304,7 +308,7 @@ static void load_resume_file(const Config *cfg, SmartQueue *queue) {
             path_start = path_buf;
         }
 
-        if (*path_start == '\0') continue;
+       if (*path_start == '\0') continue;
 
         struct stat info;
         
@@ -332,7 +336,17 @@ static void load_resume_file(const Config *cfg, SmartQueue *queue) {
 
         if (lstat_ret == 0) {
             if (S_ISDIR(info.st_mode)) {
+                // 1. 入队 (Scan 逻辑)
                 smart_enqueue(cfg, queue, path_start, &info);
+                
+                // ===【新增】2. 转录 (Record 逻辑) ===
+                // 将这个目录直接写入新的 progress 二进制文件
+                // 这样下次如果崩了，这些目录就已经在 .pbin 里了
+                if (cfg->continue_mode) {
+                    record_path(cfg, state, path_start, &info);
+                }
+                // =================================
+                
                 loaded_count++;
             }
         } else {
@@ -480,26 +494,48 @@ void traverse_files(Config *cfg, RuntimeState *state) {
         exit(EXIT_FAILURE);
     }
 
-    if (cfg->resume_file) {
-        load_resume_file(cfg, &queue);
-    } else {   
-         if (S_ISDIR(root_info.st_mode)) {
-            state->dir_count++;
-            smart_enqueue(cfg, &queue, cfg->target_path, &root_info);
-            if (cfg->continue_mode) {
-                record_path(cfg, state, cfg->target_path, &root_info);
-            }
-            if (cfg->print_dir) {
-                fprintf(state->dir_info_fp, OUTPUT_DIR_PREFIX "%s\n", cfg->target_path);
-            }
-            // 根目录自己也要输出
-            if (cfg->include_dir) {
-                push_write_task_file(cfg->target_path);
-            }
+    if (cfg->continue_mode) {
+        if (cfg->resume_file) {
+            // 场景 A: 导入模式 (-R)
+            // 1. 彻底清理旧的进度文件 (Abandon old progress)
+            verbose_printf(cfg, 1, "检测到导入模式 (-R)，正在清理旧的进度文件...\n");
+            cleanup_progress(cfg, state);
+            
+            // 2. 重置内存状态 (保险起见)
+            state->process_slice_index = 0;
+            state->processed_count = 0;
+            state->write_slice_index = 0;
+            // 注意：不要重置 output_slice_num，因为那属于输出文件的逻辑，
+            // 但如果用户希望全量重跑，通常也会清理 output。
+            // 这里我们只负责重置“进度”相关的。
+            
+            // 3. 初始化全新的进度系统 (Create new .idx / .pbin)
+            progress_init(cfg, state);
+            
+            // 4. 加载并转录
+            load_resume_file(cfg, &queue, state); // <--- 传入 state
+            
         } else {
-            state->file_count++;
-            // 这里如果是单文件，直接走同步输出或推给 worker 均可，这里推给 worker 保持一致
-            push_write_task_file(cfg->target_path); 
+            // 场景 B: 常规续传模式
+            progress_init(cfg, state);
+            restore_progress(cfg, &queue, state);
+        }
+    }
+    // ===========================
+    
+    // === 根目录处理逻辑调整 ===
+    // 如果是 -R 模式，根目录已经在 load_resume_file 里被处理了（如果它在列表里）
+    // 如果列表里没有根目录，通常意味着不需要扫根目录
+    // 所以这里只需要处理“非 -R” 的情况
+    
+    if (!cfg->resume_file) { // <--- 只有非 -R 模式才去扫 -p 参数指定的根
+        struct stat root_info;
+        if (lstat(cfg->target_path, &root_info) != 0) { /* ... */ }
+
+        if (S_ISDIR(root_info.st_mode)) {
+            // ... (入队根目录)
+        } else {
+            // ... (处理单文件)
         }
     }
     while (true) {
@@ -605,6 +641,11 @@ int main(int argc, char *argv[]) {
     // ===【新增：程序结束前销毁锁】===
     pthread_mutex_destroy(&state.dev_cache_mutex);
     // =============================    
+    // === 新增：关闭状态文件 ===
+    if (state.status_file_fp && state.status_file_fp != stdout) {
+        fclose(state.status_file_fp);
+    }
+    // ========================
     printf("\033[11;0H");
     return 0;
 }

@@ -164,6 +164,7 @@ typedef struct {
     bool quote;
     bool include_dir;
     char *resume_file;
+    bool mute;
 } Config;
 
 // 运行时状态
@@ -185,8 +186,12 @@ typedef struct {
     DeviceCapEntry dev_cache[MAX_DEV_CACHE];
     size_t dev_cache_count;
     pthread_mutex_t dev_cache_mutex;
+    // === 新增：状态文件句柄 ===
+    FILE *status_file_fp; 
+    // ========================
     // === 新增：统计模块 ===
     Statistics stats;
+    
 } RuntimeState;
 
 // 线程共享状态结构体

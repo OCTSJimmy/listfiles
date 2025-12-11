@@ -11,6 +11,7 @@
 #include <linux/fs.h>
 #include <sys/stat.h>
 #include "async_worker.h"
+#include <unistd.h>
 
 // 辅助函数：将 st_mode 转换为 ls -l 格式的字符串
 void format_mode_str(mode_t mode, char *buf) {
@@ -651,70 +652,89 @@ void cleanup_cache(RuntimeState *state) {
     }
 }
 
+// === 修改：display_status ===
 void display_status(const ThreadSharedState *shared) {
     const Config *cfg = shared->cfg;
-    const RuntimeState *state = shared->state;
-    const SmartQueue *queue = shared->queue; // 目录队列 (生产者输入)
+    const RuntimeState *state = shared->state; // 注意：这里是 const，无法修改 state->status_file_fp
+    // 为了写入 status_file_fp，我们需要去 const
+    RuntimeState *mutable_state = (RuntimeState *)state;
+    const SmartQueue *queue = shared->queue;
 
-    // 只在使用-o或-O参数时显示
-    if (!cfg->is_output_file && !cfg->is_output_split_dir) {
+    // 如果没开 output 也没开 mute (即不需要状态文件)，则直接返回
+    if (!cfg->is_output_file && !cfg->is_output_split_dir && !cfg->mute) {
         return;
     }
-    // === 核心修改：驱动统计更新 ===
-    update_statistics(state);
-    // ==========================
-    // 获取消费者（文件写入）队列的积压量
-size_t async_pending = async_worker_get_queue_size();
 
-    printf("\033[0;0H\033[J");
-    printf("===== 异步流水线状态 (v%s) =====\n", VERSION);
+    update_statistics(mutable_state);
+
+    size_t async_pending = async_worker_get_queue_size();
+    size_t dir_queued = queue->active_count + queue->buffer_count + queue->disk_count;
+
+    // === 确定输出目标 ===
+    FILE *target = stdout;
+    bool use_ansi = true;
+
+    if (cfg->mute) {
+        // 如果是 Mute 模式，输出到状态文件
+        // 懒加载打开文件 (如果尚未打开)
+        if (!mutable_state->status_file_fp) {
+            char status_path[1024];
+            snprintf(status_path, sizeof(status_path), "%s.status", cfg->progress_base);
+            mutable_state->status_file_fp = fopen(status_path, "w"); // "w" 模式打开
+            if (!mutable_state->status_file_fp) {
+                // 打开失败降级到 stdout
+                mutable_state->status_file_fp = stdout; 
+            }
+        }
+        target = mutable_state->status_file_fp;
+        
+        // 如果目标不是 stdout/stderr，则不使用 ANSI 颜色/清屏码，并重置文件指针
+        if (target != stdout && target != stderr) {
+            use_ansi = false;
+            rewind(target); // 回到文件头
+            ftruncate(fileno(target), 0); // 截断文件，清除旧内容
+        }
+    }
+
+    // === 开始输出 ===
+    if (use_ansi) fprintf(target, "\033[0;0H\033[J"); // ANSI 清屏
+    
+    fprintf(target, "===== 异步流水线状态 (v%s) =====\n", VERSION);
     
     char time_str[32];
     format_elapsed_time(state->start_time, time_str, sizeof(time_str));
-    printf("运行时间: %s\n", time_str);
+    fprintf(target, "运行时间: %s\n", time_str);
 
-    // === 生产者状态 ===
-    size_t dir_queued = queue->active_count + queue->buffer_count + queue->disk_count;
-    printf("\n[生产者: 目录扫描]\n");
-    printf("├── 目录队列堆积: %zu (内存:%zu, 磁盘:%zu)\n", 
+    fprintf(target, "\n[生产者: 目录扫描]\n");
+    fprintf(target, "├── 目录队列堆积: %zu (内存:%zu, 磁盘:%zu)\n", 
            dir_queued, queue->active_count + queue->buffer_count, queue->disk_count);
-    
-    // 修改：显示 1m 均值和峰值
-    printf("└── 目录发现速率: %.2f 个/秒 (峰值: %.2f)\n", 
+    fprintf(target, "└── 目录发现速率: %.2f 个/秒 (峰值: %.2f)\n", 
            state->stats.current_dir_rate, state->stats.max_dir_rate);
 
-    // === 消费者状态 ===
-    printf("\n[消费者: 结果写入]\n");
-    printf("├── 待写入文件数: %zu (Output Buffer)\n", async_pending);
-    
-    // 修改：显示 1m 均值和峰值
-    printf("└── 文件产出速率: %.2f 个/秒 (峰值: %.2f)\n", 
+    fprintf(target, "\n[消费者: 结果写入]\n");
+    fprintf(target, "├── 待写入文件数: %zu (Output Buffer)\n", async_pending);
+    fprintf(target, "└── 文件产出速率: %.2f 个/秒 (峰值: %.2f)\n", 
            state->stats.current_file_rate, state->stats.max_file_rate);
 
-    // === 结果输出 (Output) ===
     if (cfg->is_output_split_dir) {
-        printf("\n[落盘状态]\n");
-        printf("当前分片: " OUTPUT_SLICE_FORMAT " (行数: %lu / %lu)\n", 
+        fprintf(target, "\n[落盘状态]\n");
+        fprintf(target, "当前分片: " OUTPUT_SLICE_FORMAT " (行数: %lu / %lu)\n", 
                state->output_slice_num, state->output_line_count, cfg->output_slice_lines);
-        printf("总产出量: %lu 文件\n", state->file_count);
+        fprintf(target, "总产出量: %lu 文件\n", state->file_count);
     } else {
-        printf("\n[落盘状态]\n");
-        printf("总产出量: %lu 文件\n", state->file_count);
+        fprintf(target, "\n[落盘状态]\n");
+        fprintf(target, "总产出量: %lu 文件\n", state->file_count);
     }
 
-    // === 断点进度 (Progress) ===
     if (cfg->continue_mode) {
-        printf("\n[断点保护]\n");
-        // 这里必须清晰：这代表“目录扫描进度”，不代表“文件写入进度”
-        printf("进度记录: 分片 " PROGRESS_SLICE_FORMAT " (已记录目录数: %lu)\n", 
+        fprintf(target, "\n[断点保护]\n");
+        fprintf(target, "进度记录: 分片 " PROGRESS_SLICE_FORMAT " (已记录目录数: %lu)\n", 
                state->write_slice_index, state->line_count % DEFAULT_PROGRESS_SLICE_LINES);
     }
     
-    // === 实时预览 ===
-    printf("\n当前扫描目录: %s\n", state->current_path ? state->current_path : "...");
+    fprintf(target, "\n当前扫描目录: %s\n", state->current_path ? state->current_path : "...");
     
-    // 刷新输出
-    fflush(stdout);
+    fflush(target);
 }
 
 // 线程函数
