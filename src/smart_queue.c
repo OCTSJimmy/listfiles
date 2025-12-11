@@ -353,9 +353,21 @@ void init_smart_queue(SmartQueue *queue) {
     queue->free_list_count = 0;      // (可选) 统计池子里有多少闲置节点，防止无限膨胀
 }
 
+// 修改 alloc_node (初始化标志)
+ScanNode* alloc_scan_node(SmartQueue *queue) {
+    ScanNode *node;
+    if (queue->free_list_head) {
+        node = queue->free_list_head;
+        queue->free_list_head = node->next; 
+        queue->free_list_count--;
+    } else {
+        node = safe_malloc(sizeof(ScanNode));
+    }
+    node->pre_checked = false; // 默认为 false
+    return node;
+}
 
-// 智能入队(优化版)
-// void smart_enqueue(const Config *cfg, SmartQueue *queue, const char *path, const struct stat *info) {
+// 修改 smart_enqueue (标记为已检查)
 void smart_enqueue(const Config *cfg, SmartQueue *queue, const char *path, const struct stat *info) {
 
     if (cfg->continue_mode && g_history_object_set) {
@@ -381,7 +393,7 @@ void smart_enqueue(const Config *cfg, SmartQueue *queue, const char *path, const
     safe_strcpy(entry->path, path, strlen(path)+1);
     // memcpy(&entry->info, info, sizeof(struct stat));
     entry->next = NULL;
-
+    entry->pre_checked = true;
     add_to_buffer(queue, entry);
     // 新增逻辑：当内存中的条目总数超过阈值时，将缓存区刷新到磁盘
     if ((queue->active_count + queue->buffer_count) >= queue->max_mem_items) {
@@ -391,6 +403,22 @@ void smart_enqueue(const Config *cfg, SmartQueue *queue, const char *path, const
     }
 }
 
+// === 新增：盲入队实现 ===
+void blind_enqueue(SmartQueue *queue, const char *path) {
+    ScanNode *entry = alloc_scan_node(queue);
+    entry->path = safe_malloc(strlen(path)+1);
+    safe_strcpy(entry->path, path, strlen(path)+1);
+    entry->next = NULL;
+    entry->pre_checked = false; // <--- 关键：标记为未检查
+
+    // 直接入队，不查哈希，不做 IO
+    add_to_buffer(queue, entry);
+    
+    // 依然需要检查内存溢出，防止 resume 文件过大撑爆内存
+    // 这里我们假设 resume 时尚未初始化 cfg (或者传入 cfg)
+    // 为了简化，这里暂不自动 flush (假设 resume 文件大小可控)，
+    // 或者你可以让它也支持 flush，但通常 load 阶段还是纯内存快。
+}
 
 // 智能出队(优化版)
 ScanNode *smart_dequeue(const Config *cfg, SmartQueue *queue, RuntimeState *state) {

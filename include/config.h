@@ -123,6 +123,7 @@ typedef struct GroupCacheEntry {
 typedef struct ScanNode {
     char *path;
     struct ScanNode *next;
+    bool pre_checked;
 } ScanNode;
 
 // 智能队列结构

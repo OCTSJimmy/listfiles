@@ -265,7 +265,7 @@ bool is_absolute_path(const char* path) {
 }
 
 // 从文件列表加载任务
-static void load_resume_file(const Config *cfg, SmartQueue *queue, RuntimeState *state) {
+static void load_resume_file(const Config *cfg, SmartQueue *queue) {
     FILE *fp = fopen(cfg->resume_file, "r");
     if (!fp) {
         perror("无法打开恢复列表文件");
@@ -279,16 +279,8 @@ static void load_resume_file(const Config *cfg, SmartQueue *queue, RuntimeState 
     char path_buf[MAX_PATH_LENGTH]; 
     size_t prefix_len = strlen(OUTPUT_DIR_PREFIX);
 
-    // === QoS 初始化 ===
-    long long current_sleep = START_SLEEP_US; 
-    long long op_start, op_end, duration;
-    // =================
 
     while (fgets(line, sizeof(line), fp)) {
-        // === QoS 执行限流 ===
-        if (current_sleep > 0) usleep(current_sleep);
-        // ===================
-
         // 1. 去除尾部换行符
         line[strcspn(line, "\n")] = 0;
         
@@ -309,57 +301,16 @@ static void load_resume_file(const Config *cfg, SmartQueue *queue, RuntimeState 
         }
 
        if (*path_start == '\0') continue;
-
-        struct stat info;
-        
-        // === QoS: 测量 lstat 耗时 ===
-        op_start = current_timestamp();
-        int lstat_ret = lstat(path_start, &info);
-        op_end = current_timestamp();
-        // ==========================
-
-        // === QoS: 动态反馈调节 ===
-        duration = op_end - op_start;
-        if (duration < 2000) { 
-            // <2ms: 存储很闲，加速
-            current_sleep = current_sleep * 0.95;
-            if (current_sleep < MIN_SLEEP_US) current_sleep = MIN_SLEEP_US;
-        } else if (duration > 100000) { 
-            // >100ms: 存储卡了，急刹车
-            current_sleep = (current_sleep * 2) + 50000;
-        } else if (duration > 10000) {
-            // >10ms: 有点压力，缓慢减速
-            current_sleep = current_sleep * 1.1;
-        }
-        if (current_sleep > MAX_SLEEP_US) current_sleep = MAX_SLEEP_US;
-        // ========================
-
-        if (lstat_ret == 0) {
-            if (S_ISDIR(info.st_mode)) {
-                // 1. 入队 (Scan 逻辑)
-                smart_enqueue(cfg, queue, path_start, &info);
-                
-                // ===【新增】2. 转录 (Record 逻辑) ===
-                // 将这个目录直接写入新的 progress 二进制文件
-                // 这样下次如果崩了，这些目录就已经在 .pbin 里了
-                if (cfg->continue_mode) {
-                    record_path(cfg, state, path_start, &info);
-                }
-                // =================================
-                
-                loaded_count++;
-            }
-        } else {
-            verbose_printf(cfg, 2, "跳过无效路径: %s\n", path_start);
-        }
+        // === 变更点 ===
+        // 直接盲入队，不做 lstat，不查重，不记录
+        blind_enqueue(queue, path_start);
+        loaded_count++;
+        // =============
     }
 
     fclose(fp);
-    verbose_printf(cfg, 1, "恢复列表加载完成，共加入 %lu 个目录任务。\n", loaded_count);
+    verbose_printf(cfg, 1, "列表加载完成，队列预热 %lu 项 (将在运行时动态验证)。\n", loaded_count);
     
-    if (loaded_count == 0) {
-        fprintf(stderr, "警告: 未能从文件中加载任何有效目录。请检查文件格式或路径是否正确。\n");
-    }
 }
 
 static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queue, const char* dir_path) {
@@ -513,7 +464,7 @@ void traverse_files(Config *cfg, RuntimeState *state) {
             progress_init(cfg, state);
             
             // 4. 加载并转录
-            load_resume_file(cfg, &queue, state); // <--- 传入 state
+            load_resume_file(cfg, &queue); // <--- 传入 state
             
         } else {
             // 场景 B: 常规续传模式
@@ -541,7 +492,40 @@ void traverse_files(Config *cfg, RuntimeState *state) {
     while (true) {
         ScanNode *entry = smart_dequeue(cfg, &queue, state);
         if (!entry) break;
+// ===【新增】运行时二次安检 (Lazy Validation) ===
+        if (!entry->pre_checked) {
+            // 这是一个“盲注”节点，必须补票：lstat + 哈希检查 + 转录
+            struct stat info;
+            
+            // 1. 补做 lstat (IO 操作，自然受 worker 单线程速度限制)
+            if (lstat(entry->path, &info) != 0) {
+                // 文件可能被删了，跳过
+                verbose_printf(cfg, 2, "跳过失效的恢复路径: %s\n", entry->path);
+                recycle_scan_node(&queue, entry);
+                continue; 
+            }
 
+            // 2. 补做去重
+            ObjectIdentifier id = { .st_dev = info.st_dev, .st_ino = info.st_ino };
+            if (hash_set_contains(g_history_object_set, &id)) {
+                // 已经处理过了 (比如父目录已经扫到了它)，跳过
+                recycle_scan_node(&queue, entry);
+                continue;
+            }
+            hash_set_insert(g_history_object_set, &id);
+
+            // 3. 补做转录 (如果开启断点续传)
+            // 因为之前盲加载没写 .pbin，现在确认有效了，赶紧写进去
+            if (cfg->continue_mode) {
+                record_path(cfg, state, entry->path, &info);
+            }
+            
+            // 4. 补做目录输出 (如果开启 -D)
+            // 之前 blind_enqueue 没做这步
+            if (cfg->include_dir) {
+                push_write_task_file(entry->path);
+            }
+        }
         state->current_path = entry->path;
         process_directory(cfg, state, &queue, entry->path);
         
