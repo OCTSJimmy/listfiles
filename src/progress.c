@@ -134,33 +134,54 @@ void restore_progress(const Config *cfg, SmartQueue *queue, RuntimeState *state)
     verbose_printf(cfg, 2, "阶段一：构建历史对象标识符集合...\n");
     for (unsigned long s_idx = 0; ; ++s_idx) {
         char *slice_path = get_slice_filename(cfg->progress_base, s_idx);
-        // 以 "rb" (read binary) 模式打开
         FILE *slice_fp = fopen(slice_path, "rb");
         if (!slice_fp) {
             free(slice_path);
-            break; // 没有更多分片了
+            break; 
         }
 
         size_t path_len;
         dev_t dev;
         ino_t ino;
         
-        // 循环读取二进制记录
+        // === 新增：分片内记录计数器 ===
+        unsigned long record_idx_in_slice = 0; 
+        // ============================
+
         while (fread(&path_len, sizeof(size_t), 1, slice_fp) == 1) {
-            // 跳过路径字符串，我们只需要 dev 和 ino
             fseek(slice_fp, path_len, SEEK_CUR);
             
             if (fread(&dev, sizeof(dev_t), 1, slice_fp) == 1 &&
                 fread(&ino, sizeof(ino_t), 1, slice_fp) == 1) {
                 
                 if (g_history_object_set) {
-                    ObjectIdentifier id = { .st_dev = dev, .st_ino = ino };
-                    hash_set_insert(g_history_object_set, &id);
+                    // === 核心修复逻辑 ===
+                    bool is_truly_processed = false;
+                    
+                    // 1. 如果是之前的旧分片，那肯定是全处理完了
+                    if (s_idx < state->process_slice_index) {
+                        is_truly_processed = true;
+                    } 
+                    // 2. 如果是当前分片，只有索引小于 processed_count 的才是处理完的
+                    else if (s_idx == state->process_slice_index) {
+                        if (record_idx_in_slice < state->processed_count) {
+                            is_truly_processed = true;
+                        }
+                    }
+                    // 3. 未来的分片（如果有）或者当前分片靠后的记录，都是“待处理”的，不能加黑名单！
+
+                    if (is_truly_processed) {
+                        ObjectIdentifier id = { .st_dev = dev, .st_ino = ino };
+                        hash_set_insert(g_history_object_set, &id);
+                    }
+                    // ===================
                 }
             } else {
                 verbose_printf(cfg, 1, "警告: 进度文件 %s 可能已损坏，提前中止读取。\n", slice_path);
                 break;
             }
+            // 别忘了递增计数器
+            record_idx_in_slice++;
         }
         fclose(slice_fp);
         free(slice_path);

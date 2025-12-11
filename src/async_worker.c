@@ -21,6 +21,7 @@ static struct {
     time_t last_flush_time;
     const Config *cfg;
     RuntimeState *state;
+    pthread_t tid;
 } g_worker;
 
 // 辅助：执行刷盘
@@ -171,10 +172,7 @@ void async_worker_init(const Config *cfg, RuntimeState *state) {
     g_worker.state = state;
     pthread_mutex_init(&g_worker.mutex, NULL);
     pthread_cond_init(&g_worker.cond, NULL);
-    
-    pthread_t tid;
-    pthread_create(&tid, NULL, worker_thread_func, NULL);
-    pthread_detach(tid); 
+    pthread_create(&g_worker.tid, NULL, worker_thread_func, NULL);
 }
 
 void push_write_task_file(const char *path) {
@@ -221,11 +219,15 @@ void push_write_task_checkpoint(const RuntimeState *current_state) {
 }
 
 void async_worker_shutdown() {
-    pthread_mutex_lock(&g_worker.mutex);
+pthread_mutex_lock(&g_worker.mutex);
     g_worker.stop_flag = true;
     pthread_cond_signal(&g_worker.cond);
     pthread_mutex_unlock(&g_worker.mutex);
-    // 给一点时间让 worker 退出，或者使用 join (如果改用 joinable thread)
-    // 这里简单 sleep 等待
-    sleep(1); 
+    
+    // 3. 【删除】sleep(1)，改为 join
+    if (g_worker.tid) {
+        // 这行代码会阻塞主线程，直到 worker 把那 6 万条数据全部写完并 return
+        // 这样就绝对不会出现“主线程先撤梯子”的情况了
+        pthread_join(g_worker.tid, NULL); 
+    }
 }
