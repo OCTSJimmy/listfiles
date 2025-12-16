@@ -12,7 +12,7 @@
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "8.0"
+#define VERSION "9.0"
 #define MAX_PATH_LENGTH 2046
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
