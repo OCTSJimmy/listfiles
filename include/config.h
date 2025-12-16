@@ -31,15 +31,14 @@
 #define UID_CACHE_SIZE 4096
 #define GID_CACHE_SIZE 4096
 #define HASH_SET_INITIAL_SIZE 2000003 
-// 定义初始休眠时间：50ms (极度保守，探测冰面)
 #define START_SLEEP_US 50000 
 #define MIN_SLEEP_US 0
 #define MAX_SLEEP_US 500000
 #define BATCH_FLUSH_SIZE 5000 
 #define FLUSH_INTERVAL_SEC 5
 #define MAX_DEV_CACHE 64
-#define RATE_WINDOW_SIZE 60 // 采样窗口大小 (60次采样)
-#define SAMPLE_INTERVAL_MS 1000 // 采样间隔 1000ms
+#define RATE_WINDOW_SIZE 60
+#define SAMPLE_INTERVAL_MS 1000
 #define OUTPUT_DIR_PREFIX "目录: "
 
 #define min_size(a, b) ((a) < (b) ? (a) : (b))
@@ -49,17 +48,9 @@
 // 枚举类型定义
 // =======================================================
 
-// 格式预编译类型
 typedef enum {
-    FMT_TEXT,
-    FMT_PATH,
-    FMT_SIZE,
-    FMT_USER,
-    FMT_GROUP,
-    FMT_MTIME,
-    FMT_ATIME,
-    FMT_MODE,
-    FMT_XATTR
+    FMT_TEXT, FMT_PATH, FMT_SIZE, FMT_USER, FMT_GROUP,
+    FMT_MTIME, FMT_ATIME, FMT_MODE, FMT_XATTR
 } FormatType;
 
 typedef enum {
@@ -68,7 +59,7 @@ typedef enum {
     DEV_STATUS_UNSUPPORTED
 } DeviceStatus;
 
-// === 新增：速率采样点 ===
+// 速率采样点
 typedef struct {
     time_t timestamp;
     unsigned long dir_count;
@@ -76,21 +67,18 @@ typedef struct {
     unsigned long dequeued_count;
 } RateSample;
 
-// === 新增：统计状态 ===
+// 统计状态
 typedef struct {
-RateSample samples[RATE_WINDOW_SIZE];
+    RateSample samples[RATE_WINDOW_SIZE];
     int head_idx;
     bool filled;
     time_t last_sample_time;
     
-    double current_dir_rate;    // 发现速率
+    double current_dir_rate;
     double max_dir_rate;
-    
-    double current_file_rate;   // 产出速率
+    double current_file_rate;
     double max_file_rate;
-
-    // === 新增 ===
-    double current_dequeue_rate; // 消费速率
+    double current_dequeue_rate;
     double max_dequeue_rate;
 } Statistics;
 
@@ -103,55 +91,24 @@ typedef struct {
 // 核心数据结构定义
 // =======================================================
 
-// 格式段结构
 typedef struct {
     FormatType type;
     char *text;
 } FormatSegment;
 
-// 用户缓存结构
 typedef struct UserCacheEntry {
     uid_t uid;
     char *name;
     struct UserCacheEntry *next;
 } UserCacheEntry;
 
-// 组缓存结构
 typedef struct GroupCacheEntry {
     gid_t gid;
     char *name;
     struct GroupCacheEntry *next;
 } GroupCacheEntry;
 
-// ===【重命名：QueueEntry -> ScanNode】===
-// 这是一个“扫描任务节点”，用于目录遍历队列
-typedef struct ScanNode {
-    char *path;
-    struct ScanNode *next;
-    bool pre_checked;
-} ScanNode;
-
-// 智能队列结构
-typedef struct {
-    // 队列指针全部改为 ScanNode
-    ScanNode *active_front, *active_rear;
-    ScanNode *buffer_front, *buffer_rear;
-    size_t active_count, buffer_count, disk_count;
-    
-    FILE *overflow_file;
-    char overflow_name[256];
-    size_t max_mem_items, low_watermark;
-    char *temp_dir;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    int overflow_file_count;
-    size_t items_per_file;
-    size_t current_file_items;
-
-    // 空闲节点池
-    ScanNode *free_list_head; 
-    size_t free_list_count;
-} SmartQueue;
+// 【删除】ScanNode 和 SmartQueue 结构体定义已移除
 
 // 全局配置
 typedef struct {
@@ -192,18 +149,15 @@ typedef struct {
     DeviceCapEntry dev_cache[MAX_DEV_CACHE];
     size_t dev_cache_count;
     pthread_mutex_t dev_cache_mutex;
-    // === 新增：状态文件句柄 ===
     FILE *status_file_fp; 
-    // ========================
-    // === 新增：统计模块 ===
-    Statistics stats;;
+    Statistics stats;
 } RuntimeState;
 
 // 线程共享状态结构体
 typedef struct {
     const Config *cfg;
     const RuntimeState *state;
-    const SmartQueue *queue;
+    // 【删除】 const SmartQueue *queue;  <-- 已移除
     volatile int running;
 } ThreadSharedState;
 

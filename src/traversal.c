@@ -241,9 +241,41 @@ static void run_main_looper(Config *cfg, RuntimeState *state) {
     verbose_printf(cfg, 1, "启动 %d 个 Worker 线程\n", num_workers);
 
     // 3. 派发初始任务 (种子)
-    if (cfg->continue_mode && cfg->resume_file) {
-        verbose_printf(cfg, 1, "正在并行加载恢复列表...\n");
-        dispatch_resume_file(cfg);
+    if (cfg->continue_mode) {
+        bool resumed = false;
+
+        if (cfg->resume_file) {
+            // -R 模式：从文本列表恢复
+            verbose_printf(cfg, 1, "正在并行加载恢复列表 (-R)...\n");
+            dispatch_resume_file(cfg); 
+            resumed = true;
+        } else {
+            // --continue 模式：尝试从 checkpoint 恢复
+            // 【新增：调用加载索引】
+            if (load_progress_index(cfg, state)) {
+                verbose_printf(cfg, 1, "发现断点，正在恢复进度 (Slice: %lu, Items: %lu)...\n", 
+                               state->process_slice_index, state->processed_count);
+                
+                // 恢复分片数据
+                int batches = restore_progress(cfg, &g_worker_mq, state);
+                atomic_fetch_add(&g_pending_tasks, batches);
+            } else {
+                verbose_printf(cfg, 1, "未找到有效断点，将从头开始扫描。\n");
+            }
+        }
+        // 如果没有恢复任何进度（或者恢复失败），则从根目录开始
+        if (!resumed) {
+            struct stat root_info;
+            if (lstat(cfg->target_path, &root_info) == 0) {
+                 if (S_ISDIR(root_info.st_mode)) {
+                    atomic_fetch_add(&g_pending_tasks, 1);
+                    mq_send(&g_worker_mq, MSG_SCAN_DIR, strdup(cfg->target_path));
+                } else {
+                    push_write_task_file(cfg->target_path, &root_info);
+                    state->file_count++;
+                }
+            }
+        }
     } else {
         // 扫描根目录
         struct stat root_info;
@@ -368,7 +400,6 @@ void traverse_files(Config *cfg, RuntimeState *state) {
     ThreadSharedState shared = {
         .cfg = cfg,
         .state = state,
-        .queue = NULL, // 传 NULL
         .running = 1
     };
     pthread_t status_thread;

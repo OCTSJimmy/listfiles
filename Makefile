@@ -30,8 +30,8 @@ BINDIR := bin
 # 目标可执行文件名
 TARGET := listfiles
 
-# 自动获取 src 目录下所有的 .c 文件
-SOURCES := $(wildcard $(SRCDIR)/*.c)
+# 自动获取 src 目录下所有的 .c 文件，排除 smart_queue.c
+SOURCES := $(filter-out $(SRCDIR)/smart_queue.c, $(wildcard $(SRCDIR)/*.c))
 
 # 根据 .c 文件列表，自动生成对应的 .o (object) 文件列表
 # 例如, src/main.c 会被转换为 obj/main.o

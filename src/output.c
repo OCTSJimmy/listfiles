@@ -649,52 +649,56 @@ void cleanup_cache(RuntimeState *state) {
     }
 }
 
-// === 修改：display_status ===
+// === 清理后的 display_status ===
 void display_status(const ThreadSharedState *shared) {
     const Config *cfg = shared->cfg;
-    const RuntimeState *state = shared->state; // 注意：这里是 const，无法修改 state->status_file_fp
-    // 为了写入 status_file_fp，我们需要去 const
+    const RuntimeState *state = shared->state; 
+    
+    // 【Hack 说明】: display_status 本质上是一个只读展示函数，但我们需要在这里驱动
+    // 统计数据的更新（如计算每秒速率）。因此这里进行了一次去 const 转换。
     RuntimeState *mutable_state = (RuntimeState *)state;
-    const SmartQueue *queue = shared->queue;
-
-    // 如果没开 output 也没开 mute (即不需要状态文件)，则直接返回
-    if (!cfg->is_output_file && !cfg->is_output_split_dir && !cfg->mute) {
-        return;
+    
+    // 1. 判断是否需要显示
+    // 逻辑：如果结果输出到屏幕(stdout)，则不能打印仪表盘（会混淆数据）。
+    // 除非：用户开启了 --mute，此时仪表盘会重定向到 .status 文件。
+    bool output_to_stdout = (!cfg->is_output_file && !cfg->is_output_split_dir);
+    if (output_to_stdout && !cfg->mute) {
+        return; 
     }
 
+    // 2. 更新速率统计 (Ring Buffer 计算)
     update_statistics(mutable_state);
 
+    // 3. 获取异步写入队列的积压量 (这是唯一剩下的显式队列指标)
     size_t async_pending = async_worker_get_queue_size();
-    size_t dir_queued = queue->active_count + queue->buffer_count + queue->disk_count;
 
-    // === 确定输出目标 ===
-    FILE *target = stdout;
-    bool use_ansi = true;
+    // 4. 确定输出目标
+    FILE *target = stdout; // 默认屏幕
+    bool use_ansi = true;  // 默认使用动画
 
     if (cfg->mute) {
-        // 如果是 Mute 模式，输出到状态文件
-        // 懒加载打开文件 (如果尚未打开)
+        // --- Mute 模式：输出到 .status 文件 ---
+        // 懒加载：第一次运行时打开文件
         if (!mutable_state->status_file_fp) {
             char status_path[1024];
             snprintf(status_path, sizeof(status_path), "%s.status", cfg->progress_base);
-            mutable_state->status_file_fp = fopen(status_path, "w"); // "w" 模式打开
+            mutable_state->status_file_fp = fopen(status_path, "w");
             if (!mutable_state->status_file_fp) {
-                // 打开失败降级到 stdout
-                mutable_state->status_file_fp = stdout; 
+                mutable_state->status_file_fp = stdout; // 失败降级
             }
         }
         target = mutable_state->status_file_fp;
         
-        // 如果目标不是 stdout/stderr，则不使用 ANSI 颜色/清屏码，并重置文件指针
+        // 如果是文件，禁用 ANSI 颜色，并执行“原地刷新”魔法
         if (target != stdout && target != stderr) {
             use_ansi = false;
-            rewind(target); // 回到文件头
-            ftruncate(fileno(target), 0); // 截断文件，清除旧内容
+            rewind(target);               // 指针回到文件头
+            ftruncate(fileno(target), 0); // 截断文件内容
         }
     }
 
-    // === 开始输出 ===
-    if (use_ansi) fprintf(target, "\033[0;0H\033[J"); // ANSI 清屏
+    // 5. 绘制仪表盘
+    if (use_ansi) fprintf(target, "\033[0;0H\033[J"); // ANSI 清屏 + 光标复位
     
     fprintf(target, "===== 异步流水线状态 (v%s) =====\n", VERSION);
     
@@ -702,44 +706,41 @@ void display_status(const ThreadSharedState *shared) {
     format_elapsed_time(state->start_time, time_str, sizeof(time_str));
     fprintf(target, "运行时间: %s\n", time_str);
 
-fprintf(target, "\n[生产者: 目录扫描]\n");
-    fprintf(target, "├── 队列堆积: %zu (内存:%zu, 磁盘:%zu)\n", 
-           dir_queued, queue->active_count + queue->buffer_count, queue->disk_count);
-    
-    // 显示 发现速率 vs 消费速率
-    fprintf(target, "├── 发现速率: %.2f 个/秒 (峰值: %.2f) [入队]\n", 
+    fprintf(target, "\n[Looper 调度器]\n");
+    // Looper 架构下，我们不再直接显示队列深度，而是通过速率差来判断压力
+    // 发现速率 > 消费速率 = 积压；发现速率 < 消费速率 = 消化
+    fprintf(target, "├── 发现速率: %.2f 个/秒 (峰值: %.2f)\n", 
            state->stats.current_dir_rate, state->stats.max_dir_rate);
-    fprintf(target, "└── 消费速率: %.2f 个/秒 (峰值: %.2f) [出队]\n", 
+    fprintf(target, "└── 消费速率: %.2f 个/秒 (峰值: %.2f)\n", 
            state->stats.current_dequeue_rate, state->stats.max_dequeue_rate);
 
-    // 计算压力趋势
     double trend = state->stats.current_dir_rate - state->stats.current_dequeue_rate;
-    fprintf(target, "    └── 压力趋势: %s%.2f/s %s\n", 
+    fprintf(target, "    └── 负载趋势: %s%.2f/s %s\n", 
             trend > 0 ? "+" : "", trend, 
             trend > 0 ? "(积压中)" : "(消化中)");
 
-    fprintf(target, "\n[消费者: 结果写入]\n");
-    fprintf(target, "├── 待写入文件数: %zu (Output Buffer)\n", async_pending);
-    fprintf(target, "└── 文件产出速率: %.2f 个/秒 (峰值: %.2f)\n", 
+    fprintf(target, "\n[AsyncWorker 写入]\n");
+    fprintf(target, "├── 写入缓冲: %zu (待落盘)\n", async_pending);
+    fprintf(target, "└── 落盘速率: %.2f 个/秒 (峰值: %.2f)\n", 
            state->stats.current_file_rate, state->stats.max_file_rate);
 
+    fprintf(target, "\n[总体进度]\n");
     if (cfg->is_output_split_dir) {
-        fprintf(target, "\n[落盘状态]\n");
         fprintf(target, "当前分片: " OUTPUT_SLICE_FORMAT " (行数: %lu / %lu)\n", 
                state->output_slice_num, state->output_line_count, cfg->output_slice_lines);
-        fprintf(target, "总产出量: %lu 文件\n", state->file_count);
-    } else {
-        fprintf(target, "\n[落盘状态]\n");
-        fprintf(target, "总产出量: %lu 文件\n", state->file_count);
     }
+    fprintf(target, "总产出量: %lu 文件\n", state->file_count);
 
     if (cfg->continue_mode) {
-        fprintf(target, "\n[断点保护]\n");
-        fprintf(target, "进度记录: 分片 " PROGRESS_SLICE_FORMAT " (已记录目录数: %lu)\n", 
+        fprintf(target, "断点保护: 分片 " PROGRESS_SLICE_FORMAT " (Offset: %lu)\n", 
                state->write_slice_index, state->line_count % DEFAULT_PROGRESS_SLICE_LINES);
     }
     
-    fprintf(target, "\n当前扫描目录: %s\n", state->current_path ? state->current_path : "...");
+    // 显示当前正在处理的路径 (如果有)
+    // 注意：在 Looper 模式下，state->current_path 可能更新不及时，仅供参考
+    if (state->current_path) {
+        fprintf(target, "\n当前扫描: %s\n", state->current_path);
+    }
     
     fflush(target);
 }

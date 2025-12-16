@@ -2,7 +2,7 @@
 #define PROGRESS_H
 
 #include "config.h"
-#include "smart_queue.h"
+#include "looper.h"
 
 // 初始化进度系统
 void progress_init(const Config *cfg, RuntimeState *state);
@@ -12,7 +12,7 @@ void record_path(const Config *cfg, RuntimeState *state, const char *path, const
 void refresh_progress(const Config *cfg, RuntimeState *state);
 
 // 从进度文件恢复队列
-void restore_progress(const Config *cfg, SmartQueue *queue, RuntimeState *state);
+int restore_progress(const Config *cfg, MessageQueue *worker_mq, RuntimeState *state);
 
 // 清理进度相关文件和状态
 void cleanup_progress(const Config *cfg, RuntimeState *state);
@@ -32,5 +32,7 @@ void release_lock(RuntimeState *state);
 
 void save_config_to_disk(const Config* cfg);
 char *get_index_filename(const char *base);
+
+bool load_progress_index(const Config *cfg, RuntimeState *state);
 
 #endif // PROGRESS_H
