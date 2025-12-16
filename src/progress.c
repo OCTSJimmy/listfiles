@@ -334,7 +334,7 @@ int restore_progress(const Config *cfg, MessageQueue *worker_mq, RuntimeState *s
                     // 为了简单，我们假定 traversal.c 会把 g_pending_tasks 暴露出来，或者提供接口。
                     // **最简单的方案**：让 traversal.c 的 `dispatch_resume_file` 逻辑通用化。
                     // 现在先保持 mq_send，我们在 traversal.c 里解决计数问题。
-                    
+                    traversal_add_pending_tasks(1);
                     mq_send(worker_mq, MSG_CHECK_BATCH, batch);
                     batch = batch_create();
                     batch_count++;
@@ -344,6 +344,7 @@ int restore_progress(const Config *cfg, MessageQueue *worker_mq, RuntimeState *s
         }
         
         if (batch->count > 0) {
+            traversal_add_pending_tasks(1);
             mq_send(worker_mq, MSG_CHECK_BATCH, batch);
         } else {
             batch_destroy(batch);

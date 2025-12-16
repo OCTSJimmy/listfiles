@@ -429,3 +429,7 @@ void traverse_files(Config *cfg, RuntimeState *state) {
         g_history_object_set = NULL;
     }
 }
+// 暴露给 progress.c 使用的计数器接口
+void traversal_add_pending_tasks(int count) {
+    atomic_fetch_add(&g_pending_tasks, count);
+}
