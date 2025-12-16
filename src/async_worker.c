@@ -37,18 +37,13 @@ static void perform_flush_output() {
 
 // 辅助：执行进度保存 (原子更新)
 static void perform_save_progress(const ProgressSnapshot *snap) {
-    // 我们需要一个特殊的 atomic_update 变体，或者临时修改 state 再调用
-    // 为了安全，我们构造一个临时的 state 副本传给 atomic_update_index
-    // 但 atomic_update_index 内部使用了 state 的指针。
-    // 这里我们直接利用 snap 的值写入磁盘，重写 atomic_update_index 的逻辑部分
-    
     char *idx_file = get_index_filename(g_worker.cfg->progress_base);
-    char *tmp_file = safe_malloc(strlen(idx_file) + 5);
-    snprintf(tmp_file, strlen(idx_file) + 5, "%s.tmp", idx_file);
+    char *tmp_file = safe_malloc(strlen(idx_file) + 32);
+    // 【修复】：同样加上线程ID
+    snprintf(tmp_file, strlen(idx_file) + 32, "%s.tmp.%lu", idx_file, (unsigned long)pthread_self());
     
     FILE *tmp_fp = fopen(tmp_file, "w");
     if (tmp_fp) {
-        // 使用快照中的值，而不是 g_worker.state (后者可能已经变了)
         fprintf(tmp_fp, "%lu %lu %lu %lu %lu\n", 
                 snap->process_slice_index, 
                 snap->processed_count,
@@ -59,6 +54,7 @@ static void perform_save_progress(const ProgressSnapshot *snap) {
         
         if (rename(tmp_file, idx_file) != 0) {
             perror("Worker: 无法更新进度索引");
+            unlink(tmp_file);
         }
     }
     free(idx_file);
@@ -175,11 +171,20 @@ void async_worker_init(const Config *cfg, RuntimeState *state) {
     pthread_create(&g_worker.tid, NULL, worker_thread_func, NULL);
 }
 
-void push_write_task_file(const char *path) {
-    WriteNode *writeNode = safe_malloc(sizeof(WriteNode));
+void push_write_task_file(const char *path, const struct stat *info) {
+WriteNode *writeNode = safe_malloc(sizeof(WriteNode));
     writeNode->type = NODE_TYPE_FILE;
     writeNode->path = strdup(path); 
     writeNode->next = NULL;
+
+    // 【核心修复】：初始化 stat 缓存状态
+    if (info) {
+        writeNode->has_cached_stat = true;
+        writeNode->cached_stat = *info; // 复制 stat 结构体
+    } else {
+        writeNode->has_cached_stat = false;
+        // memset(&writeNode->cached_stat, 0, sizeof(struct stat)); // 可选，清零更安全
+    }
 
     pthread_mutex_lock(&g_worker.mutex);
     if (g_worker.tail) {

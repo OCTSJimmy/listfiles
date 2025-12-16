@@ -72,8 +72,8 @@ void traverse_files(Config *cfg, RuntimeState *state) {
             if (S_ISDIR(root_info.st_mode)) {
                 smart_enqueue(cfg, &queue, cfg->target_path, &root_info);
             } else {
-                // 单文件处理
-                push_write_task_file(cfg->target_path);
+                // 【修复】：传入 &root_info
+                push_write_task_file(cfg->target_path, &root_info);
                 state->file_count++;
             }
         }
@@ -112,14 +112,14 @@ void traverse_files(Config *cfg, RuntimeState *state) {
             if (S_ISDIR(info.st_mode)) {
                 // 如果是目录，进入 process_directory 扫描子项
                 if (cfg->include_dir || cfg->print_dir) {
-                     // 目录本身也需要输出吗？根据配置
-                     if(cfg->include_dir) push_write_task_file(entry->path);
+                    // 【修复】：传入 &info
+                    if(cfg->include_dir) push_write_task_file(entry->path, &info);
                 }
                 state->current_path = entry->path;
                 process_directory(cfg, state, &queue, entry->path);
             } else {
                 // 如果是文件（可能 load_resume_file 里包含文件），直接输出
-                push_write_task_file(entry->path);
+                push_write_task_file(entry->path, &info);
             }
         } else {
              // smart_enqueue 进来的已经是通过 check 的目录
@@ -224,11 +224,11 @@ static void process_directory(Config* cfg, RuntimeState* state, SmartQueue* queu
                 fprintf(state->dir_info_fp, OUTPUT_DIR_PREFIX "%s\n", full_path);
             }
             if (cfg->include_dir) {
-                push_write_task_file(full_path);
+                push_write_task_file(full_path, &info);
             }
         } else {
             // 文件：直接推给 Worker (传递 stat info!)
-            push_write_task_file(full_path);
+            push_write_task_file(full_path, &info);
         }
     }
     closedir(dir);

@@ -322,24 +322,26 @@ void cleanup_progress(const Config *cfg, RuntimeState *state) {
 // 修改索引文件更新函数
 // 索引格式：处理切片号 处理切片行号 写入切片号 输出文件号 输出文件行号
 void atomic_update_index(const Config *cfg, RuntimeState *state) {
-    char *idx_file = get_index_filename(cfg->progress_base);
-    char *tmp_file = safe_malloc(strlen(idx_file) + 5);
-    snprintf(tmp_file, strlen(idx_file) + 5, "%s.tmp", idx_file);
+char *idx_file = get_index_filename(cfg->progress_base);
+    // 【修复】：增加足够的空间存放线程ID
+    char *tmp_file = safe_malloc(strlen(idx_file) + 32); 
+    // 【修复】：临时文件名加上线程ID，避免冲突
+    snprintf(tmp_file, strlen(idx_file) + 32, "%s.tmp.%lu", idx_file, (unsigned long)pthread_self());
     
     FILE *tmp_fp = fopen(tmp_file, "w");
     if (tmp_fp) {
-        // 索引格式：处理切片号 处理切片行号 写入切片号 输出文件号 输出文件行号
         fprintf(tmp_fp, "%lu %lu %lu %lu %lu\n", 
                 state->process_slice_index, 
-                state->processed_count, // 注意：此行号是当前正在处理的切片内的行号
+                state->processed_count,
                 state->write_slice_index,
                 state->output_slice_num,
                 state->output_line_count);
         fclose(tmp_fp);
         
-        // 原子性重命名
         if (rename(tmp_file, idx_file) != 0) {
+            // 只有重命名失败才报错，但由于文件名独立，概率极低
             perror("无法重命名索引文件");
+            unlink(tmp_file); // 尝试清理残余
         }
     } else {
         perror("无法创建临时索引文件");
