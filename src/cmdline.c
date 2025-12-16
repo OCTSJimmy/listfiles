@@ -16,10 +16,45 @@ void show_help() {
     printf("\n文件列表器 %s\n", VERSION);
     printf("递归列出文件及其元数据,支持断点续传\n\n");
     printf("用法: listfiles --path=路径 [选项]\n\n");
-    // ... (保持原有的帮助信息内容) ...
+    printf("选项:\n");
+    printf("  -p, --path=路径        要扫描的目标目录 (必须)\n");
+    printf("  -c, --continue         启用断点续传模式\n");
+    printf("  -f, --progress-file=文件 进度文件前缀 (默认: progress)\n");
+    printf("  -d, --print-dir        打印目录路径到标准错误\n");
+    printf("  -v, --verbose          启用详细输出\n");
+    printf("  -V, --version          显示版本信息\n");
+    printf("  -F, --format=格式      自定义输出格式,支持占位符:\n");
+    printf("                          %%p = 路径, %%s = 大小, %%u = 用户, %%g = 组\n");
+    printf("                          %%m = 修改时间, %%a = 访问时间, %%o = 权限模式\n");
+    printf("                          %%x = 扩展属性\n\n");
+    printf("  -o, --output=文件      将结果写入指定文件 (默认: %s)\n", DEFAULT_OUTPUT_FILE);
+    printf("  -O, --output-split=目录 将结果按行拆分到指定目录 (默认: %lu)\n",(long unsigned int) DEFAULT_OUTPUT_SPLIT_DIR);
+    printf("      --max-slice=行数   每个输出切片的最大行数 (默认: %lu)\n", (long unsigned int) DEFAULT_OUTPUT_SLICE_LINES);
+    printf("  -Z, --archive          压缩已处理的进度文件切片, 归档后会删掉原文件\n");
+    printf("  -C, --clean            删除已处理的进度文件切片, 不归档\n");
+    printf("      --decompress       解压缩归档文件并输出内容\n");
+    printf("  -Q, --quote            对输出结果进行引号包裹\n");
+    printf("  -D, --dirs             包含目录信息\n");
+    printf("  -R, --resume-from=文件 从指定的进度文件恢复\n");
+    printf("  -M, --mute             禁用所有输出\n");
+    printf("注意: -o与-O互斥, -Z与-C互斥\n");
+    printf("verbose控制:\n");
+    printf("  --verbose-type=类型    控制verbose输出类型 (0/1,0: Full, 1:Versioned, Default: 0)\n");
+    printf("  --verbose-level=级别   控制verbose输出级别 (0-999999999)\n");
+    printf("元数据标志 (被--format覆盖):\n");
+    printf("  --size                 包含文件大小\n");
+    printf("  --user                 包含所有者用户\n");
+    printf("  --group                包含所有者组\n");
+    printf("  --mtime                包含修改时间\n");
+    printf("  --atime                包含访问时间\n");
+    printf("  --mode                 包含权限模式\n");
+    printf("  --xattr                包含扩展属性\n");
+    printf("  --follow-symlinks      跟踪符号链接\n\n");
     printf("示例:\n");
     printf("  listfiles -p /data --continue --format=\"%%p|%%s|%%u|%%m\"\n");
     printf("  listfiles -p /home --size --user --mtime > 文件列表.csv\n");
+    printf("  listfiles -p /home -D --mode --xattr --quote\n");
+    printf("  listfiles -p /data -c -R resume_file --output-split=output/\n");
 }
 
 void init_config(Config *cfg) {
