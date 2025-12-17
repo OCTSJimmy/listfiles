@@ -32,7 +32,7 @@ void release_lock(RuntimeState *state);
 
 void save_config_to_disk(const Config* cfg);
 char *get_index_filename(const char *base);
-
+void finalize_progress(const Config *cfg, RuntimeState *state);
 bool load_progress_index(const Config *cfg, RuntimeState *state);
 
 #endif // PROGRESS_H

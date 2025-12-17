@@ -338,9 +338,9 @@ static void run_main_looper(Config *cfg, RuntimeState *state, AsyncWorker *worke
                         if (cfg->include_dir || cfg->print_dir) {
                              if(cfg->include_dir) batch_add(output_batch, path, st);
                              if(cfg->print_dir) {
-                                 // 直接写 stderr 或者通过 async worker
-                                 // 这里为了简单保持原样，注意线程安全
-                                 fprintf(stderr, "目录: %s\n", path);
+                                 // 使用专门的目录信息输出文件指针输出目录路径
+                                 fprintf(state->dir_info_fp, "%s%s\n", OUTPUT_DIR_PREFIX, path);
+                                 fflush(state->dir_info_fp);
                              }
                         }
                         
@@ -431,6 +431,7 @@ void traverse_files(Config *cfg, RuntimeState *state) {
     
     // 5. 清理资源
     if (cfg->continue_mode) {
+        finalize_progress(cfg, state);
         cleanup_progress(cfg, state);
         release_lock(state);
     }

@@ -110,6 +110,21 @@ static void *worker_thread_func(void *arg) {
                 }
                 free(writeNode->path);
 
+            } else if (writeNode->type == NODE_TYPE_BATCH) {
+                TaskBatch *batch = writeNode->batch;
+                if (batch) {
+                    for (int i = 0; i < batch->count; i++) {
+                        worker->state->file_count++;
+                        // 使用 Batch 中携带的 stat 信息，无需再次 lstat
+                        // 此时是在 AsyncWorker 线程内，无锁连续写入
+                        format_output(worker->cfg, worker->state, batch->paths[i], &batch->stats[i]);
+                        worker->pending_count++;
+                    }
+                    // 关键：必须销毁 Batch 以释放内存！
+                    batch_destroy(batch); 
+                } else {
+                    fprintf(stderr, "Worker: 批次为空\n");
+                }
             } else if (writeNode->type == NODE_TYPE_CHECKPOINT) {
                 // === 处理检查点 ===
                 perform_flush_output(worker);
