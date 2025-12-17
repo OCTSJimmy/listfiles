@@ -311,6 +311,8 @@ static void run_main_looper(Config *cfg, RuntimeState *state, AsyncWorker *worke
         switch (msg->what) {
             case MSG_RESULT_BATCH: {
                 TaskBatch *batch = (TaskBatch *)msg->obj;
+                // === [新增] 创建一个专门用于写入的批次 ===
+                TaskBatch *output_batch = batch_create();
                 
                 // === 串行处理一批结果 (无锁去重) ===
                 for (int i = 0; i < batch->count; i++) {
@@ -334,11 +336,11 @@ static void run_main_looper(Config *cfg, RuntimeState *state, AsyncWorker *worke
                         
                         // 目录本身输出
                         if (cfg->include_dir || cfg->print_dir) {
-                             if(cfg->include_dir) push_write_task_file(worker, path, st);
+                             if(cfg->include_dir) batch_add(output_batch, path, st);
                              if(cfg->print_dir) {
                                  // 直接写 stderr 或者通过 async worker
                                  // 这里为了简单保持原样，注意线程安全
-                                 // fprintf(stderr, "目录: %s\n", path);
+                                 fprintf(stderr, "目录: %s\n", path);
                              }
                         }
                         
@@ -349,8 +351,19 @@ static void run_main_looper(Config *cfg, RuntimeState *state, AsyncWorker *worke
                     } else {
                         // 如果是文件，直接输出
                         state->file_count++;
-                        push_write_task_file(worker, path, st);
+                        batch_add(output_batch, path, st);
                     }
+                    // [新增]：如果输出批次满了，立即发送
+                    if (output_batch->count >= BATCH_SIZE) {
+                        push_write_task_batch(worker, output_batch);
+                        output_batch = batch_create(); // 换新篮子
+                    }
+                }
+                // [新增]：发送剩余的输出批次
+                if (output_batch->count > 0) {
+                    push_write_task_batch(worker, output_batch);
+                } else {
+                    batch_destroy(output_batch); // 空篮子销毁
                 }
                 // 处理完一批，销毁这个批次数据
                 batch_destroy(batch);
@@ -367,9 +380,7 @@ static void run_main_looper(Config *cfg, RuntimeState *state, AsyncWorker *worke
         // 回收消息壳
         mq_recycle(&g_looper_mq, msg);
     }
-
     verbose_printf(cfg, 1, "所有扫描任务已完成。\n");
-
     // 5. 清理现场
     // 销毁 Worker 队列 -> Worker 线程会读到 NULL 并退出
     mq_destroy(&g_worker_mq);

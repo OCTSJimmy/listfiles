@@ -50,12 +50,10 @@ static void perform_save_progress(AsyncWorker *worker, const ProgressSnapshot *s
 static void *worker_thread_func(void *arg) {
     // 1. 获取上下文
     AsyncWorker *worker = (AsyncWorker *)arg;
-    
     worker->last_flush_time = time(NULL);
 
     while (true) {
         WriteNode *writeNode = NULL;
-        
         // 2. 加锁访问 worker->mutex
         pthread_mutex_lock(&worker->mutex);
         
@@ -133,6 +131,31 @@ static void *worker_thread_func(void *arg) {
     
     perform_flush_output(worker);
     return NULL;
+}
+// [新增] 批量提交接口
+void push_write_task_batch(AsyncWorker *worker, TaskBatch *batch) {
+    if (!worker || !batch) return;
+    if (batch->count == 0) {
+        batch_destroy(batch);
+        return;
+    }
+
+    WriteNode *writeNode = safe_malloc(sizeof(WriteNode));
+    writeNode->type = NODE_TYPE_BATCH;
+    writeNode->batch = batch; // 接管所有权
+    writeNode->path = NULL;
+    writeNode->next = NULL;
+
+    pthread_mutex_lock(&worker->mutex);
+    if (worker->tail) {
+        worker->tail->next = writeNode;
+        worker->tail = writeNode;
+    } else {
+        worker->head = worker->tail = writeNode;
+    }
+    worker->queue_count++;
+    pthread_cond_signal(&worker->cond);
+    pthread_mutex_unlock(&worker->mutex);
 }
 
 AsyncWorker* async_worker_init(const Config *cfg, RuntimeState *state) {
@@ -235,6 +258,9 @@ void async_worker_shutdown(AsyncWorker *worker) {
     WriteNode *curr = worker->head;
     while(curr) {
         WriteNode *next = curr->next;
+        if (curr->type == NODE_TYPE_BATCH) {
+            batch_destroy(curr->batch);
+        }
         if (curr->path) free(curr->path);
         free(curr);
         curr = next;

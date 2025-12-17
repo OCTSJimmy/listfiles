@@ -2,12 +2,15 @@
 #define ASYNC_WORKER_H
 
 #include "config.h"
+#include "config.h"
+#include "looper.h" // [新增] 需要 TaskBatch 定义
 #include <pthread.h>
 #include <stdbool.h>
 
 typedef enum {
     NODE_TYPE_FILE,
-    NODE_TYPE_CHECKPOINT
+    NODE_TYPE_CHECKPOINT,
+    NODE_TYPE_BATCH
 } WriteNodeType;
 
 // 进度快照结构体
@@ -21,8 +24,15 @@ typedef struct {
 
 typedef struct WriteNode {
     WriteNodeType type;
-    char *path;               // 仅 TYPE_FILE 有效
-    ProgressSnapshot progress; // 仅 TYPE_CHECKPOINT 有效
+    
+    // 联合体 payload (可选优化，为了代码清晰暂时维持原样或直接添加字段)
+    // 为保持兼容性，我们直接添加字段，依靠 type 区分
+    char *path;               
+    
+    // [新增] 批量数据包
+    TaskBatch *batch;         
+
+    ProgressSnapshot progress; 
     struct WriteNode *next;
     bool has_cached_stat;
     struct stat cached_stat;
@@ -55,13 +65,13 @@ AsyncWorker* async_worker_init(const Config *cfg, RuntimeState *state);
 // 提交一个文件路径 (主线程调用，需传入 worker 实例)
 void push_write_task_file(AsyncWorker *worker, const char *path, const struct stat *info);
 
-// 提交一个进度检查点 (主线程调用，需传入 worker 实例)
+// [新增] 提交一批文件任务 (worker 将接管 batch 的内存所有权)
+void push_write_task_batch(AsyncWorker *worker, TaskBatch *batch);
+
 void push_write_task_checkpoint(AsyncWorker *worker, const RuntimeState *current_state);
 
-// 等待处理完毕并关闭，同时释放 worker 内存
 void async_worker_shutdown(AsyncWorker *worker);
 
-// 获取队列大小
 size_t async_worker_get_queue_size(AsyncWorker *worker);
 
 #endif
