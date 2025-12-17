@@ -15,15 +15,11 @@ void format_output(const Config *cfg, RuntimeState *state, const char *path, con
 // 初始化输出文件（包括普通输出和分片输出）
 void init_output_files(const Config *cfg, RuntimeState *state);
 
-// 显示实时状态信息
-void display_status(const ThreadSharedState *shared);
-
-// 状态显示线程的执行函数
-void *status_thread_func(void *arg);
+// 执行切片轮转
+void rotate_output_slice(const Config *cfg, RuntimeState *state);
 
 void cleanup_cache(RuntimeState *state);
 void close_output_file(FILE *fp);
 void format_mode_str(mode_t mode, char *buf);
-double calculate_rate(time_t start_time, unsigned long count);
 
 #endif // OUTPUT_H

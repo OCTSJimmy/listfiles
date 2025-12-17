@@ -8,6 +8,9 @@
 #include <pthread.h>
 #include <zlib.h>
 
+
+struct AsyncWorker;
+
 // =======================================================
 // 全局常量与宏
 // =======================================================
@@ -157,8 +160,8 @@ typedef struct {
 typedef struct {
     const Config *cfg;
     const RuntimeState *state;
-    // 【删除】 const SmartQueue *queue;  <-- 已移除
+    struct AsyncWorker *worker; // [新增]：持有 worker 句柄
     volatile int running;
-} ThreadSharedState;
+} ThreadSharedState; 
 
 #endif // CONFIG_H

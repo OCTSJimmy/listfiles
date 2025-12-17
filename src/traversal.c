@@ -5,7 +5,8 @@
 #include "progress.h"
 #include "idempotency.h"
 #include "signals.h"
-#include "output.h" // 确保包含 format_elapsed_time 等
+#include "output.h"
+#include "monitor.h" // [新增]
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,7 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <sys/sysinfo.h>
+#include "monitor.h" // 新增引用
 
 // === 全局队列与状态 ===
 // 主线程收信箱 (处理结果) - 仅由主线程访问，无需额外锁保护
@@ -223,7 +225,7 @@ static void dispatch_resume_file(const Config *cfg) {
 // - 处理Worker线程返回的结果
 // - 维护全局任务计数（使用atomic类型确保线程安全）
 // - 线程安全注意：所有对全局状态的修改都需要保证线程安全
-static void run_main_looper(Config *cfg, RuntimeState *state) {
+static void run_main_looper(Config *cfg, RuntimeState *state, AsyncWorker *worker) {
     // 1. 初始化双队列
     mq_init(&g_looper_mq);
     mq_init(&g_worker_mq);
@@ -271,7 +273,7 @@ static void run_main_looper(Config *cfg, RuntimeState *state) {
                     atomic_fetch_add(&g_pending_tasks, 1);
                     mq_send(&g_worker_mq, MSG_SCAN_DIR, strdup(cfg->target_path));
                 } else {
-                    push_write_task_file(cfg->target_path, &root_info);
+                    push_write_task_file(worker, cfg->target_path, &root_info);
                     state->file_count++;
                 }
             }
@@ -286,7 +288,7 @@ static void run_main_looper(Config *cfg, RuntimeState *state) {
                 mq_send(&g_worker_mq, MSG_SCAN_DIR, strdup(cfg->target_path));
             } else {
                 // 如果是单文件，直接输出
-                push_write_task_file(cfg->target_path, &root_info);
+                push_write_task_file(worker, cfg->target_path, &root_info);
                 state->file_count++;
             }
         } else {
@@ -332,7 +334,7 @@ static void run_main_looper(Config *cfg, RuntimeState *state) {
                         
                         // 目录本身输出
                         if (cfg->include_dir || cfg->print_dir) {
-                             if(cfg->include_dir) push_write_task_file(path, st);
+                             if(cfg->include_dir) push_write_task_file(worker, path, st);
                              if(cfg->print_dir) {
                                  // 直接写 stderr 或者通过 async worker
                                  // 这里为了简单保持原样，注意线程安全
@@ -347,7 +349,7 @@ static void run_main_looper(Config *cfg, RuntimeState *state) {
                     } else {
                         // 如果是文件，直接输出
                         state->file_count++;
-                        push_write_task_file(path, st);
+                        push_write_task_file(worker, path, st);
                     }
                 }
                 // 处理完一批，销毁这个批次数据
@@ -389,10 +391,9 @@ void traverse_files(Config *cfg, RuntimeState *state) {
     if (!g_history_object_set) {
         g_history_object_set = hash_set_create(HASH_SET_INITIAL_SIZE);
     }
-    
     // 2. 启动 AsyncWorker (写文件线程)
     // 这是独立的，用于写磁盘，不受 Looper 架构影响
-    async_worker_init(cfg, state);
+    AsyncWorker *worker = async_worker_init(cfg, state);
     
     // 2. 启动监控线程 (可选)
     // 注意：这里我们不再传递 Queue，因为 SmartQueue 已废弃
@@ -400,17 +401,19 @@ void traverse_files(Config *cfg, RuntimeState *state) {
     ThreadSharedState shared = {
         .cfg = cfg,
         .state = state,
+        .worker = worker, // [修改点]：填充 worker
         .running = 1
     };
     pthread_t status_thread;
     pthread_create(&status_thread, NULL, status_thread_func, &shared);
 
     // 3. 运行主循环 (阻塞直到完成)
-    run_main_looper(cfg, state);
+    run_main_looper(cfg, state, worker);
 
     // 4. 关闭流程
     verbose_printf(cfg, 1, "等待异步写入完成...\n");
-    async_worker_shutdown();
+    // [修改点]：传入 worker 进行销毁
+    async_worker_shutdown(worker);
     
     shared.running = 0;
     pthread_join(status_thread, NULL);
