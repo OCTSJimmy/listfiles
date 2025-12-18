@@ -121,22 +121,6 @@ static void process_old_slice(const Config *cfg, unsigned long index) {
     }
 }
 
-// ==========================================
-// 4. 进度记录 (核心生产者 - 必须保留)
-// ==========================================
-static void compress_slice_file(const char *src_path, const char *dst_path) {
-    FILE *in = fopen(src_path, "rb");
-    if (!in) return;
-    gzFile out = gzopen(dst_path, "wb");
-    if (!out) { fclose(in); return; }
-    char buf[16384];
-    size_t len;
-    while ((len = fread(buf, 1, sizeof(buf), in)) > 0) {
-        gzwrite(out, buf, (unsigned)len);
-    }
-    gzclose(out);
-    fclose(in);
-}
 
 // ==========================================
 // 3. 进度记录 (生产者)
@@ -208,7 +192,7 @@ void record_path(const Config *cfg, RuntimeState *state, const char *path, const
 // ==========================================
 
 // 通用 Buffer 解析器：无需 IO，纯内存操作，极快
-static void parse_and_process_buffer(const Config *cfg, MessageQueue *mq, RuntimeState *state, 
+static void parse_and_process_buffer(RuntimeState *state, MessageQueue *mq,  
                                    unsigned char *buf, size_t size, unsigned long *global_index) {
     size_t pos = 0;
     TaskBatch *batch = batch_create();
@@ -302,7 +286,7 @@ int restore_progress(const Config *cfg, MessageQueue *worker_mq, RuntimeState *s
             
             if (uncompress(raw_buf, &dest_len, cmp_buf, c_size) == Z_OK) {
                 // 解析并处理
-                parse_and_process_buffer(cfg, worker_mq, state, raw_buf, dest_len, &global_index);
+                parse_and_process_buffer(state, worker_mq, raw_buf, dest_len, &global_index);
             } else {
                 fprintf(stderr, "警告: 归档块解压失败，跳过该块\n");
             }
@@ -345,7 +329,7 @@ int restore_progress(const Config *cfg, MessageQueue *worker_mq, RuntimeState *s
         if (fsize > 0) {
             unsigned char *buf = safe_malloc(fsize);
             fread(buf, 1, fsize, slice_fp);
-            parse_and_process_buffer(cfg, worker_mq, state, buf, fsize, &global_index);
+            parse_and_process_buffer(state, worker_mq, buf, fsize, &global_index);
             free(buf);
         }
 
