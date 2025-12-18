@@ -535,12 +535,7 @@ void format_output(const Config *cfg, RuntimeState *state, const char *path, con
         state->output_line_count >= cfg->output_slice_lines) {
         rotate_output_slice(cfg, state);
     }
-    if (output != NULL) {
-       fflush(output);
-    } else {
-       perror("Attempted to fflush NULL pointer");
-       exit(EXIT_FAILURE);
-    }
+
 }
 
 // 清理缓存
