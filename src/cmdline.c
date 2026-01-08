@@ -12,50 +12,47 @@ void show_version() {
     printf("listfiles 版本 %s\n", VERSION);
 }
 
+// [修改点 1]：更新帮助信息，补充新功能的说明
 void show_help() {
     printf("\n文件列表器 %s\n", VERSION);
-    printf("递归列出文件及其元数据,支持断点续传\n\n");
+    printf("递归列出文件及其元数据, 支持智能断点续传与半增量扫描\n\n");
     printf("用法: listfiles --path=路径 [选项]\n\n");
-    printf("选项:\n");
+    
+    printf("核心选项:\n");
     printf("  -p, --path=路径        要扫描的目标目录 (必须)\n");
-    printf("  -c, --continue         启用断点续传模式\n");
-    printf("  -f, --progress-file=文件 进度文件前缀 (默认: progress)\n");
-    printf("  -d, --print-dir        打印目录路径到标准错误\n");
-    printf("  -v, --verbose          启用详细输出\n");
-    printf("  -V, --version          显示版本信息\n");
-    printf("  -F, --format=格式      自定义输出格式,支持占位符:\n");
-    printf("                          %%p = 路径, %%s = 大小, %%u = 用户, %%g = 组\n");
-    printf("                          %%m = 修改时间, %%a = 访问时间, %%M = 权限模式\n");
-    printf("                          %%x = 扩展属性\n\n");
+    printf("  -c, --continue         启用智能续传/增量模式:\n");
+    printf("                          - 若上次任务未完成: 继续扫描 (Resume)\n");
+    printf("                          - 若上次任务已成功: 执行半增量扫描 (Incremental)\n");
+    printf("      --runone           强制全量扫描 (忽略历史进度，相当于 Fresh Start)\n");
+    printf("  -y, --yes              跳过启动时的交互式确认 (Non-interactive)\n");
+    printf("      --skip-interval=秒 设置半增量扫描的时间阈值 (默认: 0)\n");
+    printf("                          - 若文件元数据与历史一致且修改时间超过此阈值，则跳过lstat\n");
+    
+    printf("\n输出控制:\n");
+    printf("  -f, --progress-file=文件 进度文件/历史记录前缀 (默认: progress)\n");
     printf("  -o, --output=文件      将结果写入指定文件 (默认: %s)\n", DEFAULT_OUTPUT_FILE);
-    printf("  -O, --output-split=目录 将结果按行拆分到指定目录 (默认: %lu)\n",(long unsigned int) DEFAULT_OUTPUT_SPLIT_DIR);
-    printf("      --max-slice=行数   每个输出切片的最大行数 (默认: %lu)\n", (long unsigned int) DEFAULT_OUTPUT_SLICE_LINES);
-    printf("  -Z, --archive          压缩已处理的进度文件切片, 归档后会删掉原文件\n");
-    printf("  -C, --clean            删除已处理的进度文件切片, 不归档\n");
-    printf("      --decompress       解压缩归档文件并输出内容\n");
-    printf("  -Q, --quote            对输出结果进行引号包裹\n");
-    printf("  -D, --dirs             包含目录信息\n");
-    printf("  -R, --resume-from=文件 从指定的进度文件恢复\n");
+    printf("  -O, --output-split=目录 将结果按行拆分到指定目录\n");
+    printf("      --csv              启用标准 CSV 输出格式 (Quote all fields)\n");
+    printf("  -Q, --quote            对输出结果进行引号包裹 (非 CSV 模式下的简单包裹)\n");
+    printf("  -D, --dirs             包含目录本身的信息\n");
+    printf("  -d, --print-dir        打印目录路径到标准错误 (实时进度)\n");
     printf("  -M, --mute             禁用所有输出\n");
-    printf("注意: -o与-O互斥, -Z与-C互斥\n");
-    printf("verbose控制:\n");
-    printf("  --verbose-type=类型    控制verbose输出类型 (0/1,0: Full, 1:Versioned, Default: 0)\n");
-    printf("  --verbose-level=级别   控制verbose输出级别 (0-999999999)\n");
-    printf("元数据标志 (被--format覆盖):\n");
-    printf("  --size                 包含文件大小\n");
-    printf("  --user                 包含所有者用户\n");
-    printf("  --group                包含所有者组\n");
-    printf("  --mtime                包含修改时间\n");
-    printf("  --atime                包含访问时间\n");
-    printf("  --mode                 包含权限模式\n");
-    printf("  --xattr                包含扩展属性\n");
-    printf("  --follow-symlinks      跟踪符号链接\n\n");
-    printf("示例:\n");
-    printf("  listfiles -p /data --continue --format=\"%%p|%%s|%%u|%%m\"\n");
-    printf("  listfiles -p /home --size --user --mtime > 文件列表.csv\n");
-    printf("  listfiles -p /home -D --mode --xattr --quote\n");
-    printf("  listfiles -p /data -c -R resume_file --output-split=output/\n");
+
+    printf("\n格式化与元数据:\n");
+    printf("  -F, --format=格式      自定义输出格式 (如 \"%%p|%%s|%%m\")\n");
+    printf("                          %%p=路径, %%s=大小, %%u=用户, %%g=组, %%m=mtime\n");
+    printf("  --size, --user, --group, --mtime, --atime, --mode, --xattr  启用特定元数据列\n");
+    printf("  --follow-symlinks      跟踪符号链接\n");
+
+    printf("\n高级/维护:\n");
+    printf("  -Z, --archive          压缩已处理的进度分片 (归档)\n");
+    printf("  -C, --clean            删除已处理的进度分片 (清理)\n");
+    printf("  -R, --resume-from=文件 仅从指定的进度列表文件恢复 (旧版兼容模式)\n");
+    printf("  --max-slice=行数       每个输出切片的最大行数\n");
+    printf("  -v, --verbose          启用详细日志\n");
+    printf("  -h, --help             显示此帮助信息\n");
 }
+
 
 void init_config(Config *cfg) {
     cfg->progress_base = "progress";
@@ -89,7 +86,6 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"mtime", no_argument, 0, 4},
         {"atime", no_argument, 0, 5},
         {"follow-symlinks", no_argument, 0, 6},
-        {"help", no_argument, 0, 'h'},
         {"max-slice", required_argument, 0, 7},
         {"archive", no_argument, 0, 'Z'},
         {"clean", no_argument, 0, 'C'},
@@ -104,11 +100,16 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"dirs", no_argument, 0, 'D'},
         {"resume-from", required_argument, 0, 'R'},
         {"mute", no_argument, 0, 'M'},
+        {"runone", no_argument, 0, 20},
+        {"yes", no_argument, 0, 'y'},
+        {"skip-interval", required_argument, 0, 21},
+        {"csv", no_argument, 0, 22},
+        {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
     
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:cf:dvVF:ZCX:hO:o:QDRM", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:cf:dvVF:ZCX:hO:o:QDRMy", long_options, NULL)) != -1) {
         switch (opt) {
             case 'p': cfg->target_path = strdup(optarg); break;
             case 'c': cfg->continue_mode = true; break;
@@ -165,7 +166,13 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
                     if (!cfg->progress_base) cfg->progress_base = "resume_task";
                 }
                 break;
-            case 'M': cfg->mute = true; break;
+            case 'M': cfg->mute = true; break;             // [修改点 4]：处理新参数
+            case 20: cfg->runone = true; break;            // --runone
+            case 'y': cfg->sure = true; break;             // --yes
+            case 21:                                       // --skip-interval
+                cfg->skip_interval = atol(optarg);
+                break;
+            case 22: cfg->csv = true; break;               // --csv
             case 'h': default: show_help(); return -1;
         }
     }
