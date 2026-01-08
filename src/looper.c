@@ -17,6 +17,19 @@ TaskBatch* batch_create() {
     return b;
 }
 
+int mq_get_size(MessageQueue *mq) {
+    if (!mq) return 0;
+    int count = 0;
+    pthread_mutex_lock(&mq->mutex);
+    Message *curr = mq->head;
+    while (curr) {
+        count++;
+        curr = curr->next;
+    }
+    pthread_mutex_unlock(&mq->mutex);
+    return count;
+}
+
 void batch_add(TaskBatch *batch, const char *path, const struct stat *info) {
     if (batch->count < BATCH_SIZE) {
         batch->paths[batch->count] = strdup(path); // 复制路径字符串

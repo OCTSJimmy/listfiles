@@ -1,11 +1,13 @@
 #include "output.h"
 #include "utils.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <pwd.h>
 #include <grp.h>
 #include <errno.h>
 #include <unistd.h>
+#include <time.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <linux/fs.h>
@@ -35,6 +37,36 @@ void format_mode_str(mode_t mode, char *buf) {
 // =======================================================
 // lsattr 探测与缓存 (基于 RuntimeState)
 // =======================================================
+
+// ==========================================
+// 2. 格式化核心
+// ==========================================
+
+// [新增] 辅助：获取文件类型字符串
+static const char* get_type_str(mode_t mode) {
+    if (S_ISREG(mode)) return "FILE";
+    if (S_ISDIR(mode)) return "DIR";
+    if (S_ISLNK(mode)) return "LINK";
+    if (S_ISCHR(mode)) return "CHR";
+    if (S_ISBLK(mode)) return "BLK";
+    if (S_ISFIFO(mode)) return "FIFO";
+    if (S_ISSOCK(mode)) return "SOCK";
+    return "UNKNOWN";
+}
+
+// [新增] 辅助：打印 CSV 字段 (RFC 4180)
+// 规则：始终用双引号包裹，内容中的双引号替换为两个双引号
+static void print_csv_field(FILE *fp, const char *str) {
+    fputc('"', fp);
+    while (*str) {
+        if (*str == '"') {
+            fputc('"', fp); // Escape " to ""
+        }
+        fputc(*str, fp);
+        str++;
+    }
+    fputc('"', fp);
+}
 
 // 查找设备状态 (线程安全)
 static DeviceStatus get_device_status(dev_t dev, RuntimeState *state) {
@@ -130,7 +162,7 @@ static void get_xattr_str(RuntimeState *state, const char *path, const struct st
 }
 
 // 获取用户名(哈希表实现)
-const char *get_username(uid_t uid, RuntimeState *state) {
+const char *get_username( RuntimeState *state, uid_t uid) {
     // 计算哈希桶索引
     unsigned bucket = uid % UID_CACHE_SIZE;
     
@@ -145,7 +177,7 @@ const char *get_username(uid_t uid, RuntimeState *state) {
     
     // 缓存未命中,查询系统
     struct passwd *pw = getpwuid(uid);
-char temp_buf[256]; // 临时缓冲区，足够容纳 name(uid)
+    char temp_buf[256]; // 临时缓冲区，足够容纳 name(uid)
 
     if (pw) {
         // 找到了：格式化为 "root(0)" 或 "www-data(33)"
@@ -170,7 +202,7 @@ char temp_buf[256]; // 临时缓冲区，足够容纳 name(uid)
 }
 
 // 获取组名(哈希表实现)
-const char *get_groupname(gid_t gid, RuntimeState *state) {
+const char *get_groupname(RuntimeState *state, gid_t gid) {
     // 计算哈希桶索引
     unsigned bucket = gid % GID_CACHE_SIZE;
     
@@ -228,68 +260,74 @@ void cleanup_compiled_format(Config *cfg) {
  * 格式预编译实现
  **********************/
 void precompile_format(Config *cfg) {
-    if (!cfg->format) return;
+    const char *fmt = cfg->format;
     
-    char *fmt = cfg->format;
-    cfg->compiled_format = safe_malloc(256 * sizeof(FormatSegment)); // 最多256段
-    cfg->format_segment_count = 0;
+    if (cfg->csv && !fmt) {
+        // [默认 CSV 格式] Inode,Path,Size,User,Group,UID,GID,ModeStr,OctMode,Type,Mtime,Ctime
+        fmt = "%i,%p,%s,%u,%g,%U,%G,%o,%O,%t,%m,%c";
+    } else if (!fmt) {
+        // [默认文本格式]
+        fmt = "%p|%s|%m";
+    }
+
+    int count = 0;
+    int capacity = 32;
+    cfg->compiled_format = safe_malloc(sizeof(FormatSegment) * capacity);
     
-    char *segment_start = fmt;
-    int segment_length = 0;
-    
-    while (*fmt) {
-        if (*fmt == '%') {
-            // 处理之前的文本段
-            if (segment_length > 0) {
-                FormatSegment seg;
-                seg.type = FMT_TEXT;
-                seg.text = safe_malloc(segment_length + 1);
-                strncpy(seg.text, segment_start, segment_length);
-                seg.text[segment_length] = '\0';
-                cfg->compiled_format[cfg->format_segment_count++] = seg;
-                segment_length = 0;
-            }
-            
-            // 处理占位符
+    const char *p = fmt;
+    while (*p) {
+        if (*p == '%') {
+            p++;
+            if (*p == '\0') break;
+
             FormatSegment seg;
-            switch (*(++fmt)) {
+            seg.text = NULL; 
+
+            switch (*p) {
                 case 'p': seg.type = FMT_PATH; break;
                 case 's': seg.type = FMT_SIZE; break;
                 case 'u': seg.type = FMT_USER; break;
                 case 'g': seg.type = FMT_GROUP; break;
+                case 'U': seg.type = FMT_UID; break; 
+                case 'G': seg.type = FMT_GID; break;
                 case 'm': seg.type = FMT_MTIME; break;
                 case 'a': seg.type = FMT_ATIME; break;
-                case 'M': seg.type = FMT_MODE; break;
-                case 'X': seg.type = FMT_XATTR; break;
-                default:  // 无效占位符当作普通文本
-                    seg.type = FMT_TEXT;
-                    seg.text = safe_malloc(3);
-                    seg.text[0] = '%';
-                    seg.text[1] = *fmt;
-                    seg.text[2] = '\0';
-                    cfg->compiled_format[cfg->format_segment_count++] = seg;
-                    fmt++;
-                    segment_start = fmt;
-                    continue;
+                case 'c': seg.type = FMT_CTIME; break;
+                case 't': seg.type = FMT_TYPE; break;
+                case 'i': seg.type = FMT_INODE; break;
+                case 'o': seg.type = FMT_MODE; break;    
+                case 'O': seg.type = FMT_ST_MODE; break; 
+                default: 
+                    seg.type = FMT_TEXT; 
+                    char *tmp = safe_malloc(3);
+                    tmp[0] = '%'; tmp[1] = *p; tmp[2] = '\0';
+                    seg.text = tmp;
+                    break;
             }
-            seg.text = NULL;
-            cfg->compiled_format[cfg->format_segment_count++] = seg;
-            segment_start = ++fmt;
+            p++;
+            
+            if (count >= capacity) {
+                capacity *= 2;
+                cfg->compiled_format = realloc(cfg->compiled_format, sizeof(FormatSegment) * capacity);
+            }
+            cfg->compiled_format[count++] = seg;
         } else {
-            segment_length++;
-            fmt++;
+            const char *start = p;
+            while (*p && *p != '%') p++;
+            int len = p - start;
+            char *text = safe_malloc(len + 1);
+            strncpy(text, start, len);
+            text[len] = '\0';
+            
+            if (count >= capacity) {
+                capacity *= 2;
+                cfg->compiled_format = realloc(cfg->compiled_format, sizeof(FormatSegment) * capacity);
+            }
+            cfg->compiled_format[count].type = FMT_TEXT;
+            cfg->compiled_format[count++].text = text;
         }
     }
-    
-    // 处理最后的文本段
-    if (segment_length > 0) {
-        FormatSegment seg;
-        seg.type = FMT_TEXT;
-        seg.text = safe_malloc(segment_length + 1);
-        strncpy(seg.text, segment_start, segment_length);
-        seg.text[segment_length] = '\0';
-        cfg->compiled_format[cfg->format_segment_count++] = seg;
-    }
+    cfg->format_segment_count = count;
 }
 
 // 在创建新输出文件或切换切片时加锁
@@ -427,115 +465,90 @@ void rotate_output_slice(const Config *cfg, RuntimeState *state) {
     state->output_line_count = 0;
 }
 
-void format_output(const Config *cfg, RuntimeState *state, const char *path, const struct stat *info) {
-    FILE *output = state->output_fp ? state->output_fp : stdout;
-    // verbose_printf(cfg, 1, "输出装置：%s(%s)\n", state->output_fp ? "文件" : "屏幕", state->output_fp ? cfg->output_file : "stdout");
-    // 使用预编译格式输出
-    // 在写入文件前加写锁
-    bool q = cfg->quote;
-    if (cfg->compiled_format) {
-        for (int i = 0; i < cfg->format_segment_count; i++) {
-            switch (cfg->compiled_format[i].type) {
-                case FMT_TEXT:
-                    // 文本段（分隔符）不加引号
-                    fputs(cfg->compiled_format[i].text, output);
-                    break;
-                case FMT_PATH:
-                    if (q) fputc('"', output);
-                    fputs(path, output);
-                    if (q) fputc('"', output);
-                    break;
-                case FMT_SIZE:
-                    if (q) fputc('"', output);
-                    fprintf(output, "%lld", (long long)info->st_size);
-                    if (q) fputc('"', output);
-                    break;
-                case FMT_USER:
-                    if (q) fputc('"', output);
-                    fputs(get_username(info->st_uid, state), output);
-                    if (q) fputc('"', output);
-                    break;
-                case FMT_GROUP:
-                    if (q) fputc('"', output);
-                    fputs(get_groupname(info->st_gid, state), output);
-                    if (q) fputc('"', output);
-                    break;
-                case FMT_MTIME:
-                    if (q) fputc('"', output);
-                    fputs(format_time(info->st_mtime), output);
-                    if (q) fputc('"', output);
-                    break;
-                case FMT_ATIME:
-                    if (q) fputc('"', output);
-                    fputs(format_time(info->st_atime), output);
-                    if (q) fputc('"', output);
-                    break;
-                case FMT_MODE: {
-                    char mode_str[11];   
-                    format_mode_str(info->st_mode, mode_str);
-                    if (q) fputc('"', output);
-                    fprintf(output, "%s", mode_str);
-                    if (q) fputc('"', output);
-                    break;
-                }
-                case FMT_XATTR: {
-                    char attr_str[32];
-                    get_xattr_str(state, path, info, attr_str);
-                    if (q) fputc('"', output);
-                    fputs(attr_str, output);
-                    if (q) fputc('"', output);
-                    break;
-                }
-            }
-        }
-        fputc('\n', output);
-    } else {
-        // 默认模式：按需加引号
-        if (q) fprintf(output, "\"%s\"", path);
-        else fprintf(output, "%s", path);
+// 兼容旧接口的占位函数
+void format_output(const Config *cfg, RuntimeState *state, const char *path, const struct stat *st, char *buffer, size_t size) {
+    // 实际逻辑已移至 print_to_stream
+    if (size > 0) buffer[0] = '\0';
+}
 
-        if (cfg->size) {
-            if (q) fprintf(output, " \"%lld\"", (long long)info->st_size);
-            else fprintf(output, " %lld", (long long)info->st_size);
+// 直接输出到流 (性能更高)
+// 直接输出到流
+void print_to_stream(const Config *cfg, RuntimeState *state, const char *path, const struct stat *st, FILE *fp) {
+    char temp_buf[MAX_PATH_LENGTH]; // 通用缓冲区
+
+    for (int i = 0; i < cfg->format_segment_count; i++) {
+        FormatSegment *seg = &cfg->compiled_format[i];
+        
+        if (seg->type == FMT_TEXT) {
+            // CSV 模式下，如果格式串里包含逗号，这里原样输出即可
+            // 因为 precompile_format 会保证生成正确的逗号分隔符
+            if (seg->text) fputs(seg->text, fp);
+            continue;
         }
-        if (cfg->user) {
-            if (q) fprintf(output, " \"%s\"", get_username(info->st_uid, state));
-            else fprintf(output, " %s", get_username(info->st_uid, state));
+
+        const char *val_str = NULL;
+        
+        switch (seg->type) {
+            case FMT_PATH:
+                val_str = path;
+                break;
+            case FMT_SIZE:
+                snprintf(temp_buf, sizeof(temp_buf), "%ld", (long)st->st_size);
+                val_str = temp_buf;
+                break;
+            case FMT_USER:
+                val_str = get_username(state, st->st_uid);
+                break;
+            case FMT_GROUP:
+                val_str = get_groupname(state, st->st_gid);
+                break;
+            case FMT_UID: // 需确保 config.h 枚举定义了 FMT_UID
+                snprintf(temp_buf, sizeof(temp_buf), "%d", st->st_uid);
+                val_str = temp_buf;
+                break;
+            case FMT_GID:
+                snprintf(temp_buf, sizeof(temp_buf), "%d", st->st_gid);
+                val_str = temp_buf;
+                break;
+            case FMT_MTIME:
+                val_str = format_time(st->st_mtime); // 使用 utils.c 的版本
+                break;
+            case FMT_ATIME:
+                val_str = format_time(st->st_atime);
+                break;
+            case FMT_CTIME: 
+                val_str = format_time(st->st_ctime);
+                break;
+            case FMT_MODE: // rwxr-xr-x
+                format_mode_str(st->st_mode, temp_buf);
+                val_str = temp_buf;
+                break;
+            case FMT_ST_MODE: // 0755
+                snprintf(temp_buf, sizeof(temp_buf), "0%o", st->st_mode & 0777);
+                val_str = temp_buf;
+                break;
+            case FMT_TYPE: 
+                val_str = get_type_str(st->st_mode);
+                break;
+            case FMT_INODE: 
+                snprintf(temp_buf, sizeof(temp_buf), "%lu", (unsigned long)st->st_ino);
+                val_str = temp_buf;
+                break;
+            default:
+                val_str = "";
         }
-        if (cfg->group) {
-            if (q) fprintf(output, " \"%s\"", get_groupname(info->st_gid, state));
-            else fprintf(output, " %s", get_groupname(info->st_gid, state));
+
+        if (cfg->csv) {
+            print_csv_field(fp, val_str);
+        } else if (cfg->quote) {
+            fputc('"', fp);
+            if (val_str) fputs(val_str, fp);
+            fputc('"', fp);
+        } else {
+            if (val_str) fputs(val_str, fp);
         }
-        if (cfg->mtime) {
-            if (q) fprintf(output, " \"%s\"", format_time(info->st_mtime));
-            else fprintf(output, " %s", format_time(info->st_mtime));
-        }
-        if (cfg->atime) {
-            if (q) fprintf(output, " \"%s\"", format_time(info->st_atime));
-            else fprintf(output, " %s", format_time(info->st_atime));
-        }
-        if (cfg->mode) {
-            char mode_str[11];
-            format_mode_str(info->st_mode, mode_str);
-            if (q) fprintf(output, " \"%s\"", mode_str);
-            else fprintf(output, " %s", mode_str);
-        }
-        if (cfg->xattr) {
-            char xattr_buf[32];
-            get_xattr_str(state, path, info, xattr_buf);
-            if (q) fprintf(output, " \"%s\"", xattr_buf);
-            else fprintf(output, " %s", xattr_buf);
-        }
-        fputc('\n', output);
     }
-
-    // 检查是否需要切换输出切片
-    state->output_line_count++;
-    if (cfg->output_split_dir && 
-        state->output_line_count >= cfg->output_slice_lines) {
-        rotate_output_slice(cfg, state);
-    }
-
+    fputc('\n', fp);
 }
 
 // 清理缓存

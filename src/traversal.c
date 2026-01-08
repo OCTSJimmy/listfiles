@@ -6,7 +6,7 @@
 #include "idempotency.h"
 #include "signals.h"
 #include "output.h"
-#include "monitor.h" // [新增]
+#include "monitor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,42 +17,76 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <sys/sysinfo.h>
-#include "monitor.h" // 新增引用
 
 // === 全局队列与状态 ===
-// 主线程收信箱 (处理结果) - 仅由主线程访问，无需额外锁保护
 static MessageQueue g_looper_mq;
-// 工人抢任务池 (处理IO) - 由主线程和多个Worker线程并发访问，内部已实现线程安全
 static MessageQueue g_worker_mq;
-// 正在进行的任务数 (用于判断何时结束) - 使用atomic类型确保原子操作，线程安全
 static atomic_long g_pending_tasks = 0;
 
-// 特殊消息：任务完成通知
-#define MSG_TASK_DONE 999 
+// === 外部全局变量 (Idempotency) ===
+// 1. Looper 专用：本次扫描的访问记录 (用于防止环路)
+extern HashSet* g_visited_history; 
+// 2. Worker 专用：上次扫描的历史索引 (只读，用于半增量跳过)
+extern HashSet* g_reference_history;
+
+// === 本地结构 ===
+// 恢复线程参数
+typedef struct {
+    const Config *cfg;
+    RuntimeState *state;
+    MessageQueue *target_mq;
+} ResumeThreadArgs;
+
+// Worker 线程参数
+typedef struct {
+    const Config *cfg;
+} WorkerArgs;
+
+// 低优先级队列节点 (用于 Looper 暂存新任务)
+typedef struct LowPriNode {
+    char *path;
+    struct LowPriNode *next;
+} LowPriNode;
 
 // ==========================================
-// 1. Worker 线程逻辑 (消费者：只负责IO和打包)
+// 1. Worker 线程逻辑
 // ==========================================
 
-// [IO密集] 扫描单个目录并批量上报
-// 注意：该函数在Worker线程中执行，需要保证线程安全
-// - 不直接修改全局状态，仅通过消息队列与主线程通信
-// - 使用本地变量避免线程竞争
-static void worker_scan_dir(const char *dir_path) {
+// 辅助：将 mode_t 转换为 d_type
+static unsigned char get_dtype_from_stat(mode_t mode) {
+    if (S_ISREG(mode)) return DT_REG;
+    if (S_ISDIR(mode)) return DT_DIR;
+    if (S_ISLNK(mode)) return DT_LNK;
+    if (S_ISCHR(mode)) return DT_CHR;
+    if (S_ISBLK(mode)) return DT_BLK;
+    if (S_ISFIFO(mode)) return DT_FIFO;
+    if (S_ISSOCK(mode)) return DT_SOCK;
+    return DT_UNKNOWN;
+}
+
+// 核心扫描函数：包含半增量跳过逻辑
+static void worker_scan_dir(const Config *cfg, const char *dir_path) {
     DIR *dir = opendir(dir_path);
     if (!dir) {
-        // 无法打开目录，记录错误 (不中断流程)
-        // 使用 stderr 记录错误，因为 worker 线程没有 cfg 指针
-        fprintf(stderr, "无法打开目录: %s, 错误: %s\n", dir_path, strerror(errno));
+        // 权限不足或目录消失是常态，记录错误但不崩溃
+        // fprintf(stderr, "无法打开目录: %s, 错误: %s\n", dir_path, strerror(errno));
         return;
     }
 
-    // 创建一个任务批次 (篮子)
+    // 获取当前目录设备ID (用于构建 key)
+    // 假设: 同一目录下的文件通常在同一设备上 (跨设备挂载点除外，这是为了性能的妥协)
+    struct stat dir_stat;
+    dev_t current_dev = 0;
+    if (lstat(dir_path, &dir_stat) == 0) {
+        current_dev = dir_stat.st_dev;
+    }
+
     TaskBatch *batch = batch_create();
     struct dirent *entry;
+    time_t now = time(NULL);
 
     while ((entry = readdir(dir)) != NULL) {
-        // 跳过 . 和 ..
+        // 跳过 "." 和 ".."
         if (entry->d_name[0] == '.' && 
            (entry->d_name[1] == '\0' || (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) {
             continue;
@@ -60,391 +94,389 @@ static void worker_scan_dir(const char *dir_path) {
 
         char full_path[MAX_PATH_LENGTH];
         int n = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
-        if (n >= MAX_PATH_LENGTH) {
-            // 路径过长被截断，记录错误
-            fprintf(stderr, "警告: 路径过长被截断: %s/%s\n", dir_path, entry->d_name);
-            continue;
+        if (n >= MAX_PATH_LENGTH) continue; // 路径过长忽略
+
+        // === [Phase 3 核心: 半增量跳过逻辑] ===
+        bool skip_lstat = false;
+        struct stat cached_info = {0};
+
+        // 启用条件: 配置了间隔 > 0 && 存在参考历史 && inode 有效
+        if (cfg->skip_interval > 0 && g_reference_history && entry->d_ino != 0) {
+            // 1. 查表 (O(1))
+            HashSetNode *node = hash_set_lookup(g_reference_history, current_dev, entry->d_ino);
+            
+            if (node) {
+                // 2. 校验链 (Verify Chain)
+                
+                // A. 文件名哈希校验 (防 Inode 复用)
+                uint32_t name_hash = calculate_name_hash(entry->d_name);
+                bool hash_match = (node->id.name_hash == name_hash);
+                
+                // B. 类型校验 (d_type 可能为 DT_UNKNOWN，此时不强校验)
+                bool type_match = true;
+                if (entry->d_type != DT_UNKNOWN) {
+                    type_match = (node->id.d_type == entry->d_type);
+                }
+
+                // C. 时间区间校验
+                if (hash_match && type_match) {
+                    double age = difftime(now, node->id.mtime);
+                    if (age > cfg->skip_interval) {
+                        // === HIT! 判定为"死数据"，跳过 lstat ===
+                        skip_lstat = true;
+                        
+                        // 构造伪 stat 信息 (仅填充关键字段)
+                        cached_info.st_ino = entry->d_ino;
+                        cached_info.st_dev = current_dev;
+                        cached_info.st_mtime = node->id.mtime;
+                        cached_info.st_atime = node->id.mtime; // 近似值
+                        cached_info.st_ctime = node->id.mtime; // 近似值
+                        
+                        // 尽可能恢复 st_mode 类型位
+                        if (node->id.d_type == DT_DIR) cached_info.st_mode = S_IFDIR | 0755;
+                        else if (node->id.d_type == DT_REG) cached_info.st_mode = S_IFREG | 0644;
+                        else if (node->id.d_type == DT_LNK) cached_info.st_mode = S_IFLNK | 0777;
+                        else cached_info.st_mode = 0;
+                        
+                        // 注意: size 无法从 Inode 恢复，半增量模式下 size 将为 0
+                        cached_info.st_size = 0; 
+                    }
+                }
+            }
+        }
+        // ========================================
+
+        if (skip_lstat) {
+            // 极速路径：使用缓存元数据
+            batch_add(batch, full_path, &cached_info);
+        } else {
+            // 传统路径：执行 IO
+            struct stat info;
+            if (lstat(full_path, &info) == 0) {
+                batch_add(batch, full_path, &info);
+            }
         }
 
-        struct stat info;
-        // 执行 lstat (这是最耗时的 IO 操作之一)
-        if (lstat(full_path, &info) == 0) {
-            // 加入批次
-            batch_add(batch, full_path, &info);
-
-            // 篮子满了？发送！
-            if (batch->count >= BATCH_SIZE) {
-                mq_send(&g_looper_mq, MSG_RESULT_BATCH, batch);
-                batch = batch_create(); // 换新篮子
-            }
-        } else {
-            // 无法获取文件状态，记录错误
-            fprintf(stderr, "无法获取文件状态: %s, 错误: %s\n", full_path, strerror(errno));
+        // 批次满了发送
+        if (batch->count >= BATCH_SIZE) {
+            mq_send(&g_looper_mq, MSG_RESULT_BATCH, batch);
+            batch = batch_create();
         }
     }
     
-    // 发送剩余的半篮子
-    if (batch->count > 0) {
-        mq_send(&g_looper_mq, MSG_RESULT_BATCH, batch);
-    } else {
-        batch_destroy(batch); // 空篮子直接销毁
-    }
+    // 发送剩余批次
+    if (batch->count > 0) mq_send(&g_looper_mq, MSG_RESULT_BATCH, batch);
+    else batch_destroy(batch);
 
     closedir(dir);
 }
 
-// [IO密集] 批量验证路径 (用于 Resume)
+// 批量检查 (用于 Resume 阶段验证文件是否存在)
 static void worker_check_batch(TaskBatch *input_batch) {
     TaskBatch *result_batch = batch_create();
-    
-    // 遍历输入的一批路径，验证是否存在
     for (int i = 0; i < input_batch->count; i++) {
         struct stat info;
+        // Resume 检查必须 lstat，确保文件还在
         if (lstat(input_batch->paths[i], &info) == 0) {
-            // 存在的有效路径，加入结果批次
             batch_add(result_batch, input_batch->paths[i], &info);
         }
     }
-    
-    // 将有效结果发回 Looper
-    if (result_batch->count > 0) {
-        mq_send(&g_looper_mq, MSG_RESULT_BATCH, result_batch);
-    } else {
-        batch_destroy(result_batch);
-    }
-    
-    // 销毁输入的任务包
+    if (result_batch->count > 0) mq_send(&g_looper_mq, MSG_RESULT_BATCH, result_batch);
+    else batch_destroy(result_batch);
     batch_destroy(input_batch);
 }
 
-// Worker 线程入口函数
-// 注意：该函数是Worker线程的入口点，需要保证线程安全
-// - 通过消息队列与主线程通信，内部已实现线程安全
-// - 每个Worker线程独立执行，互不干扰
-// - 动态分配的内存（如strdup的路径）需要在使用后及时释放
+// Worker 线程入口
 static void* worker_thread_entry(void *arg) {
-    (void)arg;
+    WorkerArgs *args = (WorkerArgs*)arg;
+    const Config *cfg = args->cfg;
+    free(args); // 释放参数容器
+
     while (true) {
-        // 阻塞等待任务
         Message *msg = mq_dequeue(&g_worker_mq);
-        if (!msg) break; // 队列被销毁，退出线程
+        if (!msg) break; // 收到 NULL (Quit)
 
         switch (msg->what) {
             case MSG_SCAN_DIR:
-                // 处理目录扫描任务
-                worker_scan_dir((char *)msg->obj);
-                free(msg->obj); // 释放路径字符串
-                // 通知 Looper 这里的活干完了
+                worker_scan_dir(cfg, (char *)msg->obj);
+                free(msg->obj); // 路径字符串使用完释放
                 mq_send(&g_looper_mq, MSG_TASK_DONE, NULL);
                 break;
                 
             case MSG_CHECK_BATCH:
-                // 处理批量检查任务
                 worker_check_batch((TaskBatch *)msg->obj);
-                // 通知 Looper 这里的活干完了
                 mq_send(&g_looper_mq, MSG_TASK_DONE, NULL);
                 break;
         }
-        
-        // 回收消息对象
         mq_recycle(&g_worker_mq, msg);
     }
     return NULL;
 }
 
 // ==========================================
-// 2. Looper 主控逻辑 (生产者/调度者)
+// 2. Resume 线程 (流控生产者)
 // ==========================================
 
-// 辅助：加载 Resume 文件并派发任务
-static void dispatch_resume_file(const Config *cfg) {
-    FILE *fp = fopen(cfg->resume_file, "r");
-    if (!fp) {
-        perror("无法打开恢复列表文件");
-        return;
-    }
-
-    char line[MAX_PATH_LENGTH + 256];
-    char path_buf[MAX_PATH_LENGTH];
-    size_t prefix_len = strlen(OUTPUT_DIR_PREFIX);
+static void *resume_thread_entry(void *arg) {
+    ResumeThreadArgs *args = (ResumeThreadArgs *)arg;
     
-    TaskBatch *batch = batch_create();
-
-    while (fgets(line, sizeof(line), fp)) {
-        line[strcspn(line, "\n")] = 0;
-        char *path_start = line;
-        while (*path_start == ' ' || *path_start == '\t') path_start++;
-
-        // 去除 "目录: " 前缀
-        if (strncmp(path_start, OUTPUT_DIR_PREFIX, prefix_len) == 0) {
-            path_start += prefix_len;
-        }
-        
-        // 去除双引号 (简单的处理)
-        size_t len = strlen(path_start);
-        if (len > 1 && path_start[0] == '"' && path_start[len-1] == '"') {
-            size_t inner_len = len - 2;
-            if (inner_len >= sizeof(path_buf)) {
-                // 路径过长被截断，记录错误
-                fprintf(stderr, "警告: 恢复文件中的路径过长被截断: %s\n", path_start);
-                continue;
-            }
-            strncpy(path_buf, path_start + 1, inner_len);
-            path_buf[inner_len] = '\0';
-            path_start = path_buf;
-        }
-        
-        if (*path_start == '\0') continue;
-
-        // 加入待检查批次 (stat 暂时空着，由 Worker 填充)
-        batch_add(batch, path_start, NULL);
-
-        // 攒够一批，发给 Worker
-        if (batch->count >= BATCH_SIZE) {
-            atomic_fetch_add(&g_pending_tasks, 1); // 记账：发出了一个任务
-            mq_send(&g_worker_mq, MSG_CHECK_BATCH, batch);
-            batch = batch_create();
-        }
-    }
+    // 执行恢复逻辑 (progress.c)
+    // 这里的 restore_progress 会读取 .pbin/.archive 并发送 batch 到 target_mq
+    restore_progress(args->cfg, args->target_mq, args->state);
     
-    // 发送最后剩余的
-    if (batch->count > 0) {
-        atomic_fetch_add(&g_pending_tasks, 1);
-        mq_send(&g_worker_mq, MSG_CHECK_BATCH, batch);
-    } else {
-        batch_destroy(batch);
-    }
-    fclose(fp);
+    // 通知 Looper 恢复已完成
+    mq_send(&g_looper_mq, MSG_RESUME_FINISHED, NULL);
+    
+    free(args);
+    return NULL;
 }
 
-// 核心循环：Looper
-// 注意：该函数是主线程的核心逻辑，负责协调所有Worker线程
-// - 初始化和销毁消息队列
-// - 启动和停止Worker线程池
-// - 派发初始任务
-// - 处理Worker线程返回的结果
-// - 维护全局任务计数（使用atomic类型确保线程安全）
-// - 线程安全注意：所有对全局状态的修改都需要保证线程安全
-static void run_main_looper(Config *cfg, RuntimeState *state, AsyncWorker *worker) {
-    // 1. 初始化双队列
+// ==========================================
+// 3. Looper 主控逻辑 (调度者)
+// ==========================================
+
+static void run_main_looper(const Config *cfg, RuntimeState *state, AsyncWorker *worker) {
     mq_init(&g_looper_mq);
     mq_init(&g_worker_mq);
     atomic_store(&g_pending_tasks, 0);
 
+    // 1. 初始化本次访问集合 (Looper 独占，防环用)
+    g_visited_history = hash_set_create(HASH_SET_INITIAL_SIZE);
+
     // 2. 启动 Worker 线程池
-    // 根据 CPU 核心数动态调整线程池大小，IO 密集型任务可以使用核心数的 2-4 倍
-    int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
-    if (num_cores < 1) num_cores = 4; // 保底
-    int num_workers = num_cores * 2; 
+    int num_cores = get_nprocs();
+    if (num_cores < 1) num_cores = 4;
+    int num_workers = num_cores * 2; // IO 密集型可适当超配
+    
     pthread_t *workers = safe_malloc(sizeof(pthread_t) * num_workers);
     for (int i = 0; i < num_workers; i++) {
-        pthread_create(&workers[i], NULL, worker_thread_entry, NULL);
+        WorkerArgs *args = safe_malloc(sizeof(WorkerArgs));
+        args->cfg = cfg;
+        pthread_create(&workers[i], NULL, worker_thread_entry, args);
     }
     verbose_printf(cfg, 1, "启动 %d 个 Worker 线程\n", num_workers);
 
-    // 3. 派发初始任务 (种子)
-    if (cfg->continue_mode) {
-        bool resumed = false;
+    // 3. 初始任务分发 & 模式选择
+    bool resume_active = false;
+    
+    // 低优先级队列 (链表，用于 Resume 期间积压新任务)
+    LowPriNode *low_pri_head = NULL;
+    LowPriNode *low_pri_tail = NULL;
+    int low_pri_count = 0;
 
-        if (cfg->resume_file) {
-            // -R 模式：从文本列表恢复
-            verbose_printf(cfg, 1, "正在并行加载恢复列表 (-R)...\n");
-            dispatch_resume_file(cfg); 
-            resumed = true;
+    // A. 强制全量 (--runone)
+    if (cfg->runone) {
+        verbose_printf(cfg, 1, "模式: 强制全量扫描 (--runone)\n");
+        // 下发根目录逻辑在后方统一处理
+    }
+    // B. 智能续传 / 半增量
+    else if (cfg->continue_mode) {
+        // 如果 g_reference_history 已存在(由 main.c 预加载)，说明是“半增量模式”
+        if (g_reference_history) {
+            verbose_printf(cfg, 1, "模式: 半增量扫描 (Reference Loaded)\n");
+            // 半增量本质上也是从根目录重新扫，只是利用 reference 跳过 lstat
+            // 所以这里不需要启动 resume 线程，直接下发根目录即可
         } else {
-            // --continue 模式：尝试从 checkpoint 恢复
-            // 【新增：调用加载索引】
+            // 如果 reference 未加载且 continue_mode=true，说明是“断点续传模式”
+            // 需要加载 .idx 并恢复队列
             if (load_progress_index(cfg, state)) {
-                verbose_printf(cfg, 1, "发现断点，正在恢复进度 (Slice: %lu, Items: %lu)...\n", 
-                               state->process_slice_index, state->processed_count);
+                verbose_printf(cfg, 1, "模式: 断点续传 (Resuming)...\n");
                 
-                // 恢复分片数据
-                int batches = restore_progress(cfg, &g_worker_mq, state);
-                atomic_fetch_add(&g_pending_tasks, batches);
-            } else {
-                verbose_printf(cfg, 1, "未找到有效断点，将从头开始扫描。\n");
+                // 启动恢复线程
+                ResumeThreadArgs *r_args = safe_malloc(sizeof(ResumeThreadArgs));
+                r_args->cfg = cfg;
+                r_args->state = state;
+                r_args->target_mq = &g_worker_mq;
+                
+                pthread_t r_tid;
+                pthread_create(&r_tid, NULL, resume_thread_entry, r_args);
+                pthread_detach(r_tid); // 独立运行
+                
+                resume_active = true;
             }
         }
-        // 如果没有恢复任何进度（或者恢复失败），则从根目录开始
-        if (!resumed) {
-            struct stat root_info;
-            if (lstat(cfg->target_path, &root_info) == 0) {
-                 if (S_ISDIR(root_info.st_mode)) {
-                    atomic_fetch_add(&g_pending_tasks, 1);
-                    mq_send(&g_worker_mq, MSG_SCAN_DIR, strdup(cfg->target_path));
-                } else {
-                    push_write_task_file(worker, cfg->target_path, &root_info);
-                    state->file_count++;
-                }
-            }
-        }
-    } else {
-        // 扫描根目录
+    }
+
+    // C. 如果没有正在进行 Resume，则需要下发根目录作为种子
+    if (!resume_active) {
         struct stat root_info;
         if (lstat(cfg->target_path, &root_info) == 0) {
             if (S_ISDIR(root_info.st_mode)) {
-                // 如果是目录，发给 Worker 去扫
                 atomic_fetch_add(&g_pending_tasks, 1);
                 mq_send(&g_worker_mq, MSG_SCAN_DIR, strdup(cfg->target_path));
             } else {
-                // 如果是单文件，直接输出
+                // 如果目标本身只是个文件
                 push_write_task_file(worker, cfg->target_path, &root_info);
                 state->file_count++;
             }
         } else {
-            // 无法获取根目录状态，记录错误
-            fprintf(stderr, "无法获取根目录状态: %s, 错误: %s\n", cfg->target_path, strerror(errno));
+            fprintf(stderr, "错误: 无法访问目标路径 %s\n", cfg->target_path);
         }
     }
 
-    // 4. Looper 事件循环 (主线程在此空转)
+    // 4. 主事件循环
     while (true) {
-        // 退出条件：所有派发出去的任务都已回报(done)，且 Looper 队列里没积压消息
-        if (atomic_load(&g_pending_tasks) == 0 && g_looper_mq.head == NULL) {
+        // 退出条件检查:
+        // 1. 没有 Pending 任务 (所有发出的任务都 done 了)
+        // 2. Looper 队列空了
+        // 3. Resume 线程结束了
+        // 4. 低优先级队列空了
+        if (atomic_load(&g_pending_tasks) == 0 && 
+            g_looper_mq.head == NULL && 
+            !resume_active && 
+            low_pri_head == NULL) {
             break;
         }
 
-        // 阻塞等待消息
+        // 阻塞等待 Looper 消息
         Message *msg = mq_dequeue(&g_looper_mq);
-        if (!msg) break; // 应该不会发生
+        if (!msg) break;
 
         switch (msg->what) {
             case MSG_RESULT_BATCH: {
                 TaskBatch *batch = (TaskBatch *)msg->obj;
-                // === [新增] 创建一个专门用于写入的批次 ===
                 TaskBatch *output_batch = batch_create();
                 
-                // === 串行处理一批结果 (无锁去重) ===
                 for (int i = 0; i < batch->count; i++) {
                     char *path = batch->paths[i];
                     struct stat *st = &batch->stats[i];
 
-                    // A. 幂等性检查 (这里不需要锁，因为 Looper 是单线程的)
-                    ObjectIdentifier id = {st->st_dev, st->st_ino};
-                    if (hash_set_contains(g_history_object_set, &id)) {
-                        continue; // 重复，跳过
+                    // 1. 防环检查 (Looper 独占访问 g_visited_history，无锁)
+                    ObjectIdentifier id = { .st_dev = st->st_dev, .st_ino = st->st_ino };
+                    if (hash_set_contains(g_visited_history, &id)) {
+                        continue; // 环路或重复，跳过
                     }
-                    hash_set_insert(g_history_object_set, &id);
+                    hash_set_insert(g_visited_history, &id);
 
-                    // B. 逻辑分流
+                    // 2. 处理逻辑
                     if (S_ISDIR(st->st_mode)) {
-                        // 如果是目录，派发新任务给 Worker
-                        atomic_fetch_add(&g_pending_tasks, 1);
-                        mq_send(&g_worker_mq, MSG_SCAN_DIR, strdup(path));
+                        // === 发现目录：产生新任务 ===
                         
+                        // [分级流控逻辑]
+                        if (resume_active) {
+                            // 恢复进行中 -> 压入低优先级队列，暂不发给 Worker
+                            LowPriNode *node = safe_malloc(sizeof(LowPriNode));
+                            node->path = strdup(path);
+                            node->next = NULL;
+                            
+                            if (low_pri_tail) low_pri_tail->next = node;
+                            else low_pri_head = node;
+                            low_pri_tail = node;
+                            low_pri_count++;
+                        } else {
+                            // 正常发送给 Worker
+                            atomic_fetch_add(&g_pending_tasks, 1);
+                            mq_send(&g_worker_mq, MSG_SCAN_DIR, strdup(path));
+                        }
+
                         state->dir_count++;
                         
-                        // 目录本身输出
-                        if (cfg->include_dir || cfg->print_dir) {
-                             if(cfg->include_dir) batch_add(output_batch, path, st);
-                             if(cfg->print_dir) {
-                                 // 使用专门的目录信息输出文件指针输出目录路径
-                                 fprintf(state->dir_info_fp, "%s%s\n", OUTPUT_DIR_PREFIX, path);
-                                 fflush(state->dir_info_fp);
-                             }
+                        // 目录输出与记录
+                        if (cfg->include_dir) batch_add(output_batch, path, st);
+                        if (cfg->print_dir && state->dir_info_fp) {
+                            fprintf(state->dir_info_fp, "%s%s\n", OUTPUT_DIR_PREFIX, path);
                         }
+                        // 只有在 continue 模式下才记录进度到 pbin
+                        if (cfg->continue_mode) record_path(cfg, state, path, st);
                         
-                        // 记录断点 (可选)
-                        if (cfg->continue_mode) {
-                            record_path(cfg, state, path, st);
-                        }
                     } else {
-                        // 如果是文件，直接输出
+                        // === 发现文件：直接输出 ===
                         state->file_count++;
                         batch_add(output_batch, path, st);
                     }
-                    // [新增]：如果输出批次满了，立即发送
-                    if (output_batch->count >= BATCH_SIZE) {
-                        push_write_task_batch(worker, output_batch);
-                        output_batch = batch_create(); // 换新篮子
-                    }
                 }
-                // [新增]：发送剩余的输出批次
-                if (output_batch->count > 0) {
-                    push_write_task_batch(worker, output_batch);
-                } else {
-                    batch_destroy(output_batch); // 空篮子销毁
-                }
-                // 处理完一批，销毁这个批次数据
-                batch_destroy(batch);
+                
+                // 批量推送给 Writer 线程
+                if (output_batch->count > 0) push_write_task_batch(worker, output_batch);
+                else batch_destroy(output_batch);
+                
+                batch_destroy(batch); // 释放原始 batch
                 break;
             }
 
             case MSG_TASK_DONE:
-                // 收到 Worker 完成通知
                 atomic_fetch_sub(&g_pending_tasks, 1);
-                state->total_dequeued_count++; // 用于速率统计
+                state->total_dequeued_count++;
+                break;
+
+            case MSG_RESUME_FINISHED:
+                verbose_printf(cfg, 1, "恢复阶段完成。释放低优先级任务 (%d 个)...\n", low_pri_count);
+                resume_active = false;
+                
+                // 泄洪：将积压在低优先级队列的任务全部灌入 Worker
+                LowPriNode *curr = low_pri_head;
+                while (curr) {
+                    atomic_fetch_add(&g_pending_tasks, 1);
+                    // 注意：直接移交 curr->path 指针，不 strdup，也不 free(path)
+                    // mq_send 内部是 strdup 吗？ looper.c 中 mq_send -> mq_obtain(..., obj) 是直接赋值的
+                    // Worker 中使用完会 free(msg->obj)
+                    // 所以这里直接传 curr->path 是安全的
+                    mq_send(&g_worker_mq, MSG_SCAN_DIR, curr->path); 
+                    
+                    LowPriNode *next = curr->next;
+                    free(curr); // 只释放节点容器
+                    curr = next;
+                }
+                low_pri_head = low_pri_tail = NULL;
+                low_pri_count = 0;
+                break;
+                
+            case MSG_WORKER_STUCK:
+                // 简单的日志记录，可扩展为报警
+                verbose_printf(cfg, 0, "警告: Worker 报告卡顿于 %s\n", (char*)msg->obj);
+                free(msg->obj);
                 break;
         }
-
-        // 回收消息壳
         mq_recycle(&g_looper_mq, msg);
     }
-    verbose_printf(cfg, 1, "所有扫描任务已完成。\n");
-    // 5. 清理现场
-    // 销毁 Worker 队列 -> Worker 线程会读到 NULL 并退出
-    mq_destroy(&g_worker_mq);
-    
-    for (int i = 0; i < num_workers; i++) {
-        pthread_join(workers[i], NULL);
-    }
+
+    // 5. 清理与收尾
+    // 给所有 Worker 发送 NULL 退出信号
+    for (int i = 0; i < num_workers; i++) mq_enqueue(&g_worker_mq, NULL);
+    for (int i = 0; i < num_workers; i++) pthread_join(workers[i], NULL);
     free(workers);
     
+    mq_destroy(&g_worker_mq);
     mq_destroy(&g_looper_mq);
+    
+    if (g_visited_history) {
+        hash_set_destroy(g_visited_history);
+        g_visited_history = NULL;
+    }
 }
 
 // ==========================================
-// 3. 对外接口 (traverse_files)
+// 4. 对外接口
 // ==========================================
 
-void traverse_files(Config *cfg, RuntimeState *state) {
-    // 1. 初始化哈希集合用于幂等性检查
-    if (!g_history_object_set) {
-        g_history_object_set = hash_set_create(HASH_SET_INITIAL_SIZE);
-    }
-    // 2. 启动 AsyncWorker (写文件线程)
-    // 这是独立的，用于写磁盘，不受 Looper 架构影响
+void traverse_files(const Config *cfg, RuntimeState *state) {
+    // 1. 初始化异步 Writer
     AsyncWorker *worker = async_worker_init(cfg, state);
     
-    // 2. 启动监控线程 (可选)
-    // 注意：这里我们不再传递 Queue，因为 SmartQueue 已废弃
-    // 需要修改 display_status 适配新的统计方式
+    // 2. 启动状态监控线程
     ThreadSharedState shared = {
-        .cfg = cfg,
-        .state = state,
-        .worker = worker, // [修改点]：填充 worker
-        .running = 1
+        .cfg = cfg, .state = state, .worker = worker, .running = 1
     };
     pthread_t status_thread;
     pthread_create(&status_thread, NULL, status_thread_func, &shared);
 
-    // 3. 运行主循环 (阻塞直到完成)
+    // 3. 运行主循环 (阻塞直到任务完成)
     run_main_looper(cfg, state, worker);
 
-    // 4. 关闭流程
-    verbose_printf(cfg, 1, "等待异步写入完成...\n");
-    // [修改点]：传入 worker 进行销毁
+    // 4. 结束与清理
     async_worker_shutdown(worker);
-    
     shared.running = 0;
     pthread_join(status_thread, NULL);
     
-    // 5. 清理资源
+    // 5. 最终归档与清理
     if (cfg->continue_mode) {
         finalize_progress(cfg, state);
-        cleanup_progress(cfg, state);
-        release_lock(state);
+        cleanup_progress(cfg, state); // 现在 cleanup 会根据 clean/archive 参数安全删除了
     }
-    // SmartQueue 的清理已不需要调用，因为我们没用到它
     cleanup_cache(state);
-    
-    // 6. 销毁哈希集合
-    if (g_history_object_set) {
-        hash_set_destroy(g_history_object_set);
-        g_history_object_set = NULL;
-    }
 }
-// 暴露给 progress.c 使用的计数器接口
+
+// 对外暴露的接口，用于在 progress.c 中增加 pending 计数 (当重放任务时)
 void traversal_add_pending_tasks(int count) {
     atomic_fetch_add(&g_pending_tasks, count);
 }

@@ -25,7 +25,11 @@ enum {
     
     // [Worker -> Looper] 汇报
     MSG_RESULT_BATCH,   // 汇报发现的子项 (payload: TaskBatch*)
-    MSG_WORKER_STUCK    // 报告卡死 (payload: char* path)
+    MSG_WORKER_STUCK,   // 报告卡死 (payload: char* path)
+    
+    // [新增] 任务状态与流控信号
+    MSG_TASK_DONE,       // Worker 完成了一个原子任务 (payload: NULL)
+    MSG_RESUME_FINISHED  // 恢复线程通知 Looper 恢复已完成 (payload: NULL)
 };
 
 // --- 3. 消息对象 (支持池化) ---
@@ -72,5 +76,8 @@ void mq_send(MessageQueue *mq, int what, void *obj);
 Message* mq_dequeue(MessageQueue *mq);
 // 回收消息到池 (替代 free)
 void mq_recycle(MessageQueue *mq, Message *msg);
+
+// [新增] 获取队列当前长度 (用于流控)
+int mq_get_size(MessageQueue *mq);
 
 #endif // LOOPER_H

@@ -25,7 +25,7 @@ void show_help() {
     printf("  -V, --version          显示版本信息\n");
     printf("  -F, --format=格式      自定义输出格式,支持占位符:\n");
     printf("                          %%p = 路径, %%s = 大小, %%u = 用户, %%g = 组\n");
-    printf("                          %%m = 修改时间, %%a = 访问时间, %%o = 权限模式\n");
+    printf("                          %%m = 修改时间, %%a = 访问时间, %%M = 权限模式\n");
     printf("                          %%x = 扩展属性\n\n");
     printf("  -o, --output=文件      将结果写入指定文件 (默认: %s)\n", DEFAULT_OUTPUT_FILE);
     printf("  -O, --output-split=目录 将结果按行拆分到指定目录 (默认: %lu)\n",(long unsigned int) DEFAULT_OUTPUT_SPLIT_DIR);

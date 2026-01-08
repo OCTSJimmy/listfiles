@@ -7,7 +7,7 @@
 #include <sys/stat.h>
 #include <pthread.h>
 #include <zlib.h>
-
+#include <stdint.h> // 新增
 
 struct AsyncWorker;
 
@@ -15,8 +15,8 @@ struct AsyncWorker;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "9.5"
-#define MAX_PATH_LENGTH 2046
+#define VERSION "9.6" // 版本号升级
+#define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
 #define MAX_SYMLINK_DEPTH 8
@@ -53,7 +53,10 @@ struct AsyncWorker;
 
 typedef enum {
     FMT_TEXT, FMT_PATH, FMT_SIZE, FMT_USER, FMT_GROUP,
-    FMT_MTIME, FMT_ATIME, FMT_MODE, FMT_XATTR
+    FMT_MTIME, FMT_ATIME, FMT_CTIME, // [新增]
+    FMT_MODE, FMT_ST_MODE, FMT_TYPE, // [新增] st_mode(八进制), type(字符串)
+    FMT_INODE, FMT_UID, FMT_GID,// [新增]
+    FMT_XATTR
 } FormatType;
 
 typedef enum {
@@ -111,26 +114,63 @@ typedef struct GroupCacheEntry {
     struct GroupCacheEntry *next;
 } GroupCacheEntry;
 
-// 【删除】ScanNode 和 SmartQueue 结构体定义已移除
-
 // 全局配置
 typedef struct {
-    bool continue_mode, print_dir, verbose, size, user, group, mtime, atime, follow_symlinks;
-    int verbose_type, verbose_level;
-    char *format, *progress_base, *target_path;
-    FormatSegment *compiled_format;
-    int format_segment_count;
+    // === 核心身份 ===
+    char *target_path;      // -p
+    char *output_file;      // -o
+    char *output_split_dir; // -O
+    bool is_output_file;
+    bool is_output_split_dir;
+
+    // === 运行模式 ===
+    bool continue_mode;     // -c (断点续传)
+    bool runone;            // [新增] --runone (强制全量)
+    long skip_interval;     // [新增] --skip-interval (半增量阈值，秒)
+    bool sure;              // [新增] --sure (跳过交互确认)
+    
+    // === 行为策略 ===
+    bool archive;           // -Z
+    bool clean;             // -C
+    char *progress_base;    // -f
+    char *resume_file;      // -R
+    
+    // === 输出格式 ===
+    bool csv;               // [新增] --csv (严格模式)
+    char *format;           // -F
+    bool quote;             // -Q
+    
+    // === 元数据开关 ===
+    bool size;
+    bool user;
+    bool group;
+    bool mtime;
+    bool atime;
+    bool ctime;             // [新增]
+    bool mode;              // mode string (drwxr-xr-x)
+    bool st_mode;           // [新增] octal mode (0755) (隐式支持，通过 format)
+    bool inode;             // [新增] (隐式支持，通过 format)
+    bool xattr;
+    bool follow_symlinks;
+    bool include_dir;       // -D
+    
+    // === 其他 ===
+    bool print_dir;
+    bool verbose;
+    int verbose_type;
+    int verbose_level;
     unsigned long progress_slice_lines;
-    bool archive, clean, is_output_file, is_output_split_dir;
-    char *output_file, *output_split_dir;
     unsigned long output_slice_lines;
     bool decompress;
-    bool xattr;
-    bool mode;
-    bool quote;
-    bool include_dir;
-    char *resume_file;
     bool mute;
+    
+    // === 内部状态 (预编译格式) ===
+    FormatSegment *compiled_format;
+    int format_segment_count;
+    
+    // === 会话一致性校验字段 (从 .config 读取) ===
+    time_t last_start_time;
+    char *last_cmd_args; 
 } Config;
 
 // 运行时状态
@@ -160,7 +200,7 @@ typedef struct {
 typedef struct {
     const Config *cfg;
     const RuntimeState *state;
-    struct AsyncWorker *worker; // [新增]：持有 worker 句柄
+    struct AsyncWorker *worker;
     volatile int running;
 } ThreadSharedState; 
 

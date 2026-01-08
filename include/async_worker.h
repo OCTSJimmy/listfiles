@@ -2,18 +2,18 @@
 #define ASYNC_WORKER_H
 
 #include "config.h"
-#include "config.h"
-#include "looper.h" // [新增] 需要 TaskBatch 定义
+#include "looper.h" // 需要 TaskBatch 定义
 #include <pthread.h>
 #include <stdbool.h>
 
+// 任务类型枚举
 typedef enum {
-    NODE_TYPE_FILE,
-    NODE_TYPE_CHECKPOINT,
-    NODE_TYPE_BATCH
-} WriteNodeType;
+    TASK_WRITE_BATCH,      // 批量文件写入
+    TASK_WRITE_CHECKPOINT, // 进度检查点 (保存 pbin 索引)
+    TASK_WRITE_STOP        // 停止信号 (可选，也可以通过 flag 控制)
+} WriteTaskType;
 
-// 进度快照结构体
+// 进度快照 (用于 Checkpoint)
 typedef struct {
     unsigned long process_slice_index;
     unsigned long processed_count;
@@ -22,56 +22,53 @@ typedef struct {
     unsigned long output_line_count;
 } ProgressSnapshot;
 
-typedef struct WriteNode {
-    WriteNodeType type;
-    
-    // 联合体 payload (可选优化，为了代码清晰暂时维持原样或直接添加字段)
-    // 为保持兼容性，我们直接添加字段，依靠 type 区分
-    char *path;               
-    
-    // [新增] 批量数据包
-    TaskBatch *batch;         
+// 统一的任务节点
+typedef struct WriteTask {
+    WriteTaskType type;
+    union {
+        TaskBatch *batch;            // 当 type == TASK_WRITE_BATCH 时有效
+        ProgressSnapshot checkpoint; // 当 type == TASK_WRITE_CHECKPOINT 时有效
+    } data;
+    struct WriteTask *next;
+} WriteTask;
 
-    ProgressSnapshot progress; 
-    struct WriteNode *next;
-    bool has_cached_stat;
-    struct stat cached_stat;
-} WriteNode;
-
-// === 新增：AsyncWorker 上下文结构体 ===
-// 不再依赖全局变量，所有状态封装在此
+// AsyncWorker 上下文
 typedef struct AsyncWorker {
-    struct WriteNode *head;
-    struct WriteNode *tail;
+    // 队列头尾
+    struct WriteTask *head;
+    struct WriteTask *tail;
+    
+    // 线程同步
     pthread_mutex_t mutex;
     pthread_cond_t cond;
-    bool stop_flag;
-    unsigned long pending_count;
+    pthread_t thread;
+    
+    // 状态控制
+    volatile bool stop_flag;
     size_t queue_count;
     time_t last_flush_time;
+    unsigned long pending_since_flush; // 距离上次 flush 积压的条数
     
-    // 引用外部配置和状态
+    // 外部引用
     const Config *cfg;
     RuntimeState *state;
-    
-    pthread_t tid;
 } AsyncWorker;
 
-// === 修改后的公开接口 ===
+// === 公开接口 ===
 
-// 初始化异步工作线程，返回实例指针
 AsyncWorker* async_worker_init(const Config *cfg, RuntimeState *state);
-
-// 提交一个文件路径 (主线程调用，需传入 worker 实例)
-void push_write_task_file(AsyncWorker *worker, const char *path, const struct stat *info);
-
-// [新增] 提交一批文件任务 (worker 将接管 batch 的内存所有权)
-void push_write_task_batch(AsyncWorker *worker, TaskBatch *batch);
-
-void push_write_task_checkpoint(AsyncWorker *worker, const RuntimeState *current_state);
-
 void async_worker_shutdown(AsyncWorker *worker);
 
+// 提交批量写入任务
+void push_write_task_batch(AsyncWorker *worker, TaskBatch *batch);
+
+// 提交单个文件 (内部会包装成 Batch)
+void push_write_task_file(AsyncWorker *worker, const char *path, const struct stat *info);
+
+// 提交检查点 (触发 flush 并保存进度索引)
+void push_write_task_checkpoint(AsyncWorker *worker, const RuntimeState *current_state);
+
+// 获取队列积压数
 size_t async_worker_get_queue_size(AsyncWorker *worker);
 
-#endif
+#endif // ASYNC_WORKER_H

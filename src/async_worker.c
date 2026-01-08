@@ -1,31 +1,87 @@
 #include "async_worker.h"
 #include "utils.h"
 #include "output.h"
-#include "progress.h"
+#include "progress.h" // 需要 get_index_filename
 #include <pthread.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <sys/time.h> 
-#include <time.h>     
 #include <errno.h>
+#include <stdio.h>
 
-// 辅助：执行刷盘
-static void perform_flush_output(AsyncWorker *worker) {
-    if (worker->pending_count > 0) {
-        FILE *fp = worker->state->output_fp ? worker->state->output_fp : stdout;
-        fflush(fp);
-        worker->pending_count = 0;
-        worker->last_flush_time = time(NULL);
+#define FLUSH_INTERVAL_SEC 5
+#define BATCH_FLUSH_THRESHOLD 5000 
+
+// ==========================================
+// 辅助函数
+// ==========================================
+
+// 处理单个文件输出
+static void process_single_file_output(AsyncWorker *worker, const char *path, const struct stat *st) {
+    const Config *cfg = worker->cfg;
+    RuntimeState *state = worker->state;
+    FILE *target_fp = NULL;
+
+    // 1. 确定输出流 (分片逻辑 or 单文件逻辑)
+    if (cfg->is_output_split_dir) {
+        // [分片模式]
+        if (state->output_line_count >= cfg->output_slice_lines) {
+            if (state->output_fp) {
+                fclose(state->output_fp);
+                state->output_fp = NULL;
+            }
+            state->output_slice_num++;
+            state->output_line_count = 0;
+        }
+
+        if (!state->output_fp) {
+            char slice_path[1024];
+            char filename[64];
+            snprintf(filename, sizeof(filename), "%06lu.txt", state->output_slice_num);
+            snprintf(slice_path, sizeof(slice_path), "%s/output_%s", cfg->output_split_dir, filename);
+            
+            state->output_fp = fopen(slice_path, "w");
+            if (!state->output_fp) {
+                perror("无法创建输出分片"); // 严重错误，暂且打印
+                return;
+            }
+        }
+        target_fp = state->output_fp;
+        
+    } else if (cfg->is_output_file) {
+        // [单文件模式]
+        if (!state->output_fp) {
+            state->output_fp = fopen(cfg->output_file, "a");
+            if (!state->output_fp) return;
+        }
+        target_fp = state->output_fp;
+        
+    } else {
+        target_fp = stdout;
     }
+
+    if (!target_fp) return;
+
+    // 2. 执行流式输出
+    print_to_stream(cfg, state, path, st, target_fp);
+    state->output_line_count++;
 }
 
-// 辅助：执行进度保存 (原子更新)
+// 执行刷盘 (fflush)
+static void perform_flush_output(AsyncWorker *worker) {
+    FILE *fp = worker->state->output_fp ? worker->state->output_fp : stdout;
+    if (fp) fflush(fp);
+    worker->pending_since_flush = 0;
+    worker->last_flush_time = time(NULL);
+}
+
+// 执行进度保存 (原子更新 index 文件)
 static void perform_save_progress(AsyncWorker *worker, const ProgressSnapshot *snap) {
+    if (!worker->cfg->progress_base) return;
+
     char *idx_file = get_index_filename(worker->cfg->progress_base);
     char *tmp_file = safe_malloc(strlen(idx_file) + 32);
-    // 加上线程ID防止冲突
     snprintf(tmp_file, strlen(idx_file) + 32, "%s.tmp.%lu", idx_file, (unsigned long)pthread_self());
     
     FILE *tmp_fp = fopen(tmp_file, "w");
@@ -39,218 +95,114 @@ static void perform_save_progress(AsyncWorker *worker, const ProgressSnapshot *s
         fclose(tmp_fp);
         
         if (rename(tmp_file, idx_file) != 0) {
-            perror("Worker: 无法更新进度索引");
-            unlink(tmp_file);
+            unlink(tmp_file); // 失败回滚
         }
     }
     free(idx_file);
     free(tmp_file);
 }
 
-static void *worker_thread_func(void *arg) {
-    // 1. 获取上下文
+// ==========================================
+// 线程主体
+// ==========================================
+
+static void *async_writer_thread(void *arg) {
     AsyncWorker *worker = (AsyncWorker *)arg;
     worker->last_flush_time = time(NULL);
 
     while (true) {
-        WriteNode *writeNode = NULL;
-        // 2. 加锁访问 worker->mutex
+        WriteTask *task = NULL;
+
+        // 1. 获取任务 (带超时的条件等待，用于定时 Flush)
         pthread_mutex_lock(&worker->mutex);
         
         while (worker->head == NULL && !worker->stop_flag) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            time_t next_flush = worker->last_flush_time + FLUSH_INTERVAL_SEC;
-            time_t now = time(NULL);
-            if (next_flush <= now) break; 
-            ts.tv_sec = next_flush;
+            ts.tv_sec += FLUSH_INTERVAL_SEC; // 等待最多 5 秒
             
             int rc = pthread_cond_timedwait(&worker->cond, &worker->mutex, &ts);
-            if (rc == ETIMEDOUT) break;
+            if (rc == ETIMEDOUT) break; // 超时醒来，去检查是否需要 flush
         }
 
         if (worker->head != NULL) {
-            writeNode = worker->head;
-            worker->head = writeNode->next;
+            task = worker->head;
+            worker->head = task->next;
             if (worker->head == NULL) worker->tail = NULL;
-            worker->queue_count--; 
+            worker->queue_count--;
         } else if (worker->stop_flag) {
             pthread_mutex_unlock(&worker->mutex);
-            break; 
+            break; // 退出循环
         }
+        
         pthread_mutex_unlock(&worker->mutex);
 
-        // 3. 处理业务逻辑 (访问 worker->cfg, worker->state)
-        if (writeNode) {
-            if (writeNode->type == NODE_TYPE_FILE) {
-                // === 处理文件 ===
-                struct stat info;
-                bool stat_success = false;
-                
-                // 只有需要元数据时才 lstat
-                if (worker->cfg->size || worker->cfg->user || worker->cfg->mtime || 
-                    worker->cfg->group || worker->cfg->atime || worker->cfg->format) {
-                    
-                    if (writeNode->has_cached_stat) {
-                        info = writeNode->cached_stat; // 直接用缓存
-                        stat_success = true;           
-                    } else {
-                        if (lstat(writeNode->path, &info) == 0) stat_success = true;
+        // 2. 处理任务
+        if (task) {
+            switch (task->type) {
+                case TASK_WRITE_BATCH: {
+                    TaskBatch *batch = task->data.batch;
+                    if (batch) {
+                        for (int i = 0; i < batch->count; i++) {
+                            process_single_file_output(worker, batch->paths[i], &batch->stats[i]);
+                            worker->pending_since_flush++;
+                        }
+                        batch_destroy(batch); // 销毁批次内存
                     }
-                } else {
-                    memset(&info, 0, sizeof(info));
-                    stat_success = true; 
+                    break;
                 }
                 
-                if (stat_success) {
-                    worker->state->file_count++; 
-                    // 注意：format_output 内部可能还是有锁，但这在这一步暂不处理
-                    format_output(worker->cfg, worker->state, writeNode->path, &info);
-                    worker->pending_count++;
+                case TASK_WRITE_CHECKPOINT: {
+                    // 遇到检查点：强制刷盘并保存进度
+                    perform_flush_output(worker);
+                    perform_save_progress(worker, &task->data.checkpoint);
+                    break;
                 }
-                free(writeNode->path);
-
-            } else if (writeNode->type == NODE_TYPE_BATCH) {
-                TaskBatch *batch = writeNode->batch;
-                if (batch) {
-                    for (int i = 0; i < batch->count; i++) {
-                        worker->state->file_count++;
-                        // 使用 Batch 中携带的 stat 信息，无需再次 lstat
-                        // 此时是在 AsyncWorker 线程内，无锁连续写入
-                        format_output(worker->cfg, worker->state, batch->paths[i], &batch->stats[i]);
-                        worker->pending_count++;
-                    }
-                    // 关键：必须销毁 Batch 以释放内存！
-                    batch_destroy(batch); 
-                } else {
-                    fprintf(stderr, "Worker: 批次为空\n");
-                }
-            } else if (writeNode->type == NODE_TYPE_CHECKPOINT) {
-                // === 处理检查点 ===
-                perform_flush_output(worker);
-                perform_save_progress(worker, &writeNode->progress);
-                if (writeNode->path) {
-                    free(writeNode->path);
-                }
+                
+                default: break;
             }
-            free(writeNode);
+            free(task); // 销毁任务节点
         }
 
-        // 4. 自动刷盘逻辑
+        // 3. 自动 Flush 策略 (基于时间或数量)
         time_t now = time(NULL);
-        if (worker->pending_count >= BATCH_FLUSH_SIZE || 
-           (worker->pending_count > 0 && now - worker->last_flush_time >= FLUSH_INTERVAL_SEC)) {
+        if (worker->pending_since_flush >= BATCH_FLUSH_THRESHOLD || 
+            (worker->pending_since_flush > 0 && now - worker->last_flush_time >= FLUSH_INTERVAL_SEC)) {
             perform_flush_output(worker);
         }
     }
-    
+
+    // 退出前最后一次 Flush
     perform_flush_output(worker);
     return NULL;
 }
-// [新增] 批量提交接口
-void push_write_task_batch(AsyncWorker *worker, TaskBatch *batch) {
-    if (!worker || !batch) return;
-    if (batch->count == 0) {
-        batch_destroy(batch);
-        return;
-    }
 
-    WriteNode *writeNode = safe_malloc(sizeof(WriteNode));
-    writeNode->type = NODE_TYPE_BATCH;
-    writeNode->batch = batch; // 接管所有权
-    writeNode->path = NULL;
-    writeNode->next = NULL;
+// ==========================================
+// 公开接口实现
+// ==========================================
 
-    pthread_mutex_lock(&worker->mutex);
-    if (worker->tail) {
-        worker->tail->next = writeNode;
-        worker->tail = writeNode;
-    } else {
-        worker->head = worker->tail = writeNode;
-    }
-    worker->queue_count++;
-    pthread_cond_signal(&worker->cond);
-    pthread_mutex_unlock(&worker->mutex);
-}
-
-AsyncWorker* async_worker_init(const Config *cfg, RuntimeState *state) {
+AsyncWorker *async_worker_init(const Config *cfg, RuntimeState *state) {
     AsyncWorker *worker = safe_malloc(sizeof(AsyncWorker));
+    memset(worker, 0, sizeof(AsyncWorker));
     
-    // 初始化成员
-    worker->head = NULL;
-    worker->tail = NULL;
-    worker->stop_flag = false;
-    worker->pending_count = 0;
-    worker->queue_count = 0;
-    worker->last_flush_time = time(NULL);
     worker->cfg = cfg;
     worker->state = state;
+    worker->stop_flag = false;
     
     pthread_mutex_init(&worker->mutex, NULL);
     pthread_cond_init(&worker->cond, NULL);
     
-    // 启动线程，传入 worker 指针
-    if (pthread_create(&worker->tid, NULL, worker_thread_func, worker) != 0) {
-        perror("Failed to create async worker thread");
-        free(worker);
-        return NULL;
+    // 初始化文件/目录状态
+    if (cfg->is_output_file) {
+        FILE *fp = fopen(cfg->output_file, "w"); // Truncate
+        if (fp) fclose(fp);
     }
-    
+    if (cfg->is_output_split_dir) {
+        mkdir(cfg->output_split_dir, 0755);
+    }
+
+    pthread_create(&worker->thread, NULL, async_writer_thread, worker);
     return worker;
-}
-
-void push_write_task_file(AsyncWorker *worker, const char *path, const struct stat *info) {
-    if (!worker) return;
-
-    WriteNode *writeNode = safe_malloc(sizeof(WriteNode));
-    writeNode->type = NODE_TYPE_FILE;
-    writeNode->path = strdup(path); 
-    writeNode->next = NULL;
-
-    if (info) {
-        writeNode->has_cached_stat = true;
-        writeNode->cached_stat = *info;
-    } else {
-        writeNode->has_cached_stat = false;
-    }
-
-    pthread_mutex_lock(&worker->mutex);
-    if (worker->tail) {
-        worker->tail->next = writeNode;
-        worker->tail = writeNode;
-    } else {
-        worker->head = worker->tail = writeNode;
-    }
-    worker->queue_count++;
-    pthread_cond_signal(&worker->cond);
-    pthread_mutex_unlock(&worker->mutex);
-}
-
-void push_write_task_checkpoint(AsyncWorker *worker, const RuntimeState *current_state) {
-    if (!worker) return;
-
-    WriteNode *writeNode = safe_malloc(sizeof(WriteNode));
-    writeNode->type = NODE_TYPE_CHECKPOINT;
-    writeNode->path = NULL;
-    
-    writeNode->progress.process_slice_index = current_state->process_slice_index;
-    writeNode->progress.processed_count     = current_state->processed_count;
-    writeNode->progress.write_slice_index   = current_state->write_slice_index;
-    writeNode->progress.output_slice_num    = current_state->output_slice_num;
-    writeNode->progress.output_line_count   = current_state->output_line_count;
-    
-    writeNode->next = NULL;
-
-    pthread_mutex_lock(&worker->mutex);
-    if (worker->tail) {
-        worker->tail->next = writeNode;
-        worker->tail = writeNode;
-    } else {
-        worker->head = worker->tail = writeNode;
-    }
-    worker->queue_count++;
-    pthread_cond_signal(&worker->cond);
-    pthread_mutex_unlock(&worker->mutex);
 }
 
 void async_worker_shutdown(AsyncWorker *worker) {
@@ -260,28 +212,73 @@ void async_worker_shutdown(AsyncWorker *worker) {
     worker->stop_flag = true;
     pthread_cond_signal(&worker->cond);
     pthread_mutex_unlock(&worker->mutex);
+
+    pthread_join(worker->thread, NULL);
     
-    if (worker->tid) {
-        pthread_join(worker->tid, NULL); 
+    if (worker->state->output_fp && worker->state->output_fp != stdout) {
+        fclose(worker->state->output_fp);
+        worker->state->output_fp = NULL;
     }
 
-    // 清理资源
     pthread_mutex_destroy(&worker->mutex);
     pthread_cond_destroy(&worker->cond);
     
-    // 清理残留队列（如果有）
-    WriteNode *curr = worker->head;
-    while(curr) {
-        WriteNode *next = curr->next;
-        if (curr->type == NODE_TYPE_BATCH) {
-            batch_destroy(curr->batch);
+    // 清理剩余任务 (如果是非正常退出)
+    while (worker->head) {
+        WriteTask *tmp = worker->head;
+        worker->head = worker->head->next;
+        if (tmp->type == TASK_WRITE_BATCH && tmp->data.batch) {
+            batch_destroy(tmp->data.batch);
         }
-        if (curr->path) free(curr->path);
-        free(curr);
-        curr = next;
+        free(tmp);
     }
-    
     free(worker);
+}
+
+// 内部入队通用函数
+static void enqueue_task(AsyncWorker *worker, WriteTask *task) {
+    pthread_mutex_lock(&worker->mutex);
+    if (worker->tail) {
+        worker->tail->next = task;
+    } else {
+        worker->head = task;
+    }
+    worker->tail = task;
+    worker->queue_count++;
+    pthread_cond_signal(&worker->cond);
+    pthread_mutex_unlock(&worker->mutex);
+}
+
+void push_write_task_batch(AsyncWorker *worker, TaskBatch *batch) {
+    if (!worker || !batch) return;
+    WriteTask *task = safe_malloc(sizeof(WriteTask));
+    task->type = TASK_WRITE_BATCH;
+    task->data.batch = batch;
+    task->next = NULL;
+    enqueue_task(worker, task);
+}
+
+void push_write_task_file(AsyncWorker *worker, const char *path, const struct stat *info) {
+    // 包装成 Batch 发送，保持内部逻辑统一
+    TaskBatch *batch = batch_create();
+    batch_add(batch, path, info);
+    push_write_task_batch(worker, batch);
+}
+
+void push_write_task_checkpoint(AsyncWorker *worker, const RuntimeState *current_state) {
+    if (!worker) return;
+    WriteTask *task = safe_malloc(sizeof(WriteTask));
+    task->type = TASK_WRITE_CHECKPOINT;
+    
+    // 捕获当前状态快照
+    task->data.checkpoint.process_slice_index = current_state->process_slice_index;
+    task->data.checkpoint.processed_count = current_state->processed_count;
+    task->data.checkpoint.write_slice_index = current_state->write_slice_index;
+    task->data.checkpoint.output_slice_num = current_state->output_slice_num;
+    task->data.checkpoint.output_line_count = current_state->output_line_count;
+    
+    task->next = NULL;
+    enqueue_task(worker, task);
 }
 
 size_t async_worker_get_queue_size(AsyncWorker *worker) {
