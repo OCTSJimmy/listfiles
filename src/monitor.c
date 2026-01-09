@@ -122,8 +122,8 @@ static void format_elapsed_time(time_t start_time, char *buffer, size_t buf_size
 void print_progress(const Config *cfg, RuntimeState *state, Monitor *mon) {
     // 1. 判断是否需要显示
     // 如果没有重定向输出文件，且没有mute，则不打印(避免污染 stdout)
-    bool output_to_stdout = (!cfg->is_output_file && !cfg->is_output_split_dir);
-    (void) output_to_stdout;
+    // bool output_to_stdout = (!cfg->is_output_file && !cfg->is_output_split_dir);
+    // (void) output_to_stdout;
 
     // 2. 更新统计 (Hack: 移除 const 以更新统计数据)
     update_statistics((RuntimeState*)state);

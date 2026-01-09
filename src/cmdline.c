@@ -69,6 +69,12 @@ void init_config(Config *cfg) {
     cfg->decompress = false;
     cfg->verbose_type = VERBOSE_TYPE_FULL;
     cfg->verbose_level = DEFAULT_VERBOSE_LEVEL;
+    cfg->mute = false;
+    cfg->sure = false;
+    cfg->runone = false;
+    cfg->csv = false;
+    cfg->quote = false;
+    cfg->include_dir = false;
 }
 
 int parse_arguments(int argc, char *argv[], Config *cfg) {

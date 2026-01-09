@@ -94,6 +94,7 @@ static void interactive_confirm(const Config *cfg, bool has_history) {
 int main(int argc, char *argv[]) {
     // 1. 初始化配置
     Config cfg;
+    memset(&cfg, 0, sizeof(Config));
     init_config(&cfg);
     if (parse_arguments(argc, argv, &cfg) != 0) {
         return 1;
@@ -131,7 +132,7 @@ int main(int argc, char *argv[]) {
     // [新增] 初始化设备管理器 (必须在 traverse_files 之前)
     state.dev_mgr = dev_mgr_create();
     init_output_files(&cfg, &state);
-    
+
     // 保存配置
     if (!cfg.continue_mode || cfg.runone || !has_history) {
         save_config_to_disk(&cfg);
