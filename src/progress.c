@@ -475,22 +475,26 @@ void cleanup_progress(const Config *cfg, RuntimeState *state) {
 }
 
 void finalize_progress(const Config *cfg, RuntimeState *state) {
-    // 只有在正常结束时才调用
+    // 1. 关闭分片文件
     if (state->write_slice_file) {
         fclose(state->write_slice_file);
         state->write_slice_file = NULL;
         process_old_slice(cfg, state->write_slice_index);
     }
     
-    // 更新 config 为 Success
+    // 2. 更新 config 状态
     if (cfg->progress_base) {
         char config_path[1024];
         snprintf(config_path, sizeof(config_path), "%s.config", cfg->progress_base);
-        // 这里简单追加，或者重写
-        // 为了简单，我们假设下次启动会读取最后一行 status
         FILE *fp = fopen(config_path, "a");
         if (fp) {
-            fprintf(fp, "status=Success\n");
+            // [修改] 根据 has_error 决定最终状态
+            if (state->has_error) {
+                fprintf(fp, "status=Incomplete\n"); // 标记为未完成，下次触发 Resume
+                fprintf(fp, "error=DeviceMeltdown\n");
+            } else {
+                fprintf(fp, "status=Success\n");
+            }
             fprintf(fp, "end_time=%ld\n", time(NULL));
             fclose(fp);
         }

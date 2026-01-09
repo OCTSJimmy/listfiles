@@ -10,6 +10,7 @@
 #include <stdint.h> // 新增
 
 struct AsyncWorker;
+struct DeviceManager;
 
 // =======================================================
 // 全局常量与宏
@@ -194,6 +195,10 @@ typedef struct {
     pthread_mutex_t dev_cache_mutex;
     FILE *status_file_fp; 
     Statistics stats;
+    // [新增] 设备管理器句柄
+    struct DeviceManager *dev_mgr;
+    // [新增] 全局错误标志
+    volatile bool has_error;
 } RuntimeState;
 
 // 线程共享状态结构体

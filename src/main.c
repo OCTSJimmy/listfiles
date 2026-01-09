@@ -6,6 +6,7 @@
 #include "signals.h"
 #include "monitor.h" 
 #include "idempotency.h" // 确保包含 HashSet 定义
+#include "device_manager.h" // [新增]
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,10 +90,6 @@ static void interactive_confirm(const Config *cfg, bool has_history) {
     }
 }
 
-// ==========================================
-// 2. 主函数
-// ==========================================
-
 int main(int argc, char *argv[]) {
     // 1. 初始化配置
     Config cfg;
@@ -104,16 +101,13 @@ int main(int argc, char *argv[]) {
     // 2. 信号处理
     setup_signal_handlers(&cfg);
 
-    // 3. 会话管理与模式判定
+    // 3. 会话管理
     bool has_history = false;
-    
     if (cfg.runone) {
-        // 强制清理旧文件
         RuntimeState temp_state = {0}; 
         cleanup_progress(&cfg, &temp_state);
         cfg.continue_mode = false;
     } else {
-        // 检查历史文件是否存在
         char path[1024];
         snprintf(path, sizeof(path), "%s.config", cfg.progress_base);
         if (access(path, F_OK) == 0) {
@@ -129,15 +123,17 @@ int main(int argc, char *argv[]) {
     RuntimeState state;
     memset(&state, 0, sizeof(RuntimeState));
     state.start_time = time(NULL);
+    state.has_error = false; // [新增] 初始无错
 
-    // 如果是新任务，保存本次配置
+    // [新增] 初始化设备管理器 (必须在 traverse_files 之前)
+    state.dev_mgr = dev_mgr_create();
+
+    // 保存配置
     if (!cfg.continue_mode || cfg.runone || !has_history) {
         save_config_to_disk(&cfg);
     }
 
-    // 6. 预加载历史 (半增量模式判定核心)
-    // 只有当：有历史记录 + 上次状态是 Success + 开启了 skip_interval 时，才加载 Reference
-    // 如果没有 skip_interval，即便有历史，也无需加载 reference，因为不会去跳过
+    // 6. 预加载历史
     if (cfg.continue_mode && cfg.skip_interval > 0) {
         char path[1024];
         snprintf(path, sizeof(path), "%s.config", cfg.progress_base);
@@ -166,6 +162,15 @@ int main(int argc, char *argv[]) {
     printf("[System] 任务开始...\n");
     traverse_files(&cfg, &state);
 
+    // 8. 结束清理
+    // [新增] 销毁设备管理器
+    if (state.dev_mgr) {
+        dev_mgr_destroy(state.dev_mgr);
+        state.dev_mgr = NULL;
+    }
+
     printf("[System] 任务完成。耗时: %ld 秒\n", time(NULL) - state.start_time);
-    return 0;
+    
+    // 如果有错误发生（熔断），返回非零状态码
+    return state.has_error ? 1 : 0;
 }
