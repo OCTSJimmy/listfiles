@@ -130,7 +130,8 @@ int main(int argc, char *argv[]) {
 
     // [新增] 初始化设备管理器 (必须在 traverse_files 之前)
     state.dev_mgr = dev_mgr_create();
-
+    init_output_files(&cfg, &state);
+    
     // 保存配置
     if (!cfg.continue_mode || cfg.runone || !has_history) {
         save_config_to_disk(&cfg);

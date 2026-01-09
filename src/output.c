@@ -351,8 +351,7 @@ void close_output_file(FILE *fp) {
 
 // 新增输出文件管理函数
 void init_output_files(const Config *cfg, RuntimeState *state) {
-    // 处理目录信息输出文件
-    // 初始化输出文件
+    // 1. 初始化计数器和状态
     state->output_line_count = 0;
     state->output_slice_num = 1;
     state->start_time = time(NULL);
@@ -360,7 +359,9 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
     state->current_path = NULL;
     state->lock_file_path = NULL;
     
+    // 2. 处理主数据输出 (Data Output)
     if (cfg->is_output_split_dir && cfg->output_split_dir) {
+        // 模式 A: 分片目录
         if(mkdir(cfg->output_split_dir, 0700) == -1 && errno != EEXIST) {
             perror("无法创建输出目录"); exit(EXIT_FAILURE);
         }
@@ -369,13 +370,43 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
         state->output_fp = create_output_file(slice_path);
         if (!state->output_fp) state->output_fp = stdout;
     } else if (cfg->is_output_file && cfg->output_file) {
+        // 模式 B: 单文件
         state->output_fp = create_output_file(cfg->output_file);
         if (!state->output_fp) state->output_fp = stdout;
     } else {
+        // 模式 C: 标准输出
         state->output_fp = stdout;
     }
     if (!state->output_fp) { perror("无法打开输出文件"); exit(EXIT_FAILURE); }
-    if (cfg->print_dir) state->dir_info_fp = stderr; // 简化展示，请保留你原有的完整逻辑
+
+    // 3. [修复重点] 处理目录流输出 (--print-dir)
+    // 逻辑：如果数据走文件，目录流也走文件(伴生文件)；如果数据走 stdout，目录流走 stderr。
+    if (cfg->print_dir) {
+        if (cfg->is_output_split_dir) {
+            // 场景 6-Split: 写入 output_dir/scan_dirs.log
+            char dir_log_path[1024];
+            snprintf(dir_log_path, sizeof(dir_log_path), "%s/scan_dirs.log", cfg->output_split_dir);
+            state->dir_info_fp = fopen(dir_log_path, "w"); // 覆盖模式
+            if (!state->dir_info_fp) {
+                fprintf(stderr, "[警告] 无法创建目录日志文件 %s，回退到 stderr\n", dir_log_path);
+                state->dir_info_fp = stderr;
+            }
+        } else if (cfg->is_output_file) {
+            // 场景 6-File: 写入 output_file.dir (例如 data.csv.dir)
+            char dir_log_path[1024];
+            snprintf(dir_log_path, sizeof(dir_log_path), "%s.dir", cfg->output_file);
+            state->dir_info_fp = fopen(dir_log_path, "w"); // 覆盖模式
+            if (!state->dir_info_fp) {
+                fprintf(stderr, "[警告] 无法创建目录日志文件 %s，回退到 stderr\n", dir_log_path);
+                state->dir_info_fp = stderr;
+            }
+        } else {
+            // 场景 2: 数据走 stdout，目录流必须走 stderr，否则数据会乱
+            state->dir_info_fp = stderr;
+        }
+    } else {
+        state->dir_info_fp = NULL;
+    }
 }
 
 void rotate_output_slice(const Config *cfg, RuntimeState *state) {
