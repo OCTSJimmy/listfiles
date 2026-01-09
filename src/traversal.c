@@ -207,31 +207,31 @@ suicide:
     return NULL;
 }
 
-// [新增] 补位接口实现
+// 补位接口
 void traversal_spawn_replacement_worker(const Config *cfg, Monitor *monitor) {
     pthread_t tid;
     WorkerArgs *args = safe_malloc(sizeof(WorkerArgs));
     args->cfg = cfg;
     args->monitor = monitor;
     
-    // 创建 detached 线程或者 joinable 都可以，这里我们只需要它跑起来
-    // 为了防止 join 泄露，最好存入 threads 数组，但这里是补位，为了简单起见
-    // 我们可以在 monitor 里管理 tid，或者直接 detach
-    // 原有的 workers 数组是 joinable 的。
-    // 这里建议创建 detached 线程，因为我们很难把新 TID 塞回 main_looper 的 workers 数组去 join
-    
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     
     if (pthread_create(&tid, &attr, worker_thread_entry, args) == 0) {
-        if (cfg->verbose) fprintf(stderr, "[System] 已补充新的 Worker 线程\n");
+        // Log info
     } else {
-        perror("无法创建补位线程");
         free(args);
     }
     pthread_attr_destroy(&attr);
 }
+// [新增] 通知：Worker 已被遗弃
+// 由 monitor.c 调用。当判定一个 Worker 死亡时，必须手动扣除它持有的 pending 任务，
+// 否则 Looper 会一直等待 g_pending_tasks 归零，导致死锁。
+void traversal_notify_worker_abandoned(void) {
+    atomic_fetch_sub(&g_pending_tasks, 1);
+}
+
 
 // ==========================================
 // 2. Resume 线程
@@ -265,7 +265,7 @@ static void run_main_looper(const Config *cfg, RuntimeState *state, AsyncWorker 
     for (int i = 0; i < num_workers; i++) {
         WorkerArgs *args = safe_malloc(sizeof(WorkerArgs));
         args->cfg = cfg;
-        args->monitor = monitor; // [传入 Monitor]
+        args->monitor = monitor;
         pthread_create(&workers[i], NULL, worker_thread_entry, args);
     }
     verbose_printf(cfg, 1, "启动 %d 个 Worker 线程\n", num_workers);
@@ -324,12 +324,9 @@ static void run_main_looper(const Config *cfg, RuntimeState *state, AsyncWorker 
                     if (hash_set_contains(g_visited_history, &id)) continue; 
                     hash_set_insert(g_visited_history, &id);
 
-                    // [核心修改] 熔断检查: 快速失败
+                    // 熔断检查
                     if (state->dev_mgr && dev_mgr_is_blacklisted(state->dev_mgr, st->st_dev)) {
-                        // 命中黑名单：直接丢弃，不记录 pbin
-                        // 设置全局错误，确保下次 Resume
                         state->has_error = true;
-                        if (cfg->verbose) fprintf(stderr, "[Skipped] 熔断设备 %lu: %s\n", (unsigned long)st->st_dev, path);
                         continue; 
                     }
 
@@ -351,7 +348,6 @@ static void run_main_looper(const Config *cfg, RuntimeState *state, AsyncWorker 
                         if (cfg->print_dir && state->dir_info_fp) {
                             fprintf(state->dir_info_fp, "%s%s\n", OUTPUT_DIR_PREFIX, path);
                         }
-                        // 只有未被熔断的路径才记录到 pbin
                         if (cfg->continue_mode) record_path(cfg, state, path, st);
                         
                     } else {
@@ -391,7 +387,6 @@ static void run_main_looper(const Config *cfg, RuntimeState *state, AsyncWorker 
         mq_recycle(&g_looper_mq, msg);
     }
 
-    // 清理
     for (int i = 0; i < num_workers; i++) mq_enqueue(&g_worker_mq, NULL);
     for (int i = 0; i < num_workers; i++) pthread_join(workers[i], NULL);
     free(workers);
@@ -411,24 +406,18 @@ static void run_main_looper(const Config *cfg, RuntimeState *state, AsyncWorker 
 
 void traverse_files(const Config *cfg, RuntimeState *state) {
     AsyncWorker *worker = async_worker_init(cfg, state);
-    
-    // [修改] 创建 Monitor (Context)
     Monitor *monitor = monitor_create(cfg, state);
     
-    // [修改] 启动 Monitor 线程
     pthread_t monitor_tid;
     pthread_create(&monitor_tid, NULL, monitor_thread_entry, monitor);
 
-    // [修改] 运行主循环，传入 Monitor
     run_main_looper(cfg, state, worker, monitor);
 
-    // [修改] 销毁 Monitor
     monitor_destroy(monitor);
     pthread_join(monitor_tid, NULL);
 
     async_worker_shutdown(worker);
     
-    // 最终归档
     if (cfg->continue_mode) {
         finalize_progress(cfg, state);
         cleanup_progress(cfg, state);

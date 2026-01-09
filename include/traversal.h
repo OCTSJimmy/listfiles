@@ -36,5 +36,7 @@ void traversal_add_pending_tasks(int count);
 // [新增] 补充一个新的 Worker 线程 (供 Monitor 发现僵尸后调用)
 // 当 Monitor 判定某个 Worker 卡死并将其标记为僵尸后，会调用此函数维持并发度
 void traversal_spawn_replacement_worker(const Config *cfg, struct Monitor *monitor);
+// [新增]
+void traversal_notify_worker_abandoned(void);
 
 #endif // TRAVERSAL_H

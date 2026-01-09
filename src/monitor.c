@@ -222,14 +222,13 @@ static void check_workers_health(Monitor *self) {
                     hb->is_zombie = true; // 标记自杀
                     fprintf(stderr, "[Monitor] 放弃 Worker %d，补充新线程。\n", hb->id);
                     
-                    // 从名册移除 (Slot 置空)，但内存不释放 (由 Worker 线程自杀前释放或 Leak)
                     self->workers[i] = NULL; 
                     self->active_worker_count--;
-                    
-                    // 标记全局错误，阻止 Success 写入
                     self->state->has_error = true; 
                     
-                    // 补位：调用 Traversal 层的接口
+                    // [核心新增] 通知 Traversal 扣除 pending 计数，防止死锁
+                    traversal_notify_worker_abandoned();
+
                     traversal_spawn_replacement_worker(self->cfg, self);
                 }
             }
