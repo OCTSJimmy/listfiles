@@ -118,17 +118,6 @@ static void format_elapsed_time(time_t start_time, char *buffer, size_t buf_size
     snprintf(buffer, buf_size, "%d:%02d:%02d:%02d", days, hours, minutes, seconds);
 }
 
-void *status_thread_func(void *arg) {
-    ThreadSharedState *shared = (ThreadSharedState *)arg;
-    const useconds_t update_interval = 500000; // 500ms
-
-    while (shared->running) {
-        display_status(shared);
-        usleep(update_interval);
-    }
-    return NULL;
-}
-
 // 打印仪表盘
 void print_progress(const Config *cfg, RuntimeState *state, Monitor *mon) {
     // 1. 判断是否需要显示
