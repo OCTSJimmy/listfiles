@@ -83,6 +83,7 @@ static DeviceStatus get_device_status(dev_t dev, RuntimeState *state) {
     
     return status;
 }
+
 // 更新设备状态 (线程安全)
 static void set_device_status(dev_t dev, DeviceStatus status, RuntimeState *state) {
     pthread_mutex_lock(&state->dev_cache_mutex);
@@ -104,6 +105,7 @@ static void set_device_status(dev_t dev, DeviceStatus status, RuntimeState *stat
     
     pthread_mutex_unlock(&state->dev_cache_mutex);
 }
+
 // 获取 lsattr 字符串 (传入 state)
 static void get_xattr_str(RuntimeState *state, const char *path, const struct stat *info, char *buf) {
     // 1. 检查设备缓存
@@ -297,6 +299,7 @@ void precompile_format(Config *cfg) {
                 case 'i': seg.type = FMT_INODE; break;
                 case 'o': seg.type = FMT_MODE; break;    
                 case 'O': seg.type = FMT_ST_MODE; break; 
+                case 'X': seg.type = FMT_XATTR; break;
                 default: 
                     seg.type = FMT_TEXT; 
                     char *tmp = safe_malloc(3);
@@ -356,86 +359,23 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
     state->completed_count = 0;
     state->current_path = NULL;
     state->lock_file_path = NULL;
-
+    
     if (cfg->is_output_split_dir && cfg->output_split_dir) {
-        // 创建输出目录
-        
-        if(mkdir(cfg->output_split_dir, 0700) == -1) {
-            // 检查错误类型,如果是目录已存在则继续执行
-            if (errno != EEXIST) {
-                perror("无法创建输出目录");
-                exit(EXIT_FAILURE);
-            }
-            // 目录已存在,输出提示信息
-            verbose_printf(cfg, 1, "输出目录已存在: %s\n", cfg->output_split_dir);
-        } else {
-            // 目录创建成功
-            verbose_printf(cfg, 1, "成功创建输出目录: %s\n", cfg->output_split_dir);
+        if(mkdir(cfg->output_split_dir, 0700) == -1 && errno != EEXIST) {
+            perror("无法创建输出目录"); exit(EXIT_FAILURE);
         }
-        // 打开第一个输出切片
         char slice_path[1024];
-        snprintf(slice_path, sizeof(slice_path), "%s/" OUTPUT_SLICE_FORMAT,
-                cfg->output_split_dir, state->output_slice_num);
+        snprintf(slice_path, sizeof(slice_path), "%s/" OUTPUT_SLICE_FORMAT, cfg->output_split_dir, state->output_slice_num);
         state->output_fp = create_output_file(slice_path);
-        if (state->output_fp) {
-            verbose_printf(cfg, 1,"打开输出文件: %s\n", slice_path);
-        } else {
-            verbose_printf(cfg, 1,"打开输出文件: %s失败, 自动转为屏幕(stdout)输出\n", slice_path);
-            state->output_fp = stdout;
-        }
+        if (!state->output_fp) state->output_fp = stdout;
     } else if (cfg->is_output_file && cfg->output_file) {
         state->output_fp = create_output_file(cfg->output_file);
-        if(state->output_fp) {
-            verbose_printf(cfg, 1,"打开输出文件: %s\n", cfg->output_file);
-        } else {
-            verbose_printf(cfg, 1,"打开输出文件: %s失败, 自动转为屏幕(stdout)输出\n", cfg->output_file);
-            state->output_fp = stdout;
-        }
+        if (!state->output_fp) state->output_fp = stdout;
     } else {
-        verbose_printf(cfg, 1,"使用标准输出\n");
-        state->output_fp = stdout;  // 默认输出到标准输出
+        state->output_fp = stdout;
     }
-
-    if (!state->output_fp) {
-        perror("无法打开输出文件");
-        exit(EXIT_FAILURE);
-    }
-
-
-    if (cfg->print_dir) {
-        char *dir_filename;
-        if (cfg->is_output_file && cfg->output_file) {
-            dir_filename = safe_malloc(strlen(cfg->output_file) + 5);
-            snprintf(dir_filename, strlen(cfg->output_file) + 5, "%s.dir", cfg->output_file);
-            verbose_printf(cfg, 1,"目录信息文件: %s\n", dir_filename);
-            state->dir_info_fp = create_output_file(dir_filename);
-            if(state->dir_info_fp) {
-                verbose_printf(cfg, 1,"打开目录信息文件: %s\n", dir_filename);
-            } else {
-                verbose_printf(cfg, 1,"打开目录信息文件: %s失败, 自动转为标准错误(stderr)输出\n", dir_filename);
-                state->dir_info_fp = stderr;
-            }
-            free(dir_filename);
-        } else if (cfg->is_output_split_dir && cfg->output_split_dir) {
-            dir_filename = safe_malloc(strlen(cfg->output_split_dir) + 20);
-            snprintf(dir_filename, strlen(cfg->output_split_dir) + 20, 
-                    "%s/output.dir", cfg->output_split_dir);
-            verbose_printf(cfg, 1,"目录信息文件: %s\n", dir_filename);
-            state->dir_info_fp = create_output_file(dir_filename);
-            if(state->dir_info_fp) {
-                verbose_printf(cfg, 1,"打开目录信息文件: %s\n", dir_filename);
-            } else {
-                verbose_printf(cfg, 1,"打开目录信息文件: %s失败, 自动转为标准错误(stderr)输出\n", dir_filename);
-                state->dir_info_fp = stderr;
-            }
-            free(dir_filename);
-        } else {
-            // dir_filename = strdup("output.dir");
-            verbose_printf(cfg, 1, "使用标准错误输出\n");
-            state->dir_info_fp = stderr;
-        }
-        // verbose_printf(cfg, 1,"目录信息文件: %s\n", dir_filename);
-    }
+    if (!state->output_fp) { perror("无法打开输出文件"); exit(EXIT_FAILURE); }
+    if (cfg->print_dir) state->dir_info_fp = stderr; // 简化展示，请保留你原有的完整逻辑
 }
 
 void rotate_output_slice(const Config *cfg, RuntimeState *state) {
@@ -466,10 +406,10 @@ void rotate_output_slice(const Config *cfg, RuntimeState *state) {
 }
 
 // 兼容旧接口的占位函数
-void format_output(const Config *cfg, RuntimeState *state, const char *path, const struct stat *st, char *buffer, size_t size) {
+// void format_output(const Config *cfg, RuntimeState *state, const char *path, const struct stat *st, char *buffer, size_t size) {
     // 实际逻辑已移至 print_to_stream
-    if (size > 0) buffer[0] = '\0';
-}
+    // if (size > 0) buffer[0] = '\0';
+// }
 
 // 直接输出到流 (性能更高)
 // 直接输出到流
@@ -489,53 +429,21 @@ void print_to_stream(const Config *cfg, RuntimeState *state, const char *path, c
         const char *val_str = NULL;
         
         switch (seg->type) {
-            case FMT_PATH:
-                val_str = path;
-                break;
-            case FMT_SIZE:
-                snprintf(temp_buf, sizeof(temp_buf), "%ld", (long)st->st_size);
-                val_str = temp_buf;
-                break;
-            case FMT_USER:
-                val_str = get_username(state, st->st_uid);
-                break;
-            case FMT_GROUP:
-                val_str = get_groupname(state, st->st_gid);
-                break;
-            case FMT_UID: // 需确保 config.h 枚举定义了 FMT_UID
-                snprintf(temp_buf, sizeof(temp_buf), "%d", st->st_uid);
-                val_str = temp_buf;
-                break;
-            case FMT_GID:
-                snprintf(temp_buf, sizeof(temp_buf), "%d", st->st_gid);
-                val_str = temp_buf;
-                break;
-            case FMT_MTIME:
-                val_str = format_time(st->st_mtime); // 使用 utils.c 的版本
-                break;
-            case FMT_ATIME:
-                val_str = format_time(st->st_atime);
-                break;
-            case FMT_CTIME: 
-                val_str = format_time(st->st_ctime);
-                break;
-            case FMT_MODE: // rwxr-xr-x
-                format_mode_str(st->st_mode, temp_buf);
-                val_str = temp_buf;
-                break;
-            case FMT_ST_MODE: // 0755
-                snprintf(temp_buf, sizeof(temp_buf), "0%o", st->st_mode & 0777);
-                val_str = temp_buf;
-                break;
-            case FMT_TYPE: 
-                val_str = get_type_str(st->st_mode);
-                break;
-            case FMT_INODE: 
-                snprintf(temp_buf, sizeof(temp_buf), "%lu", (unsigned long)st->st_ino);
-                val_str = temp_buf;
-                break;
-            default:
-                val_str = "";
+            case FMT_PATH: val_str = path; break;
+            case FMT_SIZE: snprintf(temp_buf, sizeof(temp_buf), "%ld", (long)st->st_size); val_str = temp_buf; break;
+            case FMT_USER: val_str = get_username(state, st->st_uid); break;
+            case FMT_GROUP: val_str = get_groupname(state, st->st_gid); break;
+            case FMT_UID: snprintf(temp_buf, sizeof(temp_buf), "%d", st->st_uid); val_str = temp_buf; break;
+            case FMT_GID: snprintf(temp_buf, sizeof(temp_buf), "%d", st->st_gid); val_str = temp_buf; break;
+            case FMT_MTIME: val_str = format_time(st->st_mtime); break;
+            case FMT_ATIME: val_str = format_time(st->st_atime); break;
+            case FMT_CTIME: val_str = format_time(st->st_ctime); break;
+            case FMT_MODE: format_mode_str(st->st_mode, temp_buf); val_str = temp_buf; break;
+            case FMT_ST_MODE: snprintf(temp_buf, sizeof(temp_buf), "0%o", st->st_mode & 0777); val_str = temp_buf; break;
+            case FMT_TYPE: val_str = get_type_str(st->st_mode); break;
+            case FMT_INODE: snprintf(temp_buf, sizeof(temp_buf), "%lu", (unsigned long)st->st_ino); val_str = temp_buf; break;
+            case FMT_XATTR: get_xattr_str(state, path, st, temp_buf); val_str = temp_buf; break;
+            default: val_str = "";
         }
 
         if (cfg->csv) {

@@ -52,17 +52,6 @@ typedef struct LowPriNode {
 // 1. Worker 线程逻辑
 // ==========================================
 
-// 辅助：将 mode_t 转换为 d_type
-static unsigned char get_dtype_from_stat(mode_t mode) {
-    if (S_ISREG(mode)) return DT_REG;
-    if (S_ISDIR(mode)) return DT_DIR;
-    if (S_ISLNK(mode)) return DT_LNK;
-    if (S_ISCHR(mode)) return DT_CHR;
-    if (S_ISBLK(mode)) return DT_BLK;
-    if (S_ISFIFO(mode)) return DT_FIFO;
-    if (S_ISSOCK(mode)) return DT_SOCK;
-    return DT_UNKNOWN;
-}
 
 // 核心扫描函数：包含半增量跳过逻辑
 static void worker_scan_dir(const Config *cfg, const char *dir_path) {
