@@ -200,35 +200,22 @@ static void check_workers_health(Monitor *self) {
             if (dev == 0) continue; 
             
             DeviceState ds = dev_mgr_get_state(dm, dev);
-            
             if (ds == DEV_STATE_NORMAL) {
-                // -> 首次发现卡顿，发射探针
-                if (self->cfg->verbose) {
-                    fprintf(stderr, "[Monitor] Worker %d 超时 (dev: %lu), 启动探针...\n", hb->id, (unsigned long)dev);
-                }
+                verbose_printf(self->cfg, 0, "[Monitor] Worker %d timed out on dev %lu. Probing...\n", hb->id, (unsigned long)dev);
                 launch_probe(dm, dev, hb->current_path);
-                
             } else if (ds == DEV_STATE_PROBING) {
-                // -> 正在探测，检查是否探测超时 (判定探针死亡)
-                // 如果 Worker 持续卡顿且超过 (超时时间 + 探针等待时间)，强制判死
                 if (now - hb->last_active > HEARTBEAT_TIMEOUT_SEC + PROBE_TIMEOUT_SEC + 2) {
-                    fprintf(stderr, "[Monitor] 探针未返回，确认设备 %lu 死亡！熔断生效。\n", (unsigned long)dev);
+                    verbose_printf(self->cfg, 0, "[Monitor] Probe failed! MARKING DEVICE %lu DEAD!\n", (unsigned long)dev);
                     dev_mgr_mark_dead(dm, dev);
                 }
-                
             } else if (ds == DEV_STATE_DEAD) {
-                // -> 设备已死，清理僵尸
                 if (!hb->is_zombie) {
-                    hb->is_zombie = true; // 标记自杀
-                    fprintf(stderr, "[Monitor] 放弃 Worker %d，补充新线程。\n", hb->id);
-                    
+                    hb->is_zombie = true; 
+                    verbose_printf(self->cfg, 0, "[Monitor] Abandoning Worker %d (Zombie). Spawning replacement.\n", hb->id);
                     self->workers[i] = NULL; 
                     self->active_worker_count--;
                     self->state->has_error = true; 
-                    
-                    // [核心新增] 通知 Traversal 扣除 pending 计数，防止死锁
                     traversal_notify_worker_abandoned();
-
                     traversal_spawn_replacement_worker(self->cfg, self);
                 }
             }

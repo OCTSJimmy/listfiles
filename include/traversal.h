@@ -15,13 +15,11 @@ typedef struct {
     MessageQueue *target_mq;
 } ResumeThreadArgs;
 
-// [修改] Worker 参数增加 Monitor 上下文
 typedef struct {
     const Config *cfg;
     Monitor *monitor; 
 } WorkerArgs;
 
-// 低优先级队列节点 (用于 Looper 暂存新任务)
 typedef struct LowPriNode {
     char *path;
     struct LowPriNode *next;

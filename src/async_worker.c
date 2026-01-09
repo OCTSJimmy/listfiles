@@ -109,20 +109,16 @@ static void perform_save_progress(AsyncWorker *worker, const ProgressSnapshot *s
 static void *async_writer_thread(void *arg) {
     AsyncWorker *worker = (AsyncWorker *)arg;
     worker->last_flush_time = time(NULL);
-
+    verbose_printf(worker->cfg, 0, "[Writer] Thread started\n");
     while (true) {
         WriteTask *task = NULL;
-
-        // 1. 获取任务 (带超时的条件等待，用于定时 Flush)
         pthread_mutex_lock(&worker->mutex);
-        
         while (worker->head == NULL && !worker->stop_flag) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += FLUSH_INTERVAL_SEC; // 等待最多 5 秒
-            
+            ts.tv_sec += FLUSH_INTERVAL_SEC; 
             int rc = pthread_cond_timedwait(&worker->cond, &worker->mutex, &ts);
-            if (rc == ETIMEDOUT) break; // 超时醒来，去检查是否需要 flush
+            if (rc == ETIMEDOUT) break; 
         }
 
         if (worker->head != NULL) {
@@ -132,47 +128,38 @@ static void *async_writer_thread(void *arg) {
             worker->queue_count--;
         } else if (worker->stop_flag) {
             pthread_mutex_unlock(&worker->mutex);
-            break; // 退出循环
+            break; 
         }
-        
         pthread_mutex_unlock(&worker->mutex);
 
-        // 2. 处理任务
         if (task) {
-            switch (task->type) {
-                case TASK_WRITE_BATCH: {
-                    TaskBatch *batch = task->data.batch;
-                    if (batch) {
-                        for (int i = 0; i < batch->count; i++) {
-                            process_single_file_output(worker, batch->paths[i], &batch->stats[i]);
-                            worker->pending_since_flush++;
-                        }
-                        batch_destroy(batch); // 销毁批次内存
+            if (task->type == TASK_WRITE_BATCH) {
+                TaskBatch *batch = task->data.batch;
+                if (batch) {
+                    verbose_printf(worker->cfg, 0, "[Writer] Processing batch (%d items)\n", batch->count);
+                    for (int i = 0; i < batch->count; i++) {
+                        process_single_file_output(worker, batch->paths[i], &batch->stats[i]);
+                        worker->pending_since_flush++;
                     }
-                    break;
+                    batch_destroy(batch);
                 }
-                
-                case TASK_WRITE_CHECKPOINT: {
-                    // 遇到检查点：强制刷盘并保存进度
-                    perform_flush_output(worker);
-                    perform_save_progress(worker, &task->data.checkpoint);
-                    break;
-                }
-                
-                default: break;
+            } else if (task->type == TASK_WRITE_CHECKPOINT) {
+                verbose_printf(worker->cfg, 0, "[Writer] Checkpoint triggered\n");
+                perform_flush_output(worker);
+                perform_save_progress(worker, &task->data.checkpoint);
             }
-            free(task); // 销毁任务节点
+            free(task);
         }
 
-        // 3. 自动 Flush 策略 (基于时间或数量)
         time_t now = time(NULL);
-        if (worker->pending_since_flush >= BATCH_FLUSH_THRESHOLD || 
+        if (worker->pending_since_flush >= BATCH_FLUSH_SIZE || 
             (worker->pending_since_flush > 0 && now - worker->last_flush_time >= FLUSH_INTERVAL_SEC)) {
+            verbose_printf(worker->cfg, 0, "[Writer] Auto-flushing %zu items...\n", worker->pending_since_flush);
             perform_flush_output(worker);
         }
     }
-
-    // 退出前最后一次 Flush
+    
+    verbose_printf(worker->cfg, 0, "[Writer] Exiting, final flush...\n");
     perform_flush_output(worker);
     return NULL;
 }

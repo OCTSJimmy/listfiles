@@ -7,6 +7,7 @@
 #include "monitor.h" 
 #include "idempotency.h" // 确保包含 HashSet 定义
 #include "device_manager.h" // [新增]
+#include "output.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,9 +98,11 @@ int main(int argc, char *argv[]) {
     if (parse_arguments(argc, argv, &cfg) != 0) {
         return 1;
     }
-
+    // [修复 1] 预编译格式字符串！
+    // 之前缺失了这一步，导致 format_segment_count 为 0，输出全是空行。
+    precompile_format(&cfg);
     // 2. 信号处理
-    setup_signal_handlers(&cfg);
+    setup_signal_handlers();
 
     // 3. 会话管理
     bool has_history = false;
@@ -168,7 +171,12 @@ int main(int argc, char *argv[]) {
         dev_mgr_destroy(state.dev_mgr);
         state.dev_mgr = NULL;
     }
-
+    
+    finalize_progress(&cfg, &state);
+    // 如果不是 continue_mode (例如 runone)，traversal.c 没有清理缓存，这里可以补一下
+    if (!cfg.continue_mode) {
+        cleanup_progress(&cfg, &state);
+    }
     printf("[System] 任务完成。耗时: %ld 秒\n", time(NULL) - state.start_time);
     
     // 如果有错误发生（熔断），返回非零状态码
