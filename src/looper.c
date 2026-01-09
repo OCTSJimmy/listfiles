@@ -9,12 +9,10 @@
 // 1. 批处理 (TaskBatch) 管理实现
 // ==========================================
 
-TaskBatch* batch_create() {
-    TaskBatch *b = safe_malloc(sizeof(TaskBatch));
-    b->count = 0;
-    // 指针数组清零，方便后续安全释放
-    memset(b->paths, 0, sizeof(b->paths));
-    return b;
+TaskBatch *batch_create() {
+    TaskBatch *batch = safe_malloc(sizeof(TaskBatch));
+    batch->count = 0;
+    return batch;
 }
 
 int mq_get_size(MessageQueue *mq) {
@@ -30,26 +28,23 @@ int mq_get_size(MessageQueue *mq) {
     return count;
 }
 
-void batch_add(TaskBatch *batch, const char *path, const struct stat *info) {
-    if (batch->count < BATCH_SIZE) {
-        batch->paths[batch->count] = strdup(path); // 复制路径字符串
-        if (info) {
-            batch->stats[batch->count] = *info;    // 复制 stat 结构体
-        } else {
-            memset(&batch->stats[batch->count], 0, sizeof(struct stat));
-        }
-        batch->count++;
-    }
+void batch_add(TaskBatch *batch, const char *path, const struct stat *st) {
+    if (batch->count >= BATCH_SIZE) return;
+    // 注意：这里必须 strdup，因为 path 指针通常是临时的
+    batch->paths[batch->count] = strdup(path); 
+    batch->stats[batch->count] = *st;
+    batch->count++;
 }
 
+// [修改] 修复内存泄漏
 void batch_destroy(TaskBatch *batch) {
     if (!batch) return;
     for (int i = 0; i < batch->count; i++) {
         if (batch->paths[i]) {
-            free(batch->paths[i]); // 释放 strdup 出来的路径
+            free(batch->paths[i]); // 必须释放 strdup 的字符串
         }
     }
-    free(batch); // 释放结构体本身
+    free(batch);
 }
 
 // ==========================================

@@ -62,7 +62,7 @@ void mq_destroy(MessageQueue *mq);
 
 // 批次管理 (生产端/消费端通用)
 TaskBatch* batch_create();
-void batch_add(TaskBatch *batch, const char *path, const struct stat *info);
+void batch_add(TaskBatch *batch, const char *path, const struct stat *st);
 void batch_destroy(TaskBatch *batch); // 释放批次内所有资源
 
 // 消息操作

@@ -166,13 +166,18 @@ static void* worker_thread_entry(void *arg) {
         if (hb && hb->is_zombie) {
             goto suicide;
         }
-
+        // === [核心修复] ===
+        // 在进入可能无限阻塞的等待之前，清除设备状态。
+        // 这样 Monitor 巡检时发现 dev == 0，就会跳过对该 Worker 的超时检查。
+        if (hb) {
+            hb->current_dev = 0;
+            hb->current_path[0] = '\0'; // 可选，清空路径方便调试
+        }
         Message *msg = mq_dequeue(&g_worker_mq);
         if (!msg) break; // Quit
 
         // [心跳] 拿到任务，更新
         if (hb) hb->last_active = time(NULL);
-
         switch (msg->what) {
             case MSG_SCAN_DIR:
                 worker_scan_dir(cfg, (char *)msg->obj, hb);
