@@ -27,7 +27,8 @@ void show_help() {
     printf("  -y, --yes              跳过启动时的交互式确认 (Non-interactive)\n");
     printf("      --skip-interval=秒 设置半增量扫描的时间阈值 (默认: 0)\n");
     printf("                          - 若文件元数据与历史一致且修改时间超过此阈值，则跳过lstat\n");
-    
+    printf("  -t xx, --timeout xx 存储判死拉黑延迟，默认30秒，单位秒\n");
+
     printf("\n输出控制:\n");
     printf("  -f, --progress-file=文件 进度文件/历史记录前缀 (默认: progress)\n");
     printf("  -o, --output=文件      将结果写入指定文件 (默认: %s)\n", DEFAULT_OUTPUT_FILE);
@@ -75,6 +76,7 @@ void init_config(Config *cfg) {
     cfg->csv = false;
     cfg->quote = false;
     cfg->include_dir = false;
+    cfg->heartbeat_timeout = HEARTBEAT_TIMEOUT_SEC;
 }
 
 int parse_arguments(int argc, char *argv[], Config *cfg) {
@@ -115,7 +117,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
     };
     
     int opt;
-    while ((opt = getopt_long(argc, argv, "p:cf:dvVF:ZCX:hO:o:QDRMy", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:cf:dvVF:ZCX:hO:o:QDRMyt:", long_options, NULL)) != -1) {
         switch (opt) {
             case 'p': cfg->target_path = strdup(optarg); break;
             case 'c': cfg->continue_mode = true; break;
@@ -179,6 +181,13 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
                 cfg->skip_interval = atol(optarg);
                 break;
             case 22: cfg->csv = true; break;               // --csv
+            case 't': 
+                cfg->heartbeat_timeout = atol(optarg);
+                if (cfg->heartbeat_timeout <= 0) {
+                    fprintf(stderr, "Error: Timeout must be positive.\n");
+                    exit(EXIT_FAILURE);
+                }
+             break; //存储判死延迟
             case 'h': default: show_help(); return -1;
         }
     }

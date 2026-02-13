@@ -45,6 +45,12 @@ struct DeviceManager;
 #define SAMPLE_INTERVAL_MS 1000
 #define OUTPUT_DIR_PREFIX "目录: "
 
+
+#define HEARTBEAT_TIMEOUT_SEC 30   // Worker 30秒无心跳视为卡死
+#define PROBE_TIMEOUT_SEC 5        // 探针5秒不返回视为设备死亡
+#define MONITOR_INTERVAL_MS 500    // Monitor 线程主频 (500ms)
+#define CHECK_INTERVAL_SEC 1       // 巡检频率 (1秒)
+
 #define min_size(a, b) ((a) < (b) ? (a) : (b))
 #define max_size(a, b) ((a) > (b) ? (a) : (b))
 
@@ -172,6 +178,8 @@ typedef struct {
     // === 会话一致性校验字段 (从 .config 读取) ===
     time_t last_start_time;
     char *last_cmd_args; 
+
+    int heartbeat_timeout;
 } Config;
 
 // 运行时状态

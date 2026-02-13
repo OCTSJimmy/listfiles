@@ -10,11 +10,6 @@
 #include <errno.h>
 #include <math.h>
 
-#define HEARTBEAT_TIMEOUT_SEC 30   // Worker 30秒无心跳视为卡死
-#define PROBE_TIMEOUT_SEC 5        // 探针5秒不返回视为设备死亡
-#define MONITOR_INTERVAL_MS 500    // Monitor 线程主频 (500ms)
-#define CHECK_INTERVAL_SEC 1       // 巡检频率 (1秒)
-
 static void* probe_thread_func(void *arg) {
     ProbeArgs *p = (ProbeArgs*)arg;
     
@@ -195,7 +190,7 @@ static void check_workers_health(Monitor *self) {
         if (!hb) continue;
         
         // 1. 检查是否超时
-        if (now - hb->last_active > HEARTBEAT_TIMEOUT_SEC) {
+        if (now - hb->last_active > self->cfg->heartbeat_timeout) {
             dev_t dev = hb->current_dev;
             if (dev == 0) continue; 
             
@@ -204,7 +199,7 @@ static void check_workers_health(Monitor *self) {
                 verbose_printf(self->cfg, 0, "[Monitor] Worker %d timed out on dev %lu. Probing...\n", hb->id, (unsigned long)dev);
                 launch_probe(dm, dev, hb->current_path);
             } else if (ds == DEV_STATE_PROBING) {
-                if (now - hb->last_active > HEARTBEAT_TIMEOUT_SEC + PROBE_TIMEOUT_SEC + 2) {
+                if (now - hb->last_active > self->cfg->heartbeat_timeout + PROBE_TIMEOUT_SEC + 2) {
                     verbose_printf(self->cfg, 0, "[Monitor] Probe failed! MARKING DEVICE %lu DEAD!\n", (unsigned long)dev);
                     dev_mgr_mark_dead(dm, dev);
                 }
