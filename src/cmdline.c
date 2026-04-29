@@ -112,6 +112,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"yes", no_argument, 0, 'y'},
         {"skip-interval", required_argument, 0, 21},
         {"csv", no_argument, 0, 22},
+        {"timeout", no_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
