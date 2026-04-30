@@ -379,6 +379,11 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
     }
     if (!state->output_fp) { perror("无法打开输出文件"); exit(EXIT_FAILURE); }
 
+    // 启用大块缓冲以减少系统调用
+    if (state->output_fp && state->output_fp != stdout) {
+        setvbuf(state->output_fp, NULL, _IOFBF, 8 * 1024 * 1024);
+    }
+
     // 3. [修复重点] 处理目录流输出 (--print-dir)
     // 逻辑：如果数据走文件，目录流也走文件(伴生文件)；如果数据走 stdout，目录流走 stderr。
     if (cfg->print_dir) {
@@ -406,6 +411,10 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
         }
     } else {
         state->dir_info_fp = NULL;
+    }
+
+    if (state->dir_info_fp && state->dir_info_fp != stderr && state->dir_info_fp != stdout) {
+        setvbuf(state->dir_info_fp, NULL, _IOFBF, 1 * 1024 * 1024);
     }
 }
 

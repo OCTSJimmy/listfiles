@@ -10,7 +10,7 @@ CC := gcc
 # -Wall -Wextra: 开启所有常用和额外的警告
 # -Iinclude: 告诉编译器去 'include' 目录下查找头文件 (.h)
 # -pthread: 启用 POSIX 线程支持
-CFLAGS := -g -Wall -Wextra -Iinclude -pthread
+CFLAGS := -g -Wall -Wextra -std=gnu11 -Iinclude -pthread
 
 # 链接选项
 # -pthread: 链接时加入线程库

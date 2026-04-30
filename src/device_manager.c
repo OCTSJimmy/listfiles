@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <string.h>
 
-// 简单的安全内存分配
 static void *dm_safe_malloc(size_t size) {
     void *ptr = malloc(size);
     if (!ptr) {
@@ -27,7 +26,6 @@ void dev_mgr_destroy(DeviceManager *self) {
     free(self);
 }
 
-// 内部查找 (需在锁内调用)
 static int find_index_locked(DeviceManager *self, dev_t dev) {
     for (size_t i = 0; i < self->count; i++) {
         if (self->entries[i].dev == dev) {
@@ -39,7 +37,6 @@ static int find_index_locked(DeviceManager *self, dev_t dev) {
 
 DeviceState dev_mgr_get_state(DeviceManager *self, dev_t dev) {
     if (!self) return DEV_STATE_NORMAL;
-    
     DeviceState state = DEV_STATE_NORMAL;
     pthread_mutex_lock(&self->mutex);
     int idx = find_index_locked(self, dev);
@@ -52,22 +49,18 @@ DeviceState dev_mgr_get_state(DeviceManager *self, dev_t dev) {
 
 static void update_state_locked(DeviceManager *self, dev_t dev, DeviceState new_state) {
     int idx = find_index_locked(self, dev);
-    
     if (idx != -1) {
-        // 更新现有
         self->entries[idx].state = new_state;
         if (new_state == DEV_STATE_PROBING) {
             self->entries[idx].last_probe_time = time(NULL);
         }
     } else {
-        // 新增
         if (self->count < MAX_TRACKED_DEVICES) {
             DeviceEntry *entry = &self->entries[self->count++];
             entry->dev = dev;
             entry->state = new_state;
             entry->last_probe_time = (new_state == DEV_STATE_PROBING) ? time(NULL) : 0;
         } else {
-            // 满了，仅打印一次警告
             static bool warned = false;
             if (!warned) {
                 fprintf(stderr, "[Warn] Device Manager full! Cannot track dev %lu\n", (unsigned long)dev);
@@ -81,7 +74,6 @@ void dev_mgr_mark_probing(DeviceManager *self, dev_t dev) {
     if (!self) return;
     pthread_mutex_lock(&self->mutex);
     int idx = find_index_locked(self, dev);
-    // 只有非 DEAD 状态才允许转 PROBING
     if (idx == -1 || self->entries[idx].state != DEV_STATE_DEAD) {
         update_state_locked(self, dev, DEV_STATE_PROBING);
     }
@@ -102,6 +94,14 @@ void dev_mgr_mark_alive(DeviceManager *self, dev_t dev) {
     pthread_mutex_unlock(&self->mutex);
 }
 
+void dev_mgr_mark_condemned(DeviceManager *self, dev_t dev) {
+    if (!self) return;
+    pthread_mutex_lock(&self->mutex);
+    update_state_locked(self, dev, DEV_STATE_CONDEMNED);
+    pthread_mutex_unlock(&self->mutex);
+}
+
 bool dev_mgr_is_blacklisted(DeviceManager *self, dev_t dev) {
-    return dev_mgr_get_state(self, dev) == DEV_STATE_DEAD;
+    DeviceState s = dev_mgr_get_state(self, dev);
+    return s == DEV_STATE_DEAD || s == DEV_STATE_CONDEMNED;
 }

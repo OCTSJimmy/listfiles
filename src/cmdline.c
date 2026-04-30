@@ -12,50 +12,43 @@ void show_version() {
     printf("listfiles 版本 %s\n", VERSION);
 }
 
-// [修改点 1]：更新帮助信息，补充新功能的说明
 void show_help() {
     printf("\n文件列表器 %s\n", VERSION);
     printf("递归列出文件及其元数据, 支持智能断点续传与半增量扫描\n\n");
     printf("用法: listfiles --path=路径 [选项]\n\n");
-    
     printf("核心选项:\n");
     printf("  -p, --path=路径        要扫描的目标目录 (必须)\n");
-    printf("  -c, --continue         启用智能续传/增量模式:\n");
-    printf("                          - 若上次任务未完成: 继续扫描 (Resume)\n");
-    printf("                          - 若上次任务已成功: 执行半增量扫描 (Incremental)\n");
-    printf("      --runone           强制全量扫描 (忽略历史进度，相当于 Fresh Start)\n");
-    printf("  -y, --yes              跳过启动时的交互式确认 (Non-interactive)\n");
+    printf("  -c, --continue         启用智能续传/增量模式\n");
+    printf("      --runone           强制全量扫描 (忽略历史进度)\n");
+    printf("  -y, --yes              跳过启动时的交互式确认\n");
     printf("      --skip-interval=秒 设置半增量扫描的时间阈值 (默认: 0)\n");
-    printf("                          - 若文件元数据与历史一致且修改时间超过此阈值，则跳过lstat\n");
-    printf("  -t xx, --timeout xx 存储判死拉黑延迟，默认30秒，单位秒\n");
-
+    printf("      --batch-size=数量  Worker batch 大小 (默认: %d)\n", DEFAULT_BATCH_SIZE);
+    printf("      --estimated-files=数量 预估文件数,用于预分配内存 (默认: %lu)\n", DEFAULT_ESTIMATED_FILES);
+    printf("  -t, --timeout=秒       心跳超时时间 (默认: %d)\n", HEARTBEAT_TIMEOUT_SEC);
     printf("\n输出控制:\n");
     printf("  -f, --progress-file=文件 进度文件/历史记录前缀 (默认: progress)\n");
     printf("  -o, --output=文件      将结果写入指定文件 (默认: %s)\n", DEFAULT_OUTPUT_FILE);
     printf("  -O, --output-split=目录 将结果按行拆分到指定目录\n");
-    printf("      --csv              启用标准 CSV 输出格式 (Quote all fields)\n");
-    printf("  -Q, --quote            对输出结果进行引号包裹 (非 CSV 模式下的简单包裹)\n");
+    printf("      --csv              启用标准 CSV 输出格式\n");
+    printf("  -Q, --quote            对输出结果进行引号包裹\n");
     printf("  -D, --dirs             包含目录本身的信息\n");
-    printf("  -d, --print-dir        打印目录路径到标准错误 (实时进度)\n");
+    printf("  -d, --print-dir        打印目录路径到标准错误\n");
     printf("  -M, --mute             禁用所有输出\n");
-
     printf("\n格式化与元数据:\n");
-    printf("  -F, --format=格式      自定义输出格式 (如 \"%%p|%%s|%%m\")\n");
-    printf("                          %%p=路径, %%s=大小, %%u=用户, %%g=组, %%m=mtime\n");
-    printf("  --size, --user, --group, --mtime, --atime, --mode, --xattr  启用特定元数据列\n");
+    printf("  -F, --format=格式      自定义输出格式\n");
+    printf("  --size, --user, --group, --mtime, --atime, --mode, --xattr\n");
     printf("  --follow-symlinks      跟踪符号链接\n");
-
     printf("\n高级/维护:\n");
-    printf("  -Z, --archive          压缩已处理的进度分片 (归档)\n");
-    printf("  -C, --clean            删除已处理的进度分片 (清理)\n");
-    printf("  -R, --resume-from=文件 仅从指定的进度列表文件恢复 (旧版兼容模式)\n");
+    printf("  -Z, --archive          压缩已处理的进度分片\n");
+    printf("  -C, --clean            删除已处理的进度分片\n");
+    printf("  -R, --resume-from=文件 仅从指定的进度列表文件恢复\n");
     printf("  --max-slice=行数       每个输出切片的最大行数\n");
     printf("  -v, --verbose          启用详细日志\n");
     printf("  -h, --help             显示此帮助信息\n");
 }
 
-
 void init_config(Config *cfg) {
+    memset(cfg, 0, sizeof(Config));
     cfg->progress_base = "progress";
     cfg->compiled_format = NULL;
     cfg->format_segment_count = 0;
@@ -77,6 +70,8 @@ void init_config(Config *cfg) {
     cfg->quote = false;
     cfg->include_dir = false;
     cfg->heartbeat_timeout = HEARTBEAT_TIMEOUT_SEC;
+    cfg->batch_size = DEFAULT_BATCH_SIZE;
+    cfg->estimated_files = DEFAULT_ESTIMATED_FILES;
 }
 
 int parse_arguments(int argc, char *argv[], Config *cfg) {
@@ -112,11 +107,13 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"yes", no_argument, 0, 'y'},
         {"skip-interval", required_argument, 0, 21},
         {"csv", no_argument, 0, 22},
-        {"timeout", no_argument, 0, 't'},
+        {"batch-size", required_argument, 0, 23},
+        {"estimated-files", required_argument, 0, 24},
+        {"timeout", required_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
     };
-    
+
     int opt;
     while ((opt = getopt_long(argc, argv, "p:cf:dvVF:ZCX:hO:o:QDRMyt:", long_options, NULL)) != -1) {
         switch (opt) {
@@ -125,7 +122,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 'f': cfg->progress_base = strdup(optarg); break;
             case 'd': cfg->print_dir = true; break;
             case 'v': cfg->verbose = true; break;
-            case 'V': show_version(); return -1; // -1 表示调用者应直接退出
+            case 'V': show_version(); return -1;
             case 'F': cfg->format = strdup(optarg); break;
             case 1: cfg->size = true; break;
             case 2: cfg->user = true; break;
@@ -133,14 +130,14 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 4: cfg->mtime = true; break;
             case 5: cfg->atime = true; break;
             case 6: cfg->follow_symlinks = true; break;
-            case 7: 
+            case 7:
                 cfg->output_slice_lines = atol(optarg);
                 if (cfg->output_slice_lines <= 0) {
                     fprintf(stderr, "错误: 分片大小必须大于零\n");
                     exit(EXIT_FAILURE);
                 }
                 break;
-            case 8: // verbose-type
+            case 8:
                 if (strcmp(optarg, "full") == 0 || strcmp(optarg, "0") == 0) {
                     cfg->verbose_type = VERBOSE_TYPE_FULL;
                 } else if (strcmp(optarg, "versioned") == 0 || strcmp(optarg, "1") == 0) {
@@ -149,7 +146,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
                     fprintf(stderr, "无效的verbose类型: %s, 使用默认值\n", optarg);
                 }
                 break;
-            case 9: // verbose-level
+            case 9:
                 cfg->verbose_level = atoi(optarg);
                 if (cfg->verbose_level < 0) cfg->verbose_level = DEFAULT_VERBOSE_LEVEL;
                 break;
@@ -158,37 +155,45 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 'Z': cfg->archive = true; break;
             case 'C': cfg->clean = true; break;
             case 'X': cfg->decompress = true; return -1;
-            case 'o': 
-                cfg->is_output_file = true; 
-                cfg->output_file = strdup(optarg); 
+            case 'o':
+                cfg->is_output_file = true;
+                cfg->output_file = strdup(optarg);
                 break;
-            case 'O': 
-                cfg->is_output_split_dir = true; 
-                cfg->output_split_dir = strdup(optarg); 
+            case 'O':
+                cfg->is_output_split_dir = true;
+                cfg->output_split_dir = strdup(optarg);
                 break;
             case 'Q': cfg->quote = true; break;
             case 'D': cfg->include_dir = true; break;
-            case 'R': 
+            case 'R':
                 cfg->resume_file = strdup(optarg);
                 if (!cfg->continue_mode) {
                     cfg->continue_mode = true;
                     if (!cfg->progress_base) cfg->progress_base = "resume_task";
                 }
                 break;
-            case 'M': cfg->mute = true; break;             // [修改点 4]：处理新参数
-            case 20: cfg->runone = true; break;            // --runone
-            case 'y': cfg->sure = true; break;             // --yes
-            case 21:                                       // --skip-interval
+            case 'M': cfg->mute = true; break;
+            case 20: cfg->runone = true; break;
+            case 'y': cfg->sure = true; break;
+            case 21:
                 cfg->skip_interval = atol(optarg);
                 break;
-            case 22: cfg->csv = true; break;               // --csv
-            case 't': 
+            case 22: cfg->csv = true; break;
+            case 23:
+                cfg->batch_size = atoi(optarg);
+                if (cfg->batch_size <= 0) cfg->batch_size = DEFAULT_BATCH_SIZE;
+                break;
+            case 24:
+                cfg->estimated_files = atol(optarg);
+                if (cfg->estimated_files == 0) cfg->estimated_files = DEFAULT_ESTIMATED_FILES;
+                break;
+            case 't':
                 cfg->heartbeat_timeout = atol(optarg);
                 if (cfg->heartbeat_timeout <= 0) {
                     fprintf(stderr, "Error: Timeout must be positive.\n");
                     exit(EXIT_FAILURE);
                 }
-             break; //存储判死延迟
+                break;
             case 'h': default: show_help(); return -1;
         }
     }

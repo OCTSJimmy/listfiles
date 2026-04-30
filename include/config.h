@@ -51,6 +51,9 @@ struct DeviceManager;
 #define MONITOR_INTERVAL_MS 500    // Monitor 线程主频 (500ms)
 #define CHECK_INTERVAL_SEC 1       // 巡检频率 (1秒)
 
+#define DEFAULT_BATCH_SIZE 1024
+#define DEFAULT_ESTIMATED_FILES 10000000
+
 #define min_size(a, b) ((a) < (b) ? (a) : (b))
 #define max_size(a, b) ((a) > (b) ? (a) : (b))
 
@@ -180,6 +183,10 @@ typedef struct {
     char *last_cmd_args; 
 
     int heartbeat_timeout;
+    
+    /* === 新增：进程模型与性能参数 === */
+    int batch_size;             // Worker batch 大小，默认 1024
+    unsigned long estimated_files; // 预估文件数，用于预分配 HashSet
 } Config;
 
 // 运行时状态
