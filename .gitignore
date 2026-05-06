@@ -5,3 +5,11 @@ bin/
 compile_commands.json
 test_output/
 
+
+# Test progress files
+progress*.config
+progress*.idx
+progress*.archive
+progress*.pbin
+progress*.spbin
+progress*.fpbin
