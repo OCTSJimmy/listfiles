@@ -2,6 +2,7 @@
 #define PROGRESS_H
 
 #include "config.h"
+#include "archive_format.h"
 #include "app_context.h"
 #include "spbin.h"
 
@@ -37,6 +38,15 @@ char *get_index_filename(const char *base);
 char *get_slice_filename(const char *base, unsigned long index);
 char *get_archive_filename(const char *base);
 char *get_spbin_filename(const char *base);
+char *get_per_slice_index_filename(const char *base, unsigned long index);
+char *get_fpbin_slice_filename(const char *base, unsigned long index);
+char *get_fpbin_index_filename(const char *base);
+
+/* Footer 读写与校验 */
+bool write_pbin_footer(FILE *fp, uint64_t row_count);
+bool read_pbin_footer(const char *path, PbinFooter *out);
+bool verify_pbin_footer(const PbinFooter *f);
+unsigned long get_slice_row_count(const Config *cfg, unsigned long index);
 
 /* Spbin memory cache */
 void spbin_append(AppContext *ctx, const SpbinEntry *entry);

@@ -4,6 +4,122 @@
 
 ---
 
+## [12.2.0] - 2026-05-07
+
+### 重大设计升级：同构分片 + 页脚自描述 + 两阶段提交
+
+**设计目标**：让 `fpbin` 从"崩溃即丢弃的临时垃圾"变成"可转正、可恢复、可自描述的一等进度分片"；同时让已完成的分片彻底摆脱对外部 `.idx` 的依赖，实现"随文件迁移、归档、复制"的自描述能力。
+
+#### 核心哲学
+
+- **`pbin` 与 `fpbin` 采用完全相同的物理格式**，只是生命周期和命名前缀不同。
+- **已完成的分片是自描述对象**：文件末尾自带 `Footer`（24 字节），记录实际行数与校验信息，不再需要外部 `.idx` 陪伴。
+- **活跃分片使用轻量 `.idx` 作为临时草稿纸**，分片封口时通过 **"先盖钢印、再烧草稿"** 的两阶段提交安全落地。
+
+#### 分片格式（统一结构）
+
+```
+[数据记录流]
+  [path_len][path][dev][ino][mtime][d_type]
+  ...
+
+[Footer: 固定 24 字节，文件最末尾]
+  magic        : uint64_t  (0xDEADBEEF66AAC0FF)
+  row_count    : uint64_t  (该分片实际总行数)
+  data_crc32   : uint32_t  (预留，当前填 0)
+  footer_crc32 : uint32_t  (覆盖 magic + row_count 的 CRC32)
+```
+
+**关键约束**：
+- `Footer` 只在分片**封口（seal）**时一次性 `O_APPEND` 写入，不是持续追加。
+- 活跃分片**末尾没有有效 Footer**（或即使有残留也不可信），权威来源是配套的 `.idx`。
+
+#### idx 与 Footer 的职责边界
+
+| 阶段 | 权威来源 | 作用 | 存在形式 |
+|------|---------|------|---------|
+| **活跃分片**（正在接收记录） | `{base}_00000N.idx` / `{base}.fpbin.idx` | 实时跟踪当前行数，支持原子 `rename` 更新 | 独立小文件 |
+| **已封口分片**（历史/归档/转正） | `Footer`（文件末尾） | 自描述行数，随文件迁移、归档、复制 | 内嵌元数据 |
+| **崩溃恢复** | Footer 优先，idx 兜底 | Footer 校验通过 → 用 Footer；Footer 残缺 → 用残留 idx | 两者配合 |
+
+#### fpbin 生命周期与转正流程
+
+**隔离阶段（HIST_PUMP_OLD）**：
+- Master 从历史 `pbin` 分片 pump 任务给 Worker。
+- Worker 返回的新发现子目录**不入队、不混写 pbin**，而是追加到 `{base}.fpbin_000XXX` 分片。
+- `{base}.fpbin.idx` 实时记录当前 fpbin 分片号与行数。
+
+**触发扫尾（到达截止游标）**：
+- 当最后一个历史 `pbin` 分片消费完毕：
+  1. **冻结 fpbin**：不再接收新发现。
+  2. **封口每个 fpbin 分片**：打开分片，`O_APPEND` 写入 `Footer`（行数来自 `fpbin.idx`）；`fsync` 确保落盘；关闭 fd。
+  3. `rename({base}.fpbin_000XXX → {base}_00000N.pbin)`。
+  4. **校验**：以 `O_RDONLY` 重新打开所有转正后的 `pbin`，`seek(EOF - 24)` 读取并校验 `magic + crc`。
+  5. **回收**：全部校验通过后，删除 `{base}.fpbin.idx`（以及可能的残留 fpbin 临时文件）。
+
+**后续阶段**：
+- 新发现直接写入新的 `pbin` 活跃分片（延续原有 `{base}.idx` 逻辑）。
+- `fpbin` 机制关闭，直到下一次 `--continue` 恢复时按需重新创建。
+
+#### 崩溃恢复策略
+
+```
+restore_progress()
+    ├── 扫描目录，识别所有 *.pbin 与 *.fpbin_*
+    ├── 对每个已完成的历史 pbin 分片：
+    │      seek(EOF - sizeof(Footer))
+    │      读取 Footer → 校验 magic + crc
+    │      ├─ 通过 → row_count = footer.row_count，加载到 visited_set
+    │      └─ 失败 → row_count = 残留 idx（如果有），加载到 visited_set
+    ├── 识别当前活跃分片（匹配 {base}.idx 中的 write_slice_index）
+    │      行数以 {base}.idx 为准（活跃分片无有效 Footer）
+    └── 如果存在残留 fpbin 分片且 fpbin.idx 有效：
+           视为上次转正中断，重新执行封口 + rename + 校验
+```
+
+**自动清理**：恢复时若发现某个 `pbin` 的 `Footer` 有效但旁边残留了同名 `.idx`，直接 `unlink` 该残留 idx（**钢印清晰则烧草稿**）。
+
+#### 归档增强
+
+- 压缩 `pbin` 分片前，先 `seek` 读 `Footer` 获取 `row_count`，写入 `ArchiveBlockHeader` 作为元数据。
+- 解压后得到临时文件，再次读取 `Footer` 校验，双重确认。
+- 彻底删除代码中所有 `slice_index * BATCH_SIZE` 或 `slice_index * SLICE_ROWS` 的推断逻辑。每个分片的行数必须来自其自身的 `Footer` 或 `idx`，绝不假设固定。
+
+#### 修改的文件
+
+- `include/archive_format.h`
+  - 新增 `PbinFooter`（packed，24 字节）：`magic` + `row_count` + `data_crc32` + `footer_crc32`
+  - `ArchiveBlockHeader` 增加 `uint64_t row_count` 字段，用于归档块元数据
+
+- `include/config.h`
+  - 新增 `PBIN_FOOTER_MAGIC` 和 `PBIN_FOOTER_SIZE` 常量
+
+- `include/app_context.h`
+  - `int fpbin_fd` 改为 `FILE *fpbin_slice_file`
+  - 新增 `fpbin_write_slice_index`、`fpbin_line_count`
+
+- `include/progress.h`
+  - 新增 Footer 读写校验函数：`write_pbin_footer()`、`read_pbin_footer()`、`verify_pbin_footer()`、`get_slice_row_count()`
+  - 新增 fpbin 文件名辅助：`get_fpbin_slice_filename()`、`get_fpbin_index_filename()`
+  - 新增按分片 idx 文件名辅助：`get_per_slice_index_filename()`
+  - 显式包含 `archive_format.h`
+
+- `src/progress.c`
+  - **pbin 封口**：`record_path()` rotate 时先写 Footer，再删按分片 idx；`finalize_archive()` 正常退出时也给最后活跃分片盖 Footer
+  - **按分片草稿 idx**：`atomic_update_index()` 同步更新统一 idx 与 `{base}_00000N.idx`；rotate 后旧分片 idx 被删除
+  - **fpbin 多分片**：`fpbin_append()` 支持基于 `{base}.fpbin_000XXX` 的多分片写入；`fpbin_rotate_slice()` 在分片满时封口写 Footer
+  - **转正流程重写**：`promote_fpbin_to_pbin()` 实现"封口 → rename → 校验 → 清理"完整两阶段提交；`find_max_pbin_index()` 防止覆盖已转正分片
+  - **恢复逻辑重写**：`restore_progress()` 引入 Footer-first 扫描；支持残留 fpbin 自动重新转正；已完成分片优先读 Footer，无效时 fallback 到按分片 idx，再失败则全量解析兜底
+  - **归档增强**：`archive_slice_to_file()` 分离数据区与 Footer，只压缩数据区；将 `row_count` 写入 `ArchiveBlockHeader`
+  - **解析增强**：`parse_pbin_buffer()` 新增 `max_rows` 参数，精确控制解析行数；`iterate_pbin_slices()` 自动跳过 Footer 区域
+  - **sanity check**：`iterate_archive()` 与 `count_archive_blocks()` 增加 `block_type` 与大小上限校验，防止旧格式或损坏 archive 导致崩溃
+  - **清理增强**：`cleanup_progress()` 覆盖 fpbin 文件与按分片 idx；兼容删除旧版本 `"progress.fpbin"`
+
+- `src/main.c`
+  - `app_context_init()` / `app_context_destroy()` 适配新的 `fpbin_slice_file` 字段
+
+---
+
 ## [12.1.1] - 2026-05-06
 
 ### 高优先级问题修复 (High-Priority Bug Fixes)
@@ -191,4 +307,3 @@
 - 基础设备黑名单（`DeviceManager`）。
 - CSV / 自定义格式输出。
 - zlib 进度归档（`-Z` / `--archive`）。
-

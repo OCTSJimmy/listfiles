@@ -19,7 +19,6 @@ static void app_context_init(AppContext *ctx) {
     memset(ctx, 0, sizeof(AppContext));
     ctx->epfd = -1;
     ctx->running = false;
-    ctx->fpbin_fd = -1;
     ctx->hist_pump_state = HIST_PUMP_DONE;
     ctx->next_requeue_worker = 0;
     atomic_init(&ctx->pending_tasks, 0);
@@ -61,9 +60,9 @@ static void app_context_destroy(AppContext *ctx) {
         free(ctx->spbin_entries);
         ctx->spbin_entries = NULL;
     }
-    if (ctx->fpbin_fd >= 0) {
-        close(ctx->fpbin_fd);
-        ctx->fpbin_fd = -1;
+    if (ctx->fpbin_slice_file) {
+        fclose(ctx->fpbin_slice_file);
+        ctx->fpbin_slice_file = NULL;
     }
     if (ctx->fpbin_entries) {
         for (size_t i = 0; i < ctx->fpbin_count; i++) {

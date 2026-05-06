@@ -58,7 +58,9 @@ typedef struct {
     unsigned long   hist_pump_line_no;      /* 当前分片内的行号（用于跳过已处理行） */
     
     /* === fpbin 临时缓存（恢复流程专用） === */
-    int             fpbin_fd;           /* fpbin 溢出磁盘文件描述符（-1 = 未打开） */
+    FILE           *fpbin_slice_file;   /* 当前活跃 fpbin 分片文件指针 */
+    unsigned long   fpbin_write_slice_index; /* 当前 fpbin 分片号 */
+    unsigned long   fpbin_line_count;   /* 当前 fpbin 分片行数 */
     char          **fpbin_entries;      /* 内存中的 fpbin 路径数组 */
     struct stat    *fpbin_stats;        /* 对应的 stat 数组 */
     size_t          fpbin_count;        /* 当前内存中的条目数 */

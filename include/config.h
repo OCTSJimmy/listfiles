@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "12.1.0" // 版本号升级
+#define VERSION "12.2.0" // 版本号升级
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
@@ -53,6 +53,10 @@ struct DeviceManager;
 
 #define DEFAULT_BATCH_SIZE 1024
 #define DEFAULT_ESTIMATED_FILES 10000000
+
+/* Pbin / fpbin Footer 常量 */
+#define PBIN_FOOTER_MAGIC   0xDEADBEEF66AAC0FFULL
+#define PBIN_FOOTER_SIZE    24  /* sizeof(PbinFooter) */
 
 #define min_size(a, b) ((a) < (b) ? (a) : (b))
 #define max_size(a, b) ((a) > (b) ? (a) : (b))
