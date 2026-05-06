@@ -20,6 +20,8 @@ void finalize_archive(const Config *cfg, RuntimeState *state);
 /* 恢复 */
 int restore_progress(const Config *cfg, AppContext *ctx);
 void restore_progress_to_memory(const Config *cfg, AppContext *ctx);
+void pump_pbin_batch(AppContext *ctx, int batch_size);
+void fpbin_append(AppContext *ctx, const char *path, const struct stat *st);
 
 /* 配置与生命周期 */
 void save_config_to_disk(const Config* cfg);

@@ -1,6 +1,7 @@
 #ifndef PROBE_SCHEDULER_H
 #define PROBE_SCHEDULER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
 #include <sys/types.h>

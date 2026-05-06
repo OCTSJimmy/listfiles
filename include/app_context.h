@@ -11,6 +11,13 @@
 #include "output.h"
 #include "spbin.h"
 
+/* 恢复流程中的历史目录泵送状态 */
+typedef enum {
+    HIST_PUMP_DONE,      /* 正常扫描，不需要 pump */
+    HIST_PUMP_OLD,       /* 正在消费原始 pbin，新子目录 → fpbin */
+    HIST_PUMP_NEW        /* 正在消费 fpbin 转正后的新 pbin，新子目录直接入队 */
+} HistPumpState;
+
 typedef struct {
     /* === 配置与运行时状态 === */
     Config        cfg;
@@ -34,6 +41,7 @@ typedef struct {
     /* === 事件循环 === */
     int             epfd;
     bool            running;
+    int             next_requeue_worker;
     
     /* === 任务计数 === */
     _Atomic long    pending_tasks;
@@ -42,6 +50,19 @@ typedef struct {
     /* === 输出线程 === */
     AsyncWorker    *async_writer;
     pthread_t       writer_tid;
+    
+    /* === 历史目录泵送状态（恢复流程专用） === */
+    HistPumpState   hist_pump_state;
+    FILE           *hist_pump_fp;           /* 当前正在消费的 pbin 文件 */
+    unsigned long   hist_pump_slice_idx;    /* 当前消费的分片编号 */
+    unsigned long   hist_pump_line_no;      /* 当前分片内的行号（用于跳过已处理行） */
+    
+    /* === fpbin 临时缓存（恢复流程专用） === */
+    int             fpbin_fd;           /* fpbin 溢出磁盘文件描述符（-1 = 未打开） */
+    char          **fpbin_entries;      /* 内存中的 fpbin 路径数组 */
+    struct stat    *fpbin_stats;        /* 对应的 stat 数组 */
+    size_t          fpbin_count;        /* 当前内存中的条目数 */
+    size_t          fpbin_capacity;     /* 内存数组容量 */
     
 } AppContext;
 

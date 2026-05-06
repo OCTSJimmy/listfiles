@@ -111,7 +111,7 @@ static bool try_blind_trust(const char *full_path, uint64_t dir_dev, uint64_t d_
 }
 
 static void send_batch(int fd_out, char **paths, struct stat *stats, int count) {
-    if (count <= 0) return;
+    /* Always send a batch (even count==0) so Master can decrement pending_tasks */
 
     /* Calculate total payload size */
     size_t total = sizeof(IpcBatchHeader);
@@ -119,6 +119,11 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
         total += sizeof(uint32_t);
         total += strlen(paths[i]);
         total += sizeof(struct stat);
+    }
+
+    if (total > UINT32_MAX) {
+        fprintf(stderr, "[Worker] Batch payload too large (%zu), aborting.\n", total);
+        return;
     }
 
     uint8_t *buf = malloc(total);
@@ -139,19 +144,28 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
     free(buf);
 }
 
-static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
-    struct stat dir_st;
-    if (lstat(dir_path, &dir_st) != 0) {
-        IpcErrorHeader eh = { (uint32_t)errno, 0 };
-        uint32_t plen = (uint32_t)strlen(dir_path);
+/* Helper: send ERROR for device-level failures, then an empty batch */
+static void send_error_and_empty_batch(int fd_out, int err_code, const char *path) {
+    if (err_code == ETIMEDOUT || err_code == EIO) {
+        IpcErrorHeader eh = { (uint32_t)err_code, 0 };
+        uint32_t plen = (uint32_t)strlen(path);
         uint8_t *buf = malloc(sizeof(eh) + sizeof(plen) + plen);
         if (buf) {
             memcpy(buf, &eh, sizeof(eh));
             memcpy(buf + sizeof(eh), &plen, sizeof(plen));
-            memcpy(buf + sizeof(eh) + sizeof(plen), dir_path, plen);
+            memcpy(buf + sizeof(eh) + sizeof(plen), path, plen);
             ipc_send(fd_out, IPC_MSG_ERROR, buf, (uint32_t)(sizeof(eh) + sizeof(plen) + plen));
             free(buf);
         }
+    }
+    send_batch(fd_out, NULL, NULL, 0);
+}
+
+static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
+    (void)worker_id;
+    struct stat dir_st;
+    if (lstat(dir_path, &dir_st) != 0) {
+        send_error_and_empty_batch(fd_out, errno, dir_path);
         return;
     }
 
@@ -165,7 +179,10 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
     int count = 0;
 
     DIR *dir = opendir(dir_path);
-    if (!dir) goto cleanup;
+    if (!dir) {
+        send_error_and_empty_batch(fd_out, errno, dir_path);
+        goto cleanup;
+    }
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
@@ -204,6 +221,9 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
     if (count > 0) {
         send_batch(fd_out, paths, stats, count);
         for (int i = 0; i < count; i++) free(paths[i]);
+    } else {
+        /* Empty directory: send empty batch so Master decrements pending_tasks */
+        send_batch(fd_out, NULL, NULL, 0);
     }
 
     closedir(dir);

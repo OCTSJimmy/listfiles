@@ -268,8 +268,25 @@ void precompile_format(Config *cfg) {
         // [默认 CSV 格式] Inode,Path,Size,User,Group,UID,GID,ModeStr,OctMode,Type,Mtime,Ctime
         fmt = "%i,%p,%s,%u,%g,%U,%G,%o,%O,%t,%m,%c";
     } else if (!fmt) {
-        // [默认文本格式]
-        fmt = "%p|%s|%m";
+        // [默认文本格式] 根据元数据开关动态构建
+        static char default_fmt[256];
+        int pos = 0;
+        pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "%%p");
+        if (cfg->size)   pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "|%%s");
+        if (cfg->user)   pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "|%%u");
+        if (cfg->group)  pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "|%%g");
+        if (cfg->mtime)  pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "|%%m");
+        if (cfg->atime)  pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "|%%a");
+        if (cfg->ctime)  pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "|%%c");
+        if (cfg->mode)   pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "|%%o");
+        if (cfg->inode)  pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "|%%i");
+        if (cfg->xattr)  pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "|%%X");
+        // 如果没有启用任何元数据开关，默认输出 path|size|mtime
+        if (!cfg->size && !cfg->user && !cfg->group && !cfg->mtime && !cfg->atime && !cfg->ctime && !cfg->mode && !cfg->inode && !cfg->xattr) {
+            pos = 0;
+            pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "%%p|%%s|%%m");
+        }
+        fmt = default_fmt;
     }
 
     int count = 0;

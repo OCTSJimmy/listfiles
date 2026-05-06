@@ -19,6 +19,9 @@ static void app_context_init(AppContext *ctx) {
     memset(ctx, 0, sizeof(AppContext));
     ctx->epfd = -1;
     ctx->running = false;
+    ctx->fpbin_fd = -1;
+    ctx->hist_pump_state = HIST_PUMP_DONE;
+    ctx->next_requeue_worker = 0;
     atomic_init(&ctx->pending_tasks, 0);
 }
 
@@ -57,6 +60,21 @@ static void app_context_destroy(AppContext *ctx) {
         }
         free(ctx->spbin_entries);
         ctx->spbin_entries = NULL;
+    }
+    if (ctx->fpbin_fd >= 0) {
+        close(ctx->fpbin_fd);
+        ctx->fpbin_fd = -1;
+    }
+    if (ctx->fpbin_entries) {
+        for (size_t i = 0; i < ctx->fpbin_count; i++) {
+            free(ctx->fpbin_entries[i]);
+        }
+        free(ctx->fpbin_entries);
+        ctx->fpbin_entries = NULL;
+    }
+    if (ctx->fpbin_stats) {
+        free(ctx->fpbin_stats);
+        ctx->fpbin_stats = NULL;
     }
 }
 
@@ -145,11 +163,12 @@ int main(int argc, char *argv[]) {
     setup_signal_handlers();
 
     bool has_history = false;
-    if (ctx.cfg.runone) {
+    if (ctx.cfg.runone || ctx.cfg.clean) {
         RuntimeState temp = {0};
         cleanup_progress(&ctx.cfg, &temp);
         ctx.cfg.continue_mode = false;
-    } else {
+    }
+    if (!ctx.cfg.runone) {
         load_session_config(&ctx.cfg, &has_history);
     }
     interactive_confirm(&ctx.cfg, has_history);
@@ -189,11 +208,11 @@ int main(int argc, char *argv[]) {
             fclose(fp);
         }
         if (is_success) {
-            printf("[System] 检测到上次任务已完成，加载历史索引进行半增量扫描...\n");
+            fprintf(stderr, "[System] 检测到上次任务已完成，加载历史索引进行半增量扫描...\n");
             ctx.reference_set = fp_set_create(ctx.cfg.estimated_files);
             ctx.reference_map = ref_map_create(ctx.cfg.estimated_files);
             restore_progress_to_memory(&ctx.cfg, &ctx);
-            printf("[System] 历史索引加载完成\n");
+            fprintf(stderr, "[System] 历史索引加载完成\n");
         }
     }
 
@@ -242,10 +261,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("[System] 任务开始...\n");
+    fprintf(stderr, "[System] 任务开始...\n");
     main_loop_run(&ctx);
 
-    printf("[System] 任务完成。耗时: %ld 秒\n", time(NULL) - ctx.state.start_time);
+    fprintf(stderr, "[System] 任务完成。耗时: %ld 秒\n", time(NULL) - ctx.state.start_time);
 
     finalize_progress(&ctx.cfg, &ctx.state);
     app_context_destroy(&ctx);

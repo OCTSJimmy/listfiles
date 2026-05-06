@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <dirent.h>
 
 /* ================================================================
  * Batch payload parser
@@ -160,19 +161,25 @@ void main_loop_run(AppContext *ctx) {
         monitor_dispatch_probes(ctx);
         monitor_reap_probes(ctx);
 
+        /* Pump historical pbin directories during recovery */
+        if (ctx->hist_pump_state == HIST_PUMP_OLD || ctx->hist_pump_state == HIST_PUMP_NEW) {
+            pump_pbin_batch(ctx, ctx->cfg.batch_size);
+        }
+
         /* Replace dead workers */
         for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
-            if (!ctx->worker_pool->slots[i].is_alive && ctx->worker_pool->slots[i].pid != 0) {
-                /* epoll_ctl DEL before close (fd must be valid for DEL) */
-                epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->worker_pool->slots[i].fd_out, NULL);
-                close(ctx->worker_pool->slots[i].fd_in);
-                close(ctx->worker_pool->slots[i].fd_out);
+            WorkerSlot *slot = &ctx->worker_pool->slots[i];
+            if (!slot->is_alive && slot->pid == -1) {
+                /* pid == -1 means killed by monitor but not yet reaped/replaced */
+                epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, slot->fd_out, NULL);
+                close(slot->fd_in);
+                close(slot->fd_out);
                 worker_pool_replace(ctx->worker_pool, i);
                 /* Re-add new fd_out to epoll */
                 memset(&ev, 0, sizeof(ev));
                 ev.events = EPOLLIN;
                 ev.data.u32 = (uint32_t)i;
-                epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, ctx->worker_pool->slots[i].fd_out, &ev);
+                epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, slot->fd_out, &ev);
             }
         }
 
@@ -223,10 +230,15 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
         }
 
         if (S_ISDIR(st->st_mode)) {
-            /* Dispatch sub-directory to a worker */
-            atomic_fetch_add(&ctx->pending_tasks, 1);
-            uint32_t plen = (uint32_t)strlen(path);
-            ipc_send(ctx->worker_pool->slots[worker_id].fd_in, IPC_MSG_SCAN, path, plen);
+            if (ctx->hist_pump_state == HIST_PUMP_OLD) {
+                /* Recovery pumping old pbin: new sub-dirs go to fpbin Cache */
+                fpbin_append(ctx, path, st);
+            } else {
+                /* Normal dispatch */
+                atomic_fetch_add(&ctx->pending_tasks, 1);
+                uint32_t plen = (uint32_t)strlen(path);
+                ipc_send(ctx->worker_pool->slots[worker_id].fd_in, IPC_MSG_SCAN, path, plen);
+            }
 
             ctx->state.dir_count++;
             if (ctx->cfg.include_dir) {
@@ -235,7 +247,8 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
             if (ctx->cfg.print_dir && ctx->state.dir_info_fp) {
                 fprintf(ctx->state.dir_info_fp, "%s%s\n", OUTPUT_DIR_PREFIX, path);
             }
-            if (ctx->cfg.continue_mode) {
+            if (ctx->cfg.continue_mode && ctx->hist_pump_state != HIST_PUMP_OLD) {
+                /* In HIST_PUMP_OLD, dirs go to fpbin; don't record to pbin yet */
                 record_path(&ctx->cfg, &ctx->state, path, st);
             }
         } else {
@@ -320,6 +333,7 @@ void monitor_check_timeouts(AppContext *ctx) {
             int status;
             waitpid(slot->pid, &status, WNOHANG);
             slot->is_alive = false;
+            slot->pid = -1; /* mark as needs replacement */
             ctx->worker_pool->active_count--;
         }
     }

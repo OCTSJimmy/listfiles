@@ -1,4 +1,5 @@
 #include "probe_scheduler.h"
+#include "spbin.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

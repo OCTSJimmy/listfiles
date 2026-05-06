@@ -23,7 +23,7 @@ void show_help() {
     printf("  -y, --yes              跳过启动时的交互式确认\n");
     printf("      --skip-interval=秒 设置半增量扫描的时间阈值 (默认: 0)\n");
     printf("      --batch-size=数量  Worker batch 大小 (默认: %d)\n", DEFAULT_BATCH_SIZE);
-    printf("      --estimated-files=数量 预估文件数,用于预分配内存 (默认: %lu)\n", DEFAULT_ESTIMATED_FILES);
+    printf("      --estimated-files=数量 预估文件数,用于预分配内存 (默认: %u)\n", (unsigned)DEFAULT_ESTIMATED_FILES);
     printf("  -t, --timeout=秒       心跳超时时间 (默认: %d)\n", HEARTBEAT_TIMEOUT_SEC);
     printf("\n输出控制:\n");
     printf("  -f, --progress-file=文件 进度文件/历史记录前缀 (默认: progress)\n");
@@ -41,7 +41,7 @@ void show_help() {
     printf("\n高级/维护:\n");
     printf("  -Z, --archive          压缩已处理的进度分片\n");
     printf("  -C, --clean            删除已处理的进度分片\n");
-    printf("  -R, --resume-from=文件 仅从指定的进度列表文件恢复\n");
+    printf("  -R, --resume-from=文件 仅从指定的进度列表文件恢复 (预留，暂未实现)\n");
     printf("  --max-slice=行数       每个输出切片的最大行数\n");
     printf("  -v, --verbose          启用详细日志\n");
     printf("  -h, --help             显示此帮助信息\n");
@@ -205,8 +205,12 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
     }
 
     struct stat path_stat;
-    if (stat(cfg->target_path, &path_stat) != 0 || !S_ISDIR(path_stat.st_mode)) {
-        fprintf(stderr, "错误: 无效的目标路径: %s\n", cfg->target_path);
+    if (stat(cfg->target_path, &path_stat) != 0) {
+        fprintf(stderr, "错误: 无法访问目标路径: %s\n", cfg->target_path);
+        return -1;
+    }
+    if (!S_ISDIR(path_stat.st_mode) && !S_ISREG(path_stat.st_mode) && !(S_ISLNK(path_stat.st_mode) && cfg->follow_symlinks)) {
+        fprintf(stderr, "错误: 无效的目标路径: %s (必须是目录、普通文件或符号链接)\n", cfg->target_path);
         return -1;
     }
 
@@ -222,7 +226,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
 
     if (cfg->format) {
         verbose_printf(cfg, 1, "预编译输出格式: %s\n", cfg->format);
-        precompile_format(cfg);
     }
+    precompile_format(cfg);
     return 0;
 }

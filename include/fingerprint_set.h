@@ -1,6 +1,7 @@
 #ifndef FINGERPRINT_SET_H
 #define FINGERPRINT_SET_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
