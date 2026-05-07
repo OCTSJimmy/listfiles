@@ -18,6 +18,11 @@ typedef struct {
     bool     is_alive;
     uint64_t current_dev;
     char     current_path[4096];
+    
+    /* Backlog for non-blocking fd_in (bidirectional pipe deadlock prevention) */
+    char   **backlog_paths;
+    int      backlog_count;
+    int      backlog_capacity;
 } WorkerSlot;
 
 typedef struct {

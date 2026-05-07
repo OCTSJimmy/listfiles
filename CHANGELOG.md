@@ -6,6 +6,29 @@
 
 ## [Unreleased]
 
+### 紧急修复：双向管道死锁（P0 阻断性）
+
+**问题背景**：Master 与 Worker 通过 `pipe2(O_CLOEXEC)` 双向通信。`ipc_send()` 使用阻塞 `write()`，当 Worker 的 `fd_in` 管道缓冲区（默认 64KB）被 >580 个 SCAN 任务填满时，Master 阻塞在 `write(fd_in)`。与此同时，Worker 可能正在发送大 BATCH 并阻塞在 `write(fd_out)`。双方互相等待，形成**永久死锁**。
+
+#### 修复
+
+- **管道扩容**：`worker_pool_spawn()` 中通过 `fcntl(F_SETPIPE_SZ, 1048576)` 将 `fd_in[1]` 管道容量从 64KB 提升到 1MB，触发死锁的阈值从 ~580 提升到 ~10,000 个 SCAN 任务。
+- **非阻塞写**：对 `fd_in[1]` 设置 `O_NONBLOCK`，`ipc_send()` 在管道满时返回 `-2`（`EAGAIN`），而非永久阻塞。
+- **Worker 积压队列（Backlog）**：
+  - `WorkerSlot` 新增 `backlog_paths[]`、`backlog_count`、`backlog_capacity` 字段。
+  - `process_completed_batch()` 中 `ipc_send()` 返回 `-2` 时，将任务 `strdup()` 存入对应 Worker 的 backlog（动态扩容，初始 64，倍增）。
+  - 新增 `flush_worker_backlogs()`：主循环每轮 `epoll_wait` 后遍历所有 Worker，尽可能刷出积压任务；仍满时保留至下一轮重试。
+  - 积压满时输出 Warning，递减 `pending_tasks`，丢弃任务（1MB 管道下极罕见）。
+- **终止条件前刷 backlog**：`main_loop_run()` 在判定 `pending_tasks == 0 && pending_batches == 0` 之前，先调用 `flush_worker_backlogs()`，确保所有积压任务发送完毕后才停止 Worker。
+
+#### 修改的文件
+
+- `src/worker_proc.c`
+- `include/worker_proc.h`
+- `src/main_loop.c`
+
+---
+
 ### 架构修复：Monitor 模块从线程模型恢复并适配进程模型
 
 **问题背景**：12.0.0 从线程模型重构为进程模型时，`src/monitor.c` 被整体移入 `.bak`，监控功能被临时内联到 `main_loop.c` 中。这导致：

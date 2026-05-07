@@ -26,19 +26,28 @@ void worker_set_context(const Config *cfg, const FingerprintSet *ref_set, const 
 /* ================================================================
  * IPC helpers
  * ================================================================ */
+/* ipc_send: returns 0 on success, -1 on fatal error, -2 on EAGAIN (non-blocking only) */
 int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_len) {
     IpcMessageHeader hdr = { msg_type, payload_len };
     size_t written = 0;
     while (written < sizeof(hdr)) {
         ssize_t n = write(fd, (const char*)&hdr + written, sizeof(hdr) - written);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+            return -1;
+        }
         written += n;
     }
     if (payload_len > 0 && payload) {
         written = 0;
         while (written < payload_len) {
             ssize_t n = write(fd, (const char*)payload + written, payload_len - written);
-            if (n < 0) { if (errno == EINTR) continue; return -1; }
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+                return -1;
+            }
             written += n;
         }
     }
@@ -144,7 +153,11 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
         memcpy(p, &stats[i], sizeof(struct stat)); p += sizeof(struct stat);
     }
 
-    ipc_send(fd_out, IPC_MSG_BATCH, buf, (uint32_t)total);
+    /* Worker side: retry on EAGAIN until success (pipe buffer should be large enough) */
+    int rc;
+    while ((rc = ipc_send(fd_out, IPC_MSG_BATCH, buf, (uint32_t)total)) == -2) {
+        usleep(1000); /* 1ms */
+    }
     free(buf);
 }
 
@@ -302,11 +315,17 @@ WorkerPool* worker_pool_create(int num_workers) {
 void worker_pool_destroy(WorkerPool *pool) {
     if (!pool) return;
     for (int i = 0; i < pool->num_workers; i++) {
-        if (pool->slots[i].is_alive) {
-            kill(pool->slots[i].pid, SIGKILL);
-            close(pool->slots[i].fd_in);
-            close(pool->slots[i].fd_out);
+        WorkerSlot *slot = &pool->slots[i];
+        if (slot->is_alive) {
+            kill(slot->pid, SIGKILL);
+            close(slot->fd_in);
+            close(slot->fd_out);
         }
+        /* Free backlog paths */
+        for (int j = 0; j < slot->backlog_count; j++) {
+            free(slot->backlog_paths[j]);
+        }
+        free(slot->backlog_paths);
     }
     /* Non-blocking reap of any zombie children */
     for (int i = 0; i < pool->num_workers * 3; i++) {
@@ -316,6 +335,15 @@ void worker_pool_destroy(WorkerPool *pool) {
     free(pool);
 }
 
+/* Enlarge pipe buffer to mitigate deadlock; Linux caps at pipe-max-size (usually 1MB) */
+static void enlarge_pipe(int fd) {
+    int desired = 1024 * 1024; /* 1MB */
+    int current = fcntl(fd, F_GETPIPE_SZ);
+    if (current < desired) {
+        fcntl(fd, F_SETPIPE_SZ, desired);
+    }
+}
+
 bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     int in_pipe[2], out_pipe[2];
     if (pipe2(in_pipe, O_CLOEXEC) != 0) return false;
@@ -323,6 +351,10 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
         close(in_pipe[0]); close(in_pipe[1]);
         return false;
     }
+
+    /* Enlarge pipe buffers to reduce deadlock probability */
+    enlarge_pipe(in_pipe[0]); enlarge_pipe(in_pipe[1]);
+    enlarge_pipe(out_pipe[0]); enlarge_pipe(out_pipe[1]);
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -353,6 +385,10 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     close(in_pipe[0]);
     close(out_pipe[1]);
 
+    /* Master write end must be non-blocking to prevent bidirectional pipe deadlock */
+    int flags = fcntl(in_pipe[1], F_GETFL);
+    fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
+
     WorkerSlot *slot = &pool->slots[slot_id];
     slot->pid = pid;
     slot->fd_in = in_pipe[1];
@@ -361,6 +397,9 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     slot->last_heartbeat = time(NULL);
     slot->current_dev = 0;
     slot->current_path[0] = '\0';
+    slot->backlog_paths = NULL;
+    slot->backlog_count = 0;
+    slot->backlog_capacity = 0;
     pool->active_count++;
     return true;
 }
@@ -382,7 +421,8 @@ bool worker_pool_replace(WorkerPool *pool, int slot_id) {
 void worker_pool_stop_all(WorkerPool *pool) {
     for (int i = 0; i < pool->num_workers; i++) {
         if (pool->slots[i].is_alive) {
-            ipc_send(pool->slots[i].fd_in, IPC_MSG_STOP, NULL, 0);
+            int rc = ipc_send(pool->slots[i].fd_in, IPC_MSG_STOP, NULL, 0);
+            (void)rc; /* STOP is best-effort; fd_in may be non-blocking */
         }
     }
 }

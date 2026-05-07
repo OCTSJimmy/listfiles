@@ -118,7 +118,26 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
             } else {
                 atomic_fetch_add(&ctx->pending_tasks, 1);
                 uint32_t plen = (uint32_t)strlen(path);
-                ipc_send(ctx->worker_pool->slots[batch->worker_id].fd_in, IPC_MSG_SCAN, path, plen);
+                int rc = ipc_send(ctx->worker_pool->slots[batch->worker_id].fd_in, IPC_MSG_SCAN, path, plen);
+                if (rc == -2) {
+                    /* fd_in is full (EAGAIN); enqueue to backlog to avoid deadlock */
+                    WorkerSlot *slot = &ctx->worker_pool->slots[batch->worker_id];
+                    if (slot->backlog_count >= slot->backlog_capacity) {
+                        int new_cap = slot->backlog_capacity ? slot->backlog_capacity * 2 : 64;
+                        char **new_arr = realloc(slot->backlog_paths, new_cap * sizeof(char *));
+                        if (new_arr) {
+                            slot->backlog_paths = new_arr;
+                            slot->backlog_capacity = new_cap;
+                        }
+                    }
+                    if (slot->backlog_count < slot->backlog_capacity) {
+                        slot->backlog_paths[slot->backlog_count++] = strdup(path);
+                    } else {
+                        /* Backlog full: drop task (rare with 1MB pipe buffer) */
+                        atomic_fetch_sub(&ctx->pending_tasks, 1);
+                        fprintf(stderr, "[Warning] Worker %d backlog full, dropping task %s\n", batch->worker_id, path);
+                    }
+                }
             }
             
             ctx->state.dir_count++;
@@ -179,6 +198,36 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
     free(batch->stats);
     free(batch->results);
     free(batch);
+}
+
+/* Flush pending backlog paths to workers (non-blocking write retry) */
+static void flush_worker_backlogs(AppContext *ctx) {
+    for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
+        WorkerSlot *slot = &ctx->worker_pool->slots[i];
+        if (!slot->is_alive || slot->backlog_count == 0) continue;
+        
+        int sent = 0;
+        for (int j = 0; j < slot->backlog_count; j++) {
+            char *path = slot->backlog_paths[j];
+            uint32_t plen = (uint32_t)strlen(path);
+            int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
+            if (rc == -2) break; /* Still full, stop and retry next cycle */
+            free(path);
+            slot->backlog_paths[j] = NULL;
+            sent++;
+        }
+        
+        /* Compact array: move remaining items to front */
+        if (sent > 0) {
+            int new_count = 0;
+            for (int j = 0; j < slot->backlog_count; j++) {
+                if (slot->backlog_paths[j]) {
+                    slot->backlog_paths[new_count++] = slot->backlog_paths[j];
+                }
+            }
+            slot->backlog_count = new_count;
+        }
+    }
 }
 
 static void drain_completed_batches(AppContext *ctx) {
@@ -330,6 +379,9 @@ void main_loop_run(AppContext *ctx) {
                 epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, slot->fd_out, &ev);
             }
         }
+
+        /* Flush any backlogged tasks to workers (deadlock prevention) */
+        flush_worker_backlogs(ctx);
 
         /* Termination condition */
         if (atomic_load(&ctx->pending_tasks) == 0 && !ctx->resume_active

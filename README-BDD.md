@@ -411,6 +411,22 @@ Feature: Master-Worker 进程模型
     And 主循环读取 batch payload
     And 解析出 paths 和 stats 数组
 
+  Scenario: Master 非阻塞发送与积压队列
+    Given Master 正在向 Worker 发送 IPC_MSG_SCAN 任务
+    And fd_in 管道已达到容量上限（1MB，约 10,000 个任务）
+    When ipc_send() 返回 EAGAIN（-2）
+    Then 应该将该任务追加到对应 WorkerSlot 的 backlog_paths 数组
+    And backlog 数组支持动态扩容（初始 64，倍增）
+    And pending_tasks 计数保持不变（任务仍视为已分配）
+
+  Scenario: 积压队列刷出
+    Given 某个 WorkerSlot 存在积压任务
+    When 主循环在 epoll_wait 后调用 flush_worker_backlogs()
+    Then 应该遍历该 Worker 的 backlog_paths
+    And 对每条路径重试 ipc_send()
+    And 发送成功则 free(path) 并从 backlog 移除
+    And 仍返回 EAGAIN 则保留至下一轮重试
+
   Scenario: Worker 正常退出
     Given Worker 收到 IPC_MSG_STOP
     When Worker 发送 IPC_MSG_EXIT 后调用 _exit(0)

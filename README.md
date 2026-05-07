@@ -151,6 +151,8 @@ fd_in  fd_out   pipe(TLV IPC)
 
 Master 进程通过 `epoll` 监听所有 Worker 的 `fd_out`，Worker 子进程阻塞读取 `fd_in` 上的扫描任务。Worker 完成目录遍历后，将结果批次（`IPC_MSG_BATCH`）写回 Master。
 
+Master 向 Worker 发送 `IPC_MSG_SCAN` 时采用**非阻塞写 + 积压队列**机制：`fd_in` 管道容量被提升至 1MB（默认 64KB），写满时 `ipc_send()` 返回 `EAGAIN`，任务被缓存到对应 Worker 的 `backlog_paths` 动态数组中，由主循环后续轮次重试刷出。这避免了 Master 在管道满时阻塞等待，彻底消除了双向管道死锁风险。
+
 Master 内部另设 **`ThreadPool`**（默认 4 线程），通过 `mutex + cond` 有界队列 + `eventfd` 通知，将 CPU 密集型的指纹计算与设备黑名单检查 offload 到工作线程，避免阻塞 `epoll` 主循环。队列满时自动降级为同步处理。
 
 `AsyncWorker` 输出线程采用批量提交（攒 256 条记录一次性入队），将锁竞争降至 1/256。
@@ -283,7 +285,7 @@ restore_progress()
 
 ## 版本
 
-当前版本：**12.2.1**
+当前版本：**12.2.2-dev**
 
 ## 许可证
 
