@@ -23,6 +23,7 @@ static void app_context_init(AppContext *ctx) {
     ctx->hist_pump_state = HIST_PUMP_DONE;
     ctx->next_requeue_worker = 0;
     atomic_init(&ctx->pending_tasks, 0);
+    atomic_init(&ctx->pending_batches, 0);
     record_path_batch_init(&ctx->record_batch);
 }
 
@@ -170,7 +171,14 @@ int main(int argc, char *argv[]) {
     app_context_init(&ctx);
 
     init_config(&ctx.cfg);
-    if (parse_arguments(argc, argv, &ctx.cfg) != 0) {
+    int parse_ret = parse_arguments(argc, argv, &ctx.cfg);
+    if (parse_ret == 2) {
+        /* --help or --version */
+        app_context_destroy(&ctx);
+        free(ctx.cfg.progress_base);
+        return 0;
+    }
+    if (parse_ret != 0) {
         return 1;
     }
     setup_signal_handlers();
@@ -274,12 +282,25 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    fprintf(stderr, "[System] 任务开始...\n");
+    if (!ctx.cfg.mute) {
+        fprintf(stderr, "[System] 任务开始...\n");
+    }
     main_loop_run(&ctx);
 
-    fprintf(stderr, "[System] 任务完成。耗时: %ld 秒\n", time(NULL) - ctx.state.start_time);
+    if (!ctx.cfg.mute) {
+        fprintf(stderr, "[System] 任务完成。耗时: %ld 秒\n", time(NULL) - ctx.state.start_time);
+    }
 
     finalize_progress(&ctx.cfg, &ctx.state);
     app_context_destroy(&ctx);
+
+    /* 释放命令行参数分配的字符串内存 */
+    free(ctx.cfg.target_path);
+    free(ctx.cfg.output_file);
+    free(ctx.cfg.output_split_dir);
+    free(ctx.cfg.progress_base);
+    free(ctx.cfg.format);
+    free(ctx.cfg.resume_file);
+
     return ctx.state.has_error ? 1 : 0;
 }

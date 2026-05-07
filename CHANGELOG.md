@@ -4,6 +4,66 @@
 
 ---
 
+## [12.2.1] - 2026-05-07
+
+### 紧急修复与稳定性增强
+
+本次更新修复了 12.2.0 中发现的 11 个缺陷，涵盖阻断性崩溃、命令行行为、输出控制和资源管理。
+
+#### 修复
+
+- **断点续传恢复崩溃（P0 阻断性）**：
+  - `restore_progress()` 在活跃分片已完全处理时（`line_count == row_count`），不再错误地将其标记为 `HIST_PUMP_OLD` 继续 pumping，避免 `read_next_pbin_record()` 读到 Footer magic（`0xDEADBEEF66AAC0FF`）作为 `path_len`。
+  - `read_next_pbin_record()` 增加 `path_len > MAX_PATH_LENGTH` 防御性校验，读取到异常长度时立即返回 `false`。
+  - `read_next_pbin_record()` 改用普通 `malloc` + 错误返回，替代 `safe_malloc`，防止不可信文件数据触发强制进程退出。
+
+- **`--help` / `--version` 返回码（P1）**：
+  - `parse_arguments()` 中 `-h` / `-V` 返回特殊码 `2`，`main()` 识别后直接返回 `0`，符合 POSIX 惯例。
+  - `default` 分支独立输出 `错误: 未知选项`，与 `--help` 分离处理。
+
+- **`--mute` 选项未实现（P1）**：
+  - `async_worker_thread()`：静默时跳过 `print_to_stream` 和切片计数。
+  - `process_completed_batch()`：静默时跳过 `--print-dir` 的目录日志输出。
+  - `main.c`：`[System] 任务开始/完成` 诊断信息受 `--mute` 控制。
+
+- **`--follow-symlinks` 未生效（P2）**：
+  - `worker_proc.c:scan_and_send()` 根据 `g_worker_cfg->follow_symlinks` 动态选择 `stat()`（跟踪）或 `lstat()`（不跟踪），此前硬编码为 `lstat()`。
+
+- **`--clean` 仍生成进度文件（P2）**：
+  - `record_path()` 入口增加 `if (cfg->clean) return;`，确保 `--clean` 模式下不创建任何 `.pbin` / `.idx` / `.config` 中间文件。
+
+- **命令行参数内存泄漏（P2）**：
+  - `init_config()` 中默认 `progress_base` 改为 `strdup("progress")`，确保所有参数字符串均为堆分配。
+  - `main()` 退出前统一 `free`：`target_path`, `output_file`, `output_split_dir`, `progress_base`, `format`, `resume_file`。
+
+- **`create_output_file` 追加模式导致重复输出（P3）**：
+  - `fopen(path, "a")` 改为 `fopen(path, "w")`，每次运行覆盖输出文件，避免历史残留数据混入。
+
+- **主循环终止条件不完善（P3）**：
+  - `AppContext` 新增 `_Atomic long pending_batches`，精确跟踪已提交到线程池但未完成的 batch 数量。
+  - 终止条件增加 `pending_batches == 0` 检查，确保线程池无残留任务后才优雅停止。
+  - 移除对未分配任务 Worker `is_alive` 状态的检查（此类 Worker 永远不会发送 EXIT，会导致 `all_idle` 恒为 false）。
+
+- **`precompile_format` 线程安全（P3）**：
+  - `static char default_fmt[256]` 改为普通栈局部变量，消除潜在的多线程静态状态风险。
+
+- **`send_batch` 内存分配失败静默丢弃（P3）**：
+  - `malloc(total)` 失败时发送空 batch（`count=0`），确保 Master 的 `pending_tasks` 计数能正确递减，避免扫描 hang 住。
+
+#### 修改的文件
+
+- `src/cmdline.c`
+- `src/main.c`
+- `src/main_loop.c`
+- `src/async_worker.c`
+- `src/worker_proc.c`
+- `src/progress.c`
+- `src/output.c`
+- `include/app_context.h`
+- `README.md`
+
+---
+
 ## [12.2.0] - 2026-05-07
 
 ### 重大设计升级：同构分片 + 页脚自描述 + 两阶段提交

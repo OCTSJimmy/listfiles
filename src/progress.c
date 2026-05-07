@@ -163,6 +163,7 @@ static void write_pbin_record(FILE *fp, const char *path, const struct stat *inf
 }
 
 void record_path(const Config *cfg, RuntimeState *state, const char *path, const struct stat *info) {
+    if (cfg->clean) return;  /* --clean 模式不保留任何进度文件 */
     if (!state->write_slice_file) {
         char *p = get_slice_filename(cfg->progress_base, state->write_slice_index);
         state->write_slice_file = fopen(p, "wb");
@@ -860,8 +861,13 @@ static bool read_next_pbin_record(FILE *fp, char **out_path, struct stat *out_st
     size_t path_len;
     if (fread(&path_len, sizeof(size_t), 1, fp) != 1) return false;
 
+    /* 防御性校验：防止读取到 Footer magic 或损坏数据 */
+    if (path_len > MAX_PATH_LENGTH) {
+        return false;
+    }
 
-    char *path = safe_malloc(path_len + 1);
+    char *path = malloc(path_len + 1);
+    if (!path) return false;
     if (fread(path, 1, path_len, fp) != path_len) { free(path); return false; }
     path[path_len] = '\0';
 
@@ -1081,9 +1087,19 @@ int restore_progress(const Config *cfg, AppContext *ctx) {
             if (!read_next_pbin_record(ctx->hist_pump_fp, &path, &st, &d_type)) break;
             free(path);
         }
-        ctx->hist_pump_state = HIST_PUMP_OLD;
-        ctx->hist_pump_slice_idx = ctx->state.write_slice_index;
-        ctx->hist_pump_line_no = ctx->state.line_count;
+
+        /* 如果已到达文件末尾，说明该分片已完全处理，无需 pumping */
+        int c = fgetc(ctx->hist_pump_fp);
+        if (c == EOF) {
+            fclose(ctx->hist_pump_fp);
+            ctx->hist_pump_fp = NULL;
+            ctx->hist_pump_state = HIST_PUMP_DONE;
+        } else {
+            ungetc(c, ctx->hist_pump_fp);
+            ctx->hist_pump_state = HIST_PUMP_OLD;
+            ctx->hist_pump_slice_idx = ctx->state.write_slice_index;
+            ctx->hist_pump_line_no = ctx->state.line_count;
+        }
     }
 
     verbose_printf(cfg, 1, "进度加载完成\n");

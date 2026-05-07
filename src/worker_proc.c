@@ -127,7 +127,11 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
     }
 
     uint8_t *buf = malloc(total);
-    if (!buf) return;
+    if (!buf) {
+        /* 内存不足时发送空 batch，确保 Master 能正确递减 pending_tasks */
+        send_batch(fd_out, NULL, NULL, 0);
+        return;
+    }
 
     uint8_t *p = buf;
     IpcBatchHeader bh = { (uint32_t)count };
@@ -201,7 +205,11 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
         if (try_blind_trust(full_path, dir_dev, entry->d_ino, entry->d_type, &st)) {
             got = true;
         } else {
-            if (lstat(full_path, &st) != 0) continue;
+            if (g_worker_cfg && g_worker_cfg->follow_symlinks) {
+                if (stat(full_path, &st) != 0) continue;
+            } else {
+                if (lstat(full_path, &st) != 0) continue;
+            }
             got = true;
         }
 

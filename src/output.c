@@ -269,7 +269,7 @@ void precompile_format(Config *cfg) {
         fmt = "%i,%p,%s,%u,%g,%U,%G,%o,%O,%t,%m,%c";
     } else if (!fmt) {
         // [默认文本格式] 根据元数据开关动态构建
-        static char default_fmt[256];
+        char default_fmt[256];
         int pos = 0;
         pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "%%p");
         if (cfg->size)   pos += snprintf(default_fmt + pos, sizeof(default_fmt) - pos, "|%%s");
@@ -352,7 +352,7 @@ void precompile_format(Config *cfg) {
 
 // 在创建新输出文件或切换切片时加锁
 FILE* create_output_file(const char *path) {
-    FILE *fp = fopen(path, "a");
+    FILE *fp = fopen(path, "w");
     if (!fp) {
         fprintf(stderr, "创建输出文件%s失败", path);
         return NULL;

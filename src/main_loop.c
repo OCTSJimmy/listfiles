@@ -134,7 +134,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                 out_batch.tail = task;
                 out_batch.count++;
             }
-            if (ctx->cfg.print_dir && ctx->state.dir_info_fp) {
+            if (ctx->cfg.print_dir && ctx->state.dir_info_fp && !ctx->cfg.mute) {
                 fprintf(ctx->state.dir_info_fp, "%s%s\n", OUTPUT_DIR_PREFIX, path);
             }
             if (ctx->cfg.continue_mode && ctx->hist_pump_state != HIST_PUMP_OLD) {
@@ -170,6 +170,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
     }
     
     atomic_fetch_sub(&ctx->pending_tasks, 1);
+    atomic_fetch_sub(&ctx->pending_batches, 1);
     ctx->state.total_dequeued_count++;
     
     /* 释放 batch 内存 */
@@ -336,18 +337,11 @@ void main_loop_run(AppContext *ctx) {
         }
 
         /* Termination condition */
-        if (atomic_load(&ctx->pending_tasks) == 0 && !ctx->resume_active) {
-            bool all_idle = true;
-            for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
-                if (ctx->worker_pool->slots[i].is_alive) {
-                    /* TODO: check if worker is actually idle */
-                }
-            }
-            if (all_idle) {
-                /* Graceful stop */
-                worker_pool_stop_all(ctx->worker_pool);
-                ctx->running = false;
-            }
+        if (atomic_load(&ctx->pending_tasks) == 0 && !ctx->resume_active
+            && atomic_load(&ctx->pending_batches) == 0) {
+            /* pending_tasks 和 pending_batches 均为 0，说明所有工作已完成 */
+            worker_pool_stop_all(ctx->worker_pool);
+            ctx->running = false;
         }
     }
 
@@ -387,6 +381,7 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
     batch->worker_id = worker_id;
 
     /* 尝试提交到线程池 */
+    atomic_fetch_add(&ctx->pending_batches, 1);
     if (thread_pool_submit(ctx->thread_pool, batch)) {
         /* 提交成功，ParsedBatch 内存所有权转移给 batch */
         return;

@@ -50,7 +50,7 @@ void show_help() {
 
 void init_config(Config *cfg) {
     memset(cfg, 0, sizeof(Config));
-    cfg->progress_base = "progress";
+    cfg->progress_base = strdup("progress");
     cfg->compiled_format = NULL;
     cfg->format_segment_count = 0;
     cfg->is_output_file = false;
@@ -125,7 +125,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 'f': cfg->progress_base = strdup(optarg); break;
             case 'd': cfg->print_dir = true; break;
             case 'v': cfg->verbose = true; break;
-            case 'V': show_version(); return -1;
+            case 'V': show_version(); return 2;
             case 'F': cfg->format = strdup(optarg); break;
             case 1: cfg->size = true; break;
             case 2: cfg->user = true; break;
@@ -201,7 +201,11 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
                     exit(EXIT_FAILURE);
                 }
                 break;
-            case 'h': default: show_help(); return -1;
+            case 'h': show_help(); return 2;
+            default:
+                fprintf(stderr, "错误: 未知选项\n");
+                show_help();
+                return -1;
         }
     }
 

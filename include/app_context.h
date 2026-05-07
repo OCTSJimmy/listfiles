@@ -57,6 +57,7 @@ typedef struct {
     
     /* === 任务计数 === */
     _Atomic long    pending_tasks;
+    _Atomic long    pending_batches;   /* 已提交到线程池但未完成的 batch 数 */
     bool            resume_active;
     
     /* === 输出线程 === */
