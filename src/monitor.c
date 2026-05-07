@@ -1,77 +1,39 @@
+#define _GNU_SOURCE
 #include "monitor.h"
+#include "app_context.h"
+#include "progress.h"
 #include "utils.h"
-#include "traversal.h"    // 需包含 traversal_spawn_replacement_worker
-#include "async_worker.h" // 需包含 async_worker_get_queue_size
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
-#include <errno.h>
+#include <time.h>
 #include <math.h>
 
-static void* probe_thread_func(void *arg) {
-    ProbeArgs *p = (ProbeArgs*)arg;
-    
-    struct stat st;
-    // 使用 lstat 测试访问性
-    // 如果 NFS 挂死，lstat 会卡住，线程无法返回 -> DeviceManager 状态不会更新 -> 触发 Monitor 熔断
-    if (lstat(p->path, &st) == 0) {
-        dev_mgr_mark_alive(p->mgr, p->dev); // 活过来了/没死
-    } else {
-        // 即使报错 (如 Permission denied)，只要没卡住，就说明设备是活的
-        dev_mgr_mark_alive(p->mgr, p->dev);
-    }
-    
-    free(p);
-    return NULL;
-}
+/* ================================================================
+ * Statistics helpers (ported from monitor.c.bak)
+ * ================================================================ */
 
-static void launch_probe(DeviceManager *mgr, dev_t dev, const char *path) {
-    if (!mgr) return;
-
-    // 标记为 PROBING，防止重复发射
-    dev_mgr_mark_probing(mgr, dev);
-    
-    ProbeArgs *args = safe_malloc(sizeof(ProbeArgs));
-    args->mgr = mgr;
-    args->dev = dev;
-    strncpy(args->path, path, sizeof(args->path) - 1);
-    
-    pthread_t tid;
-    // 创建 detached 线程，因为它可能永远回不来
-    if (pthread_create(&tid, NULL, probe_thread_func, args) == 0) {
-        pthread_detach(tid); 
-    } else {
-        free(args);
-    }
-}
-// ==========================================
-// 2. [模块] 统计与展示 (Statistics & Display)
-// ==========================================
-
-// 辅助：计算入队/处理速率
-double calculate_rate_simple(time_t start_time, unsigned long count) {
+static double calculate_rate_simple(time_t start_time, unsigned long count) {
     time_t current_time = time(NULL);
     double elapsed = difftime(current_time, start_time);
     if (elapsed < 1.0) return 0.0;
     return (double)count / elapsed;
 }
 
-// 更新统计数据 (Ring Buffer 算法)
 static void update_statistics(RuntimeState *state) {
     Statistics *st = &state->stats;
     time_t now = time(NULL);
-    
-    // 限制采样频率：每秒只采一次
+
     if (now - st->last_sample_time < 1) return;
-    
-    // 存入新样本
+
     st->head_idx = (st->head_idx + 1) % RATE_WINDOW_SIZE;
     if (st->head_idx == 0 && st->samples[0].timestamp != 0) {
         st->filled = true;
     }
-    
+
     RateSample *new_s = &st->samples[st->head_idx];
     new_s->timestamp = now;
     new_s->dir_count = state->dir_count;
@@ -80,25 +42,20 @@ static void update_statistics(RuntimeState *state) {
 
     st->last_sample_time = now;
 
-    // 计算窗口差值
     int tail_idx = st->filled ? (st->head_idx + 1) % RATE_WINDOW_SIZE : 0;
     RateSample *old_s = &st->samples[tail_idx];
     double time_diff = difftime(new_s->timestamp, old_s->timestamp);
-    
+
     if (time_diff >= 1.0) {
-        // 目录速率
         st->current_dir_rate = (double)(new_s->dir_count - old_s->dir_count) / time_diff;
         if (st->current_dir_rate > st->max_dir_rate) st->max_dir_rate = st->current_dir_rate;
 
-        // 文件速率
         st->current_file_rate = (double)(new_s->file_count - old_s->file_count) / time_diff;
         if (st->current_file_rate > st->max_file_rate) st->max_file_rate = st->current_file_rate;
 
-        // 消费速率
         st->current_dequeue_rate = (double)(new_s->dequeued_count - old_s->dequeued_count) / time_diff;
         if (st->current_dequeue_rate > st->max_dequeue_rate) st->max_dequeue_rate = st->current_dequeue_rate;
     } else {
-        // 刚启动不足1秒，使用全局平均兜底
         st->current_dir_rate = calculate_rate_simple(state->start_time, state->dir_count);
         st->current_file_rate = calculate_rate_simple(state->start_time, state->file_count);
     }
@@ -110,217 +67,228 @@ static void format_elapsed_time(time_t start_time, char *buffer, size_t buf_size
     int hours = elapsed / 3600; elapsed %= 3600;
     int minutes = elapsed / 60;
     int seconds = elapsed % 60;
-    snprintf(buffer, buf_size, "%d:%02d:%02d:%02d", days, hours, minutes, seconds);
+    snprintf(buffer, buf_size, "%dd %02d:%02d:%02d", days, hours, minutes, seconds);
 }
 
-// 打印仪表盘
-void print_progress(const Config *cfg, RuntimeState *state, Monitor *mon) {
-    // 1. 判断是否需要显示
-    // 如果没有重定向输出文件，且没有mute，则不打印(避免污染 stdout)
-    // bool output_to_stdout = (!cfg->is_output_file && !cfg->is_output_split_dir);
-    // (void) output_to_stdout;
+/* ================================================================
+ * Progress panel output
+ * ================================================================ */
 
-    // 2. 更新统计 (Hack: 移除 const 以更新统计数据)
-    update_statistics((RuntimeState*)state);
+void print_progress(Monitor *mon) {
+    AppContext *ctx = mon->ctx;
+    if (!ctx) return;
 
-    // 3. 确定输出目标
-    FILE *target = stdout;
-    bool use_ansi = true;
+    RuntimeState *state = &ctx->state;
+    Config *cfg = &ctx->cfg;
 
-    if (cfg->mute) {
-        // Mute 模式：输出到 .status 文件
-        if (!state->status_file_fp) {
-            char status_path[1024];
-            snprintf(status_path, sizeof(status_path), "%s.status", cfg->progress_base);
-            ((RuntimeState*)state)->status_file_fp = fopen(status_path, "w");
-            if (!state->status_file_fp) ((RuntimeState*)state)->status_file_fp = stdout;
-        }
-        target = state->status_file_fp;
-        if (target != stdout && target != stderr) {
-            use_ansi = false;
-            rewind(target);
-            ftruncate(fileno(target), 0);
-        }
-    }
+    update_statistics(state);
 
-    // 4. 绘制
-    if (use_ansi) fprintf(target, "\033[0;0H\033[J"); // 清屏
-    
+    FILE *fp = stderr;
+
     char time_str[32];
     format_elapsed_time(state->start_time, time_str, sizeof(time_str));
 
-    fprintf(target, "===== 异步流水线状态 (v%s) =====\n", VERSION);
-    fprintf(target, "运行时间: %s\n", time_str);
-    
-    // Looper 状态
-    fprintf(target, "\n[调度器 (Looper)]\n");
-    fprintf(target, "├── 发现速率: %8.2f/s (Max: %.2f)\n", state->stats.current_dir_rate, state->stats.max_dir_rate);
-    fprintf(target, "└── 消费速率: %8.2f/s (Max: %.2f)\n", state->stats.current_dequeue_rate, state->stats.max_dequeue_rate);
-    
-    // Worker 状态
-    fprintf(target, "\n[执行器 (Workers: %d/%d)]\n", mon->active_worker_count, mon->worker_capacity);
-
-    // Writer 状态
-    // 这里需要 ThreadSharedState 里的 worker 指针才能获取 queue size，暂时略过或通过 state 传递
-    // 简单起见只打印速率
-    fprintf(target, "└── 落盘速率: %8.2f/s (Max: %.2f)\n", state->stats.current_file_rate, state->stats.max_file_rate);
-
-    // 总体
-    fprintf(target, "\n[总体产出]: %lu 文件\n", state->file_count);
-    if (cfg->is_output_split_dir) {
-        fprintf(target, "当前分片: %lu (行: %lu)\n", state->output_slice_num, state->output_line_count);
+    int alive_workers = 0;
+    int total_workers = 0;
+    if (ctx->worker_pool) {
+        total_workers = ctx->worker_pool->num_workers;
+        for (int i = 0; i < total_workers; i++) {
+            if (ctx->worker_pool->slots[i].is_alive) alive_workers++;
+        }
     }
 
-    fflush(target);
-}
+    long pending = atomic_load(&ctx->pending_tasks);
+    long pending_batches = atomic_load(&ctx->pending_batches);
 
-// ==========================================
-// 3. [模块] 守护进程巡检 (Daemon Health Check)
-// ==========================================
+    if (isatty(fileno(fp))) {
+        fprintf(fp, "\033[2J\033[H");
+    }
 
-static void check_workers_health(Monitor *self) {
-    time_t now = time(NULL);
-    DeviceManager *dm = self->state->dev_mgr;
-    if (!dm) return;
+    fprintf(fp, "===== listfiles v%s =====\n", VERSION);
+    fprintf(fp, "Elapsed: %s\n", time_str);
 
-    pthread_mutex_lock(&self->mutex);
-    
-    for (int i = 0; i < self->worker_capacity; i++) {
-        WorkerHeartbeat *hb = self->workers[i];
-        if (!hb) continue;
-        
-        // 1. 检查是否超时
-        if (now - hb->last_active > self->cfg->heartbeat_timeout) {
-            dev_t dev = hb->current_dev;
-            if (dev == 0) continue; 
-            
-            DeviceState ds = dev_mgr_get_state(dm, dev);
-            if (ds == DEV_STATE_NORMAL) {
-                verbose_printf(self->cfg, 0, "[Monitor] Worker %d timed out on dev %lu. Probing...\n", hb->id, (unsigned long)dev);
-                launch_probe(dm, dev, hb->current_path);
-            } else if (ds == DEV_STATE_PROBING) {
-                if (now - hb->last_active > self->cfg->heartbeat_timeout + PROBE_TIMEOUT_SEC + 2) {
-                    verbose_printf(self->cfg, 0, "[Monitor] Probe failed! MARKING DEVICE %lu DEAD!\n", (unsigned long)dev);
-                    dev_mgr_mark_dead(dm, dev);
-                }
-            } else if (ds == DEV_STATE_DEAD) {
-                if (!hb->is_zombie) {
-                    hb->is_zombie = true; 
-                    verbose_printf(self->cfg, 0, "[Monitor] Abandoning Worker %d (Zombie). Spawning replacement.\n", hb->id);
-                    self->workers[i] = NULL; 
-                    self->active_worker_count--;
-                    self->state->has_error = true; 
-                    traversal_notify_worker_abandoned();
-                    traversal_spawn_replacement_worker(self->cfg, self);
-                }
+    fprintf(fp, "\n[Workers]\n");
+    fprintf(fp, "  Active: %d / %d\n", alive_workers, total_workers);
+    fprintf(fp, "  Pending tasks: %ld\n", pending);
+    fprintf(fp, "  Pending batches: %ld\n", pending_batches);
+
+    fprintf(fp, "\n[Throughput]\n");
+    fprintf(fp, "  Dir rate:  %8.2f/s (max: %.2f)\n", state->stats.current_dir_rate, state->stats.max_dir_rate);
+    fprintf(fp, "  File rate: %8.2f/s (max: %.2f)\n", state->stats.current_file_rate, state->stats.max_file_rate);
+    fprintf(fp, "  Dequeue:   %8.2f/s (max: %.2f)\n", state->stats.current_dequeue_rate, state->stats.max_dequeue_rate);
+
+    fprintf(fp, "\n[Progress]\n");
+    fprintf(fp, "  Dirs:  %lu\n", state->dir_count);
+    fprintf(fp, "  Files: %lu\n", state->file_count);
+
+    if (cfg->is_output_split_dir) {
+        fprintf(fp, "  Output slice: %lu (line: %lu)\n", state->output_slice_num, state->output_line_count);
+    }
+
+    if (cfg->continue_mode && cfg->progress_base) {
+        fprintf(fp, "  Progress slice: %lu (line: %lu)\n", state->write_slice_index, state->line_count);
+    }
+
+    if (ctx->dev_mgr) {
+        size_t dev_count = atomic_load(&ctx->dev_mgr->count);
+        if (dev_count > 0) {
+            int dead = 0, condemned = 0;
+            for (size_t i = 0; i < dev_count; i++) {
+                DeviceState ds = (DeviceState)atomic_load(&ctx->dev_mgr->entries[i].state);
+                if (ds == DEV_STATE_DEAD) dead++;
+                if (ds == DEV_STATE_CONDEMNED) condemned++;
+            }
+            if (dead > 0 || condemned > 0) {
+                fprintf(fp, "\n[Devices]\n");
+                fprintf(fp, "  Dead: %d, Condemned: %d\n", dead, condemned);
             }
         }
     }
-    
-    pthread_mutex_unlock(&self->mutex);
-}
 
-// ==========================================
-// 4. [模块] 生命周期与主循环 (Lifecycle & Main Loop)
-// ==========================================
-
-Monitor* monitor_create(const Config *cfg, RuntimeState *state) {
-    Monitor *self = safe_malloc(sizeof(Monitor));
-    memset(self, 0, sizeof(Monitor));
-    
-    self->cfg = cfg;
-    self->state = state;
-    self->worker_capacity = 256;
-    self->workers = safe_malloc(sizeof(WorkerHeartbeat*) * self->worker_capacity);
-    self->active_worker_count = 0;
-    self->running = true;
-    
-    pthread_mutex_init(&self->mutex, NULL);
-    
-    // 注意：dev_mgr 应该在 main.c 中已经创建并赋值给 state->dev_mgr
-    // 这里不再创建，而是直接使用
-    
-    return self;
-}
-
-void monitor_destroy(Monitor *self) {
-    if (!self) return;
-    self->running = false;
-    
-    pthread_mutex_destroy(&self->mutex);
-    
-    // 清理所有 Heartbeat
-    for (int i = 0; i < self->worker_capacity; i++) {
-        if (self->workers[i]) free(self->workers[i]);
+    if (mon->active_probe_pid > 0) {
+        fprintf(fp, "\n[Probe] active pid=%d\n", mon->active_probe_pid);
     }
-    free(self->workers);
-    free(self);
+
+    fprintf(fp, "==========================\n");
+    fflush(fp);
 }
 
-WorkerHeartbeat* monitor_register_worker(Monitor *self, pthread_t tid) {
-    if (!self) return NULL;
-    pthread_mutex_lock(&self->mutex);
-    
-    WorkerHeartbeat *hb = safe_malloc(sizeof(WorkerHeartbeat));
-    hb->id = self->active_worker_count + 1; // 仅作逻辑展示ID
-    hb->tid = tid;
-    hb->last_active = time(NULL);
-    hb->current_dev = 0;
-    hb->is_zombie = false;
-    memset(hb->current_path, 0, sizeof(hb->current_path));
-    
-    int slot = -1;
-    for (int i = 0; i < self->worker_capacity; i++) {
-        if (self->workers[i] == NULL) {
-            slot = i;
-            break;
+/* ================================================================
+ * Worker health check (directly inspect WorkerPool slots)
+ * ================================================================ */
+
+static void check_workers_health(Monitor *mon) {
+    AppContext *ctx = mon->ctx;
+    if (!ctx || !ctx->worker_pool) return;
+
+    time_t now = time(NULL);
+    int timeout = ctx->cfg.heartbeat_timeout;
+
+    for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
+        WorkerSlot *slot = &ctx->worker_pool->slots[i];
+        if (!slot->is_alive) continue;
+
+        if (now - slot->last_heartbeat > timeout) {
+            fprintf(stderr, "[Monitor] Worker %d heartbeat timeout (dev=%lu, path=%s). Replacing.\n",
+                    i, (unsigned long)slot->current_dev, slot->current_path);
+
+            kill(slot->pid, SIGKILL);
+            int status;
+            waitpid(slot->pid, &status, WNOHANG);
+
+            slot->is_alive = false;
+            slot->pid = -1;
+            ctx->worker_pool->active_count--;
+            ctx->state.has_error = true;
         }
     }
-    
-    if (slot != -1) {
-        self->workers[slot] = hb;
-        self->active_worker_count++;
-    } else {
-        free(hb);
-        hb = NULL;
-    }
-    
-    pthread_mutex_unlock(&self->mutex);
-    return hb;
 }
 
-void monitor_unregister_worker(Monitor *self, WorkerHeartbeat *hb) {
-    if (!self || !hb) return;
-    pthread_mutex_lock(&self->mutex);
-    for (int i = 0; i < self->worker_capacity; i++) {
-        if (self->workers[i] == hb) {
-            self->workers[i] = NULL;
-            self->active_worker_count--;
-            break;
+/* ================================================================
+ * Daredevil probe (fork-based, same logic as old main_loop.c)
+ * ================================================================ */
+
+static void dispatch_probes(Monitor *mon) {
+    AppContext *ctx = mon->ctx;
+    if (!ctx || !ctx->probe_scheduler) return;
+    if (mon->active_probe_pid > 0) return;
+
+    ProbeTask task;
+    if (!probe_scheduler_peek(ctx->probe_scheduler, &task)) return;
+    if (task.s_status == SP_STATUS_CONDEMNED) {
+        probe_scheduler_remove_dev(ctx->probe_scheduler, task.dev);
+        return;
+    }
+
+    probe_scheduler_remove_dev(ctx->probe_scheduler, task.dev);
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(PROBE_TIMEOUT_SEC);
+        struct stat st;
+        (void)lstat(task.probe_path, &st);
+        _exit(0);
+    } else if (pid > 0) {
+        mon->active_probe_pid = pid;
+        mon->active_probe_dev = task.dev;
+    }
+}
+
+static void reap_probes(Monitor *mon) {
+    if (mon->active_probe_pid <= 0) return;
+
+    int status;
+    pid_t rc = waitpid(mon->active_probe_pid, &status, WNOHANG);
+    if (rc == 0) return;
+
+    AppContext *ctx = mon->ctx;
+    if (rc == mon->active_probe_pid) {
+        if (WIFEXITED(status)) {
+            dev_mgr_mark_alive(ctx->dev_mgr, mon->active_probe_dev);
+            spbin_requeue_recovered(ctx, mon->active_probe_dev);
+        } else {
+            ProbeTask task = {0};
+            task.dev = mon->active_probe_dev;
+            task.probe_interval = PROBE_INTERVAL_INITIAL;
+            task.next_probe_time = time(NULL) + PROBE_INTERVAL_INITIAL;
+            task.retry_count = 0;
+            task.s_status = SP_STATUS_PROBING;
+
+            for (size_t i = 0; i < ctx->spbin_count; i++) {
+                if (ctx->spbin_entries[i].dev == mon->active_probe_dev) {
+                    safe_strcpy(task.probe_path, ctx->spbin_entries[i].path, sizeof(task.probe_path));
+                    break;
+                }
+            }
+            probe_scheduler_push(ctx->probe_scheduler, &task);
         }
     }
-    pthread_mutex_unlock(&self->mutex);
-    free(hb);
+
+    mon->active_probe_pid = -1;
+    mon->active_probe_dev = 0;
 }
 
-// Monitor 线程入口
+/* ================================================================
+ * Monitor thread lifecycle
+ * ================================================================ */
+
 void* monitor_thread_entry(void *arg) {
-    Monitor *self = (Monitor*)arg;
+    Monitor *mon = (Monitor*)arg;
     time_t last_check_time = 0;
 
-    while (self->running) {
-        // 1. 打印进度 (UI 刷新)
-        print_progress(self->cfg, self->state, self);
-        
-        // 2. 守护进程巡检 (Daemon Check)
+    while (mon->running) {
+        if (!mon->ctx->cfg.mute) {
+            print_progress(mon);
+        }
+
         time_t now = time(NULL);
         if (now - last_check_time >= CHECK_INTERVAL_SEC) {
-            check_workers_health(self);
+            check_workers_health(mon);
+            dispatch_probes(mon);
             last_check_time = now;
         }
-        
-        // 3. 休眠
+        reap_probes(mon);
+
         usleep(MONITOR_INTERVAL_MS * 1000);
     }
+
     return NULL;
+}
+
+Monitor* monitor_create(AppContext *ctx) {
+    Monitor *mon = calloc(1, sizeof(Monitor));
+    if (!mon) return NULL;
+
+    mon->ctx = ctx;
+    mon->running = true;
+    mon->active_probe_pid = -1;
+
+    return mon;
+}
+
+void monitor_destroy(Monitor *mon) {
+    if (!mon) return;
+    mon->running = false;
+    pthread_join(mon->tid, NULL);
+    free(mon);
 }

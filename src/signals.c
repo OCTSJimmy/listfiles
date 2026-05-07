@@ -49,30 +49,28 @@ void unregister_locked_file(int fd) {
     pthread_mutex_unlock(&g_lock_registry_mutex);
 }
 
+// 终止信号处理器: SIGINT/SIGTERM/SIGQUIT
+static void handle_terminate_signal(int sig) {
+    const char msg[] = "收到终止信号，正在尝试释放锁并退出...\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
 
-// 信号处理器函数
-void handle_fatal_signal(int sig) {
-    // 信号处理器内部必须使用“异步信号安全”的函数
-    // write 是安全的, printf/fprintf 不是
-    const char msg[] = "收到致命信号，正在尝试释放锁并退出...\n";
-    write(STDOUT_FILENO, msg, sizeof(msg) - 1);
-
-    // 遍历全局注册表进行清理 (现在应该只包含主锁)
     for (int i = 0; i < g_active_lock_count; i++) {
         ActiveLockInfo* info = &g_active_locks[i];
-        
-        // fcntl 解锁逻辑已根据您的请求移除。
-        
         close(info->fd);
-        
-        // 如果是主锁文件，则删除它
         if (info->is_main_lock) {
             unlink(info->path);
-            const char main_lock_msg[] = "主锁文件已删除。\n";
-            write(STDOUT_FILENO, main_lock_msg, sizeof(main_lock_msg) - 1);
         }
     }
-    
+
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+// 致命信号处理器: SIGSEGV/SIGABRT
+static void handle_fatal_signal(int sig) {
+    const char msg[] = "Fatal signal caught, aborting immediately.\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -81,14 +79,17 @@ void handle_fatal_signal(int sig) {
 void setup_signal_handlers() {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = handle_fatal_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART; // 自动重启被中断的系统调用
 
-    // 为我们关心的信号注册处理器
+    // 致命信号: 不做清理，直接让内核生成 core dump
+    sa.sa_handler = handle_fatal_signal;
     sigaction(SIGSEGV, &sa, NULL); // 段错误 (崩溃)
+    sigaction(SIGABRT, &sa, NULL); // abort() 调用
+
+    // 终止信号: 允许有限的清理
+    sa.sa_handler = handle_terminate_signal;
     sigaction(SIGTERM, &sa, NULL); // 终止 (kill 命令)
     sigaction(SIGINT, &sa, NULL);  // 中断 (Ctrl+C)
     sigaction(SIGQUIT, &sa, NULL); // 退出 (Ctrl+\)
-    sigaction(SIGABRT, &sa, NULL); // abort() 调用
 }

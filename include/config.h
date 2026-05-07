@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "11.0" // 版本号升级
+#define VERSION "12.2.0" // 版本号升级
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
@@ -50,6 +50,14 @@ struct DeviceManager;
 #define PROBE_TIMEOUT_SEC 5        // 探针5秒不返回视为设备死亡
 #define MONITOR_INTERVAL_MS 500    // Monitor 线程主频 (500ms)
 #define CHECK_INTERVAL_SEC 1       // 巡检频率 (1秒)
+
+#define DEFAULT_BATCH_SIZE 1024
+#define DEFAULT_ESTIMATED_FILES 10000000
+#define DEFAULT_MASTER_THREADS 4
+
+/* Pbin / fpbin Footer 常量 */
+#define PBIN_FOOTER_MAGIC   0xDEADBEEF66AAC0FFULL
+#define PBIN_FOOTER_SIZE    24  /* sizeof(PbinFooter) */
 
 #define min_size(a, b) ((a) < (b) ? (a) : (b))
 #define max_size(a, b) ((a) > (b) ? (a) : (b))
@@ -180,6 +188,11 @@ typedef struct {
     char *last_cmd_args; 
 
     int heartbeat_timeout;
+    
+    /* === 新增：进程模型与性能参数 === */
+    int batch_size;             // Worker batch 大小，默认 1024
+    unsigned long estimated_files; // 预估文件数，用于预分配 HashSet
+    int master_threads;         // Master 去重线程数，默认 4
 } Config;
 
 // 运行时状态
