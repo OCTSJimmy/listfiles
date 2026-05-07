@@ -22,6 +22,7 @@ typedef struct {
 #include "output.h"
 #include "spbin.h"
 #include "thread_pool.h"
+#include "monitor.h"
 
 /* 恢复流程中的历史目录泵送状态 */
 typedef enum {
@@ -30,7 +31,7 @@ typedef enum {
     HIST_PUMP_NEW        /* 正在消费 fpbin 转正后的新 pbin，新子目录直接入队 */
 } HistPumpState;
 
-typedef struct {
+typedef struct AppContext {
     /* === 配置与运行时状态 === */
     Config        cfg;
     RuntimeState  state;
@@ -63,6 +64,9 @@ typedef struct {
     /* === 输出线程 === */
     AsyncWorker    *async_writer;
     pthread_t       writer_tid;
+
+    /* === 监控线程 === */
+    Monitor        *monitor;
     
     /* === 线程池与事件通知 === */
     ThreadPool     *thread_pool;

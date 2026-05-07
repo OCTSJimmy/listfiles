@@ -11,9 +11,4 @@ void main_loop_handle_heartbeat(AppContext *ctx, int worker_id, uint64_t timesta
 void main_loop_handle_error(AppContext *ctx, int worker_id, const IpcErrorHeader *err, const char *path);
 void main_loop_handle_exit(AppContext *ctx, int worker_id);
 
-/* Monitor sub-routines */
-void monitor_check_timeouts(AppContext *ctx);
-void monitor_dispatch_probes(AppContext *ctx);
-void monitor_reap_probes(AppContext *ctx);
-
 #endif

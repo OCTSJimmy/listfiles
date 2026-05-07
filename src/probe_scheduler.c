@@ -47,33 +47,39 @@ ProbeScheduler* probe_scheduler_create(void) {
     sched->tasks = calloc(sched->capacity, sizeof(ProbeTask));
     if (!sched->tasks) { free(sched); return NULL; }
     sched->count = 0;
+    pthread_mutex_init(&sched->mutex, NULL);
     return sched;
 }
 
 void probe_scheduler_destroy(ProbeScheduler *sched) {
     if (!sched) return;
+    pthread_mutex_destroy(&sched->mutex);
     free(sched->tasks);
     free(sched);
 }
 
 void probe_scheduler_push(ProbeScheduler *sched, const ProbeTask *task) {
+    pthread_mutex_lock(&sched->mutex);
     if (sched->count >= sched->capacity) {
         size_t new_cap = sched->capacity << 1;
         ProbeTask *new_tasks = realloc(sched->tasks, new_cap * sizeof(ProbeTask));
-        if (!new_tasks) return;
+        if (!new_tasks) { pthread_mutex_unlock(&sched->mutex); return; }
         sched->tasks = new_tasks;
         sched->capacity = new_cap;
     }
     sched->tasks[sched->count] = *task;
     heap_up(sched, sched->count);
     sched->count++;
+    pthread_mutex_unlock(&sched->mutex);
 }
 
 bool probe_scheduler_peek(const ProbeScheduler *sched, ProbeTask *out) {
-    if (sched->count == 0) return false;
+    pthread_mutex_lock((pthread_mutex_t*)&sched->mutex);
+    if (sched->count == 0) { pthread_mutex_unlock((pthread_mutex_t*)&sched->mutex); return false; }
     time_t now = time(NULL);
-    if (sched->tasks[0].next_probe_time > now) return false;
+    if (sched->tasks[0].next_probe_time > now) { pthread_mutex_unlock((pthread_mutex_t*)&sched->mutex); return false; }
     if (out) *out = sched->tasks[0];
+    pthread_mutex_unlock((pthread_mutex_t*)&sched->mutex);
     return true;
 }
 
@@ -88,6 +94,7 @@ static void heap_pop(ProbeScheduler *sched) {
 }
 
 void probe_scheduler_remove_dev(ProbeScheduler *sched, dev_t dev) {
+    pthread_mutex_lock(&sched->mutex);
     for (size_t i = 0; i < sched->count; i++) {
         if (sched->tasks[i].dev == dev) {
             sched->count--;
@@ -96,25 +103,31 @@ void probe_scheduler_remove_dev(ProbeScheduler *sched, dev_t dev) {
                 heap_up(sched, i);
                 heap_down(sched, i);
             }
-            return; /* remove first match only */
-        }
-    }
-}
-
-void probe_scheduler_mark_condemned(ProbeScheduler *sched, dev_t dev) {
-    for (size_t i = 0; i < sched->count; i++) {
-        if (sched->tasks[i].dev == dev) {
-            sched->tasks[i].s_status = SP_STATUS_CONDEMNED;
+            pthread_mutex_unlock(&sched->mutex);
             return;
         }
     }
+    pthread_mutex_unlock(&sched->mutex);
+}
+
+void probe_scheduler_mark_condemned(ProbeScheduler *sched, dev_t dev) {
+    pthread_mutex_lock(&sched->mutex);
+    for (size_t i = 0; i < sched->count; i++) {
+        if (sched->tasks[i].dev == dev) {
+            sched->tasks[i].s_status = SP_STATUS_CONDEMNED;
+            pthread_mutex_unlock(&sched->mutex);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&sched->mutex);
 }
 
 /* After a probe failure: pop the due task, update interval, and push back */
 void probe_scheduler_reschedule_after_failure(ProbeScheduler *sched) {
-    if (sched->count == 0) return;
+    pthread_mutex_lock(&sched->mutex);
+    if (sched->count == 0) { pthread_mutex_unlock(&sched->mutex); return; }
     time_t now = time(NULL);
-    if (sched->tasks[0].next_probe_time > now) return;
+    if (sched->tasks[0].next_probe_time > now) { pthread_mutex_unlock(&sched->mutex); return; }
 
     ProbeTask task = sched->tasks[0];
     heap_pop(sched);
@@ -125,5 +138,8 @@ void probe_scheduler_reschedule_after_failure(ProbeScheduler *sched) {
         task.probe_interval = PROBE_INTERVAL_MAX;
     task.next_probe_time = now + task.probe_interval;
 
-    probe_scheduler_push(sched, &task);
+    sched->tasks[sched->count] = task;
+    heap_up(sched, sched->count);
+    sched->count++;
+    pthread_mutex_unlock(&sched->mutex);
 }

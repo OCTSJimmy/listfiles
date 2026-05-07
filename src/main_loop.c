@@ -309,11 +309,6 @@ void main_loop_run(AppContext *ctx) {
         /* Drain any completed batches before checking termination */
         drain_completed_batches(ctx);
 
-        /* Monitor routines */
-        monitor_check_timeouts(ctx);
-        monitor_dispatch_probes(ctx);
-        monitor_reap_probes(ctx);
-
         /* Pump historical pbin directories during recovery */
         if (ctx->hist_pump_state == HIST_PUMP_OLD || ctx->hist_pump_state == HIST_PUMP_NEW) {
             pump_pbin_batch(ctx, ctx->cfg.batch_size);
@@ -442,88 +437,4 @@ void main_loop_handle_exit(AppContext *ctx, int worker_id) {
     waitpid(slot->pid, &status, WNOHANG);
 }
 
-/* ================================================================
- * Monitor routines
- * ================================================================ */
 
-static pid_t g_probe_pid = -1;
-static dev_t g_probe_dev = 0;
-
-void monitor_check_timeouts(AppContext *ctx) {
-    time_t now = time(NULL);
-    for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
-        WorkerSlot *slot = &ctx->worker_pool->slots[i];
-        if (!slot->is_alive) continue;
-        if (now - slot->last_heartbeat > ctx->cfg.heartbeat_timeout) {
-            fprintf(stderr, "[Monitor] Worker %d heartbeat timeout. Replacing.\n", i);
-            kill(slot->pid, SIGKILL);
-            int status;
-            waitpid(slot->pid, &status, WNOHANG);
-            slot->is_alive = false;
-            slot->pid = -1; /* mark as needs replacement */
-            ctx->worker_pool->active_count--;
-        }
-    }
-}
-
-void monitor_dispatch_probes(AppContext *ctx) {
-    if (g_probe_pid > 0) return; /* already have an active probe */
-
-    ProbeTask task;
-    if (!probe_scheduler_peek(ctx->probe_scheduler, &task)) return;
-    if (task.s_status == SP_STATUS_CONDEMNED) {
-        probe_scheduler_remove_dev(ctx->probe_scheduler, task.dev);
-        return;
-    }
-
-    /* Pop the due task */
-    probe_scheduler_remove_dev(ctx->probe_scheduler, task.dev);
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        /* Child: daredevil probe */
-        alarm(PROBE_TIMEOUT_SEC);
-        struct stat st;
-        int rc = lstat(task.probe_path, &st);
-        (void)rc;
-        _exit(0); /* return = alive */
-    } else if (pid > 0) {
-        g_probe_pid = pid;
-        g_probe_dev = task.dev;
-    }
-}
-
-void monitor_reap_probes(AppContext *ctx) {
-    if (g_probe_pid <= 0) return;
-
-    int status;
-    pid_t rc = waitpid(g_probe_pid, &status, WNOHANG);
-    if (rc == 0) return; /* still running */
-
-    if (rc == g_probe_pid) {
-        if (WIFEXITED(status)) {
-            /* Probe returned: device is alive */
-            dev_mgr_mark_alive(ctx->dev_mgr, g_probe_dev);
-            spbin_requeue_recovered(ctx, g_probe_dev);
-        } else {
-            /* Killed or crashed: device still dead, reschedule */
-            ProbeTask task = {0};
-            task.dev = g_probe_dev;
-            task.probe_interval = PROBE_INTERVAL_INITIAL; /* will be doubled by scheduler */
-            task.next_probe_time = time(NULL) + PROBE_INTERVAL_INITIAL;
-            task.retry_count = 0;
-            task.s_status = SP_STATUS_PROBING;
-            /* probe_path: find from spbin_entries */
-            for (size_t i = 0; i < ctx->spbin_count; i++) {
-                if (ctx->spbin_entries[i].dev == g_probe_dev) {
-                    safe_strcpy(task.probe_path, ctx->spbin_entries[i].path, sizeof(task.probe_path));
-                    break;
-                }
-            }
-            probe_scheduler_push(ctx->probe_scheduler, &task);
-        }
-    }
-
-    g_probe_pid = -1;
-    g_probe_dev = 0;
-}

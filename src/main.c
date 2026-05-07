@@ -246,12 +246,16 @@ int main(int argc, char *argv[]) {
     int num_workers = num_cores * 2;
     ctx.worker_pool = worker_pool_create(num_workers);
     ctx.probe_scheduler = probe_scheduler_create();
+    ctx.monitor = monitor_create(&ctx);
 
-    if (!ctx.worker_pool || !ctx.probe_scheduler) {
+    if (!ctx.worker_pool || !ctx.probe_scheduler || !ctx.monitor) {
         fprintf(stderr, "[Fatal] 无法初始化进程池\n");
         app_context_destroy(&ctx);
         return 1;
     }
+
+    /* Start monitor thread */
+    pthread_create(&ctx.monitor->tid, NULL, monitor_thread_entry, ctx.monitor);
 
     /* Spawn all workers before any restore/replay (needed for resume dispatch) */
     for (int i = 0; i < num_workers; i++) {
@@ -286,6 +290,12 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "[System] 任务开始...\n");
     }
     main_loop_run(&ctx);
+
+    /* Stop monitor thread after main loop exits */
+    if (ctx.monitor) {
+        ctx.monitor->running = false;
+        pthread_join(ctx.monitor->tid, NULL);
+    }
 
     if (!ctx.cfg.mute) {
         fprintf(stderr, "[System] 任务完成。耗时: %ld 秒\n", time(NULL) - ctx.state.start_time);

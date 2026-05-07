@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <sys/types.h>
+#include <pthread.h>
 
 #define PROBE_TIMEOUT_SEC       5
 #define PROBE_INTERVAL_INITIAL  5
@@ -23,6 +24,7 @@ typedef struct {
     ProbeTask *tasks;          /* min-heap ordered by next_probe_time */
     size_t     count;
     size_t     capacity;
+    pthread_mutex_t mutex;     /* thread-safe wrapper */
 } ProbeScheduler;
 
 ProbeScheduler* probe_scheduler_create(void);
