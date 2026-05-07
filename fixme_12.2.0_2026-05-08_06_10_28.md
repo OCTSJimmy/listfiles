@@ -51,6 +51,72 @@
 
 ---
 
+## 1.1 架构上下文：为什么 `process_slice_index` 在当前设计下天然无法独立
+
+> 本节是对问题 1 的补充分析，记录架构评审结论，供后续维护者参考。
+
+### 1.1.1 Worker 内部的强耦合消除了"已扫描"与"已lstat"的时间差
+
+当前 `worker_proc.c:scan_and_send()` 的实现：
+
+```c
+Worker 收到 IPC_MSG_SCAN(dir_path)
+    ├── lstat(dir_path)              // 目录本身
+    ├── opendir(dir_path)
+    ├── while (readdir) {
+    │       ├── try_blind_trust() ?  // 命中 → 跳过 lstat
+    │       └── : lstat(full_path)   // 未命中 → 获取元数据
+    │       └── 收集到 batch
+    │   }
+    └── send_batch() → IPC_MSG_BATCH 返回 Master
+```
+
+**关键洞察**：`opendir+readdir` 和 `per-entry lstat` 在同一个 Worker 进程内**线性顺序执行**，且以**目录**为原子粒度返回。这意味着：
+
+| 游标概念 | 在当前架构下的实际状态 | 是否有独立时间窗口 |
+|---------|---------------------|------------------|
+| **Dispatch**（已发给 Worker） | `ipc_send()` 后 | ✅ 有，Worker 处理期间 |
+| **Scan**（已 readdir） | Worker 内部瞬间完成 | ❌ **无**，与 lstat 在同一函数内连续执行 |
+| **Lstat**（已获取元数据） | Scan 完成后立即执行 | ❌ **无**，与 readdir 无缝衔接 |
+| **Process**（已返回 Master） | `send_batch()` 后 | ✅ 有，网络/IPC 传输期间 |
+| **Persist**（已写入 pbin） | `record_path()` 后 | ✅ 有，Batch 缓冲期间 |
+
+**结论**：`readdir` 和 `lstat` 之间不存在可观测的"速度差"或"时间窗口"。一个目录的条目要么全部完成 lstat 并随 batch 返回，要么 Worker 卡死/超时。因此 **Scan Cursor 和 Lstat Cursor 在当前耦合架构下会完全重合**，这就是 `process_slice_index` 最初被设计但后来发现没有独立存在空间的深层原因。
+
+### 1.1.2 为什么不通过分离 Scan-Worker / Stat-Worker 来创造时间窗口
+
+曾评估过将 Worker 拆分为 **Scan-Worker**（只执行 `opendir+readdir`）和 **Stat-Worker**（只执行 `lstat`）的方案，结论如下：
+
+| 维度 | 分离方案 | 当前耦合方案 |
+|------|---------|-------------|
+| IPC 消息数 | 暴增 ~1000 倍（从"目录级"变为"文件级"） | 极低（目录级 batch） |
+| blind-trust 效率 | Master 端查表，延迟增加 | Worker 本地查表，零 IPC |
+| 缓存局部性 | Stat-Worker 处理跨目录文件，局部性丧失 | 同 Worker 连续处理同目录 |
+| 设备熔断 | 需两套逻辑 | 一套逻辑 |
+| 实现复杂度 | 极高（两套进程池 + 新 IPC 协议） | 低 |
+
+**结论**：分离 Worker 以换取"文件级游标精度"是**负 ROI** 的架构改造。当前耦合设计不是缺陷，而是**针对目录级原子任务的刻意工程权衡**——用 IPC 极简性换取极高吞吐。
+
+### 1.1.3 对问题 1 修复建议的修正
+
+基于以上分析，问题 1 的"三级游标"建议应修正为**两级游标**：
+
+| 游标 | 含义 | 更新时机 | 必要性 |
+|------|------|---------|--------|
+| **Dispatch Cursor** | 已发给 Worker 的目录位置 | 每次 `ipc_send(IPC_MSG_SCAN)` 后 | **低**——Master 端用 `pending_tasks` 已近似表达 |
+| **Process Cursor** | Worker 已返回、Master 已去重完成的位置 | 每批 `process_completed_batch()` 后 | **高**——决定恢复时重复扫描量 |
+| **Persist Cursor** | 已写入 pbin 并落盘的位置 | 每次 `record_path()` 后 | **高**——当前已有，但更新频率过低 |
+
+**Scan Cursor 和 Lstat Cursor 在当前架构下不需要也不应存在**，因为 Worker 内部的强耦合使它们天然重合。
+
+### 1.1.4 推荐的务实修复路径
+
+1. **短期**：删除 `process_slice_index`（僵尸字段），或将其真正用起来（在每批 `process_completed_batch()` 后更新，表达"这批已处理完"）。
+2. **中期**：引入 **Process Cursor**（独立于 `write_slice_index`），在 `process_completed_batch()` 末尾更新，并在 `atomic_update_index()` 中持久化。
+3. **长期**：提高 `.idx` 刷新频率（见问题 2），将真空带从"分片级"（10万条）降到"batch级"（1024条）或"时间级"（5秒）。
+
+---
+
 ## 2. [严重] `.idx` 更新频率过低，崩溃恢复精度极差
 
 - **优先级**: P0 — 与问题 1 强相关

@@ -68,34 +68,37 @@ Feature: 单文件目标扫描
 
 ## 2. 断点续传 (Resume / Checkpoint)
 
-### Feature: 多级游标追踪（应有的正确设计）
+### Feature: 两级游标追踪（当前架构下的正确设计）
 
 ```gherkin
-Feature: 多级游标追踪
+Feature: 两级游标追踪
   As a 系统管理员
-  I want 精确追踪扫描任务在"已发送/已处理/已持久化"三个阶段的进度
+  I want 精确追踪扫描任务在"已处理/已持久化"两个阶段的进度
   So that 崩溃恢复时的重复扫描量控制在可接受范围内（如 < 1000 条）
 
   Background:
     Given 用户指定了 --continue 和 --progress-file=task1
-    And 系统采用三级游标设计
+    And Worker 内部将 opendir+readdir 与 per-entry lstat 线性耦合执行
+    And 以目录为原子粒度返回 batch，不存在"已扫描但未lstat"的中间状态
+
+  Scenario: Worker 内部无独立 Scan/Lstat 阶段
+    Given Worker 收到 IPC_MSG_SCAN("/data/subdir")
+    When Worker 执行 scan_and_send()
+    Then 先执行 opendir+readdir 遍历所有条目
+    And 对每个条目立即执行 lstat 或 try_blind_trust
+    And 收集完整 batch 后一次性返回 Master
+    And 不存在"已readdir但尚未lstat"的时间窗口
+    And 因此不需要独立的 Scan Cursor 或 Lstat Cursor
 
   Scenario: 首次扫描创建游标索引
     Given 这是首次扫描
     When 程序启动
     Then 应该创建 task1.config 记录会话配置
-    And 创建 task1.idx 记录三级游标初始值
-      | 游标类型          | 字段名                    | 初始值 |
-      | Dispatch Cursor   | dispatch_slice/line       | 0 0    |
-      | Process Cursor    | process_slice/line        | 0 0    |
-      | Persist Cursor    | write_slice/line_count    | 0 0    |
-      | Output Cursor     | output_slice_num/count    | 0 0    |
-
-  Scenario: Dispatch Cursor 递进
-    Given Master 决定将目录 "/data/subdir" 发给 Worker 3
-    When 调用 ipc_send(IPC_MSG_SCAN) 成功
-    Then Dispatch Cursor 应该递进 1 个目录
-    And task1.idx 应该在下一次刷新时同步该游标
+    And 创建 task1.idx 记录两级游标初始值
+      | 游标类型          | 字段名                    | 初始值 | 说明                          |
+      | Process Cursor    | process_slice/line        | 0 0    | Master 已去重完成的目录位置   |
+      | Persist Cursor    | write_slice/line_count    | 0 0    | 已写入 pbin 并落盘的位置      |
+      | Output Cursor     | output_slice_num/count    | 0 0    | 输出切片位置（可选）          |
 
   Scenario: Process Cursor 递进
     Given Worker 返回了一个 batch 包含 50 条记录
@@ -148,6 +151,44 @@ Feature: 多级游标追踪
     And 以 O_RDONLY 重新打开校验 Footer
     And 全部校验通过后删除 fpbin.idx
     And 更新 Process Cursor 指向转正后的起始位置
+```
+
+### Feature: 为什么不分离 Scan-Worker 与 Stat-Worker
+
+```gherkin
+Feature: Worker 耦合架构的合理性论证
+  As a 架构师
+  I want 评估将 Scan 与 Stat 分离为独立 Worker 的价值
+  So that 避免为不存在的"速度差"引入过度设计
+
+  Scenario: 分离 Worker 的 IPC 开销暴增
+    Given 一个平均目录包含 1000 个文件
+    When 使用耦合 Worker（当前设计）
+    Then 每目录产生 1 条 SCAN 请求 + 1 条 BATCH 返回
+    When 使用分离 Worker（Scan + Stat）
+    Then 每目录产生 1 条 SCAN + 1 条 NAME_LIST + 1000 条 STAT + 1000 条 RESULT
+    And IPC 消息数增长约 1000 倍
+    And Master 调度负载从"目录级"变为"文件级"
+
+  Scenario: 分离 Worker 破坏 blind-trust 效率
+    Given 半增量扫描启用 blind-trust
+    And 历史索引通过 COW 共享给 Worker
+    When 使用耦合 Worker
+    Then try_blind_trust() 在 Worker 本地执行，零 IPC 开销
+    When 使用分离 Worker
+    Then Scan-Worker 只返回 d_ino + d_type
+    And Master 需为每个文件查 reference_map 决定是否发 STAT 请求
+    And 未命中文件还要再发一次 IPC 给 Stat-Worker
+    And 延迟增加，吞吐量下降
+
+  Scenario: 当前耦合设计是刻意的工程权衡
+    Given 项目目标是"数亿文件级的大规模扫描"
+    And 核心痛点是"NFS 设备挂起导致 D-State"
+    When 评估分离 Worker 的收益与代价
+    Then 收益仅为"理论上的文件级游标精度"
+    And 代价为"1000 倍 IPC 开销 + 两套进程池 + 两套熔断逻辑"
+    And 游标精度问题完全可通过 Master 端"已分配未返回"追踪解决
+    And 结论：分离 Worker 在当前需求下 ROI 为负
 ```
 
 ### Feature: 进度持久化与恢复（当前实现的缺陷描述）
