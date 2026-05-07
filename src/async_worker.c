@@ -16,20 +16,28 @@ static void *async_writer_thread(void *arg) {
             pthread_mutex_unlock(&w->mutex);
             break;
         }
-        OutputTask *task = w->head;
-        w->head = task->next;
-        if (w->head == NULL) w->tail = NULL;
+        
+        /* 批量 dequeue：一次取出尽可能多的任务（降低 mutex 频率） */
+        OutputTask *local_head = w->head;
+        w->head = NULL;
+        w->tail = NULL;
         pthread_mutex_unlock(&w->mutex);
-
-        if (w->state->output_fp) {
-            print_to_stream(w->cfg, w->state, task->path, &task->st, w->state->output_fp);
-            w->state->output_line_count++;
-            if (w->cfg->is_output_split_dir && w->state->output_line_count >= w->cfg->output_slice_lines) {
-                rotate_output_slice(w->cfg, w->state);
+        
+        /* 串行处理本地链表 */
+        OutputTask *task = local_head;
+        while (task) {
+            OutputTask *next = task->next;
+            if (w->state->output_fp) {
+                print_to_stream(w->cfg, w->state, task->path, &task->st, w->state->output_fp);
+                w->state->output_line_count++;
+                if (w->cfg->is_output_split_dir && w->state->output_line_count >= w->cfg->output_slice_lines) {
+                    rotate_output_slice(w->cfg, w->state);
+                }
             }
+            free(task->path);
+            free(task);
+            task = next;
         }
-        free(task->path);
-        free(task);
     }
     if (w->state->output_fp && w->state->output_fp != stdout) {
         fflush(w->state->output_fp);
@@ -84,4 +92,23 @@ void async_writer_submit(AsyncWorker *w, const char *path, const struct stat *st
     w->tail = task;
     pthread_cond_signal(&w->cond);
     pthread_mutex_unlock(&w->mutex);
+}
+
+void async_writer_submit_batch(AsyncWorker *w, OutputBatch *batch) {
+    if (!w || !batch || batch->count == 0) return;
+    
+    pthread_mutex_lock(&w->mutex);
+    if (w->tail) {
+        w->tail->next = batch->head;
+    } else {
+        w->head = batch->head;
+    }
+    w->tail = batch->tail;
+    
+    pthread_cond_signal(&w->cond);
+    pthread_mutex_unlock(&w->mutex);
+    
+    batch->head = NULL;
+    batch->tail = NULL;
+    batch->count = 0;
 }

@@ -206,6 +206,58 @@ void record_path(const Config *cfg, RuntimeState *state, const char *path, const
     }
 }
 
+/* ================================================================
+ * record_path 批量缓冲
+ * ================================================================ */
+
+void record_path_batch_init(RecordBatch *batch) {
+    if (!batch) return;
+    memset(batch, 0, sizeof(*batch));
+}
+
+static void record_path_batch_flush_internal(const Config *cfg, RuntimeState *state, RecordBatch *batch) {
+    if (!batch || batch->count == 0) return;
+    for (int i = 0; i < batch->count; i++) {
+        record_path(cfg, state, batch->paths[i], &batch->stats[i]);
+        free(batch->paths[i]);
+        batch->paths[i] = NULL;
+    }
+    batch->count = 0;
+    batch->total_bytes = 0;
+}
+
+void record_path_batch_flush(const Config *cfg, RuntimeState *state, RecordBatch *batch) {
+    record_path_batch_flush_internal(cfg, state, batch);
+}
+
+bool record_path_batch_append(const Config *cfg, RuntimeState *state, RecordBatch *batch, const char *path, const struct stat *info) {
+    if (!batch || !path) return false;
+    
+    size_t path_len = strlen(path);
+    size_t entry_size = path_len + sizeof(dev_t) + sizeof(ino_t) + sizeof(time_t) + sizeof(unsigned char);
+    
+    /* 检查是否需要先 flush */
+    if (batch->count >= RECORD_BATCH_COUNT ||
+        (batch->count > 0 && batch->total_bytes + entry_size >= RECORD_BATCH_BYTES)) {
+        record_path_batch_flush_internal(cfg, state, batch);
+    }
+    
+    if (batch->count >= RECORD_BATCH_COUNT) {
+        /* flush 后仍然满（理论上不应发生，因为 RECORD_BATCH_COUNT 是硬上限） */
+        record_path_batch_flush_internal(cfg, state, batch);
+    }
+    
+    batch->paths[batch->count] = strdup(path);
+    if (info) {
+        batch->stats[batch->count] = *info;
+    } else {
+        memset(&batch->stats[batch->count], 0, sizeof(struct stat));
+    }
+    batch->total_bytes += entry_size;
+    batch->count++;
+    return true;
+}
+
 void record_skip(const Config *cfg, RuntimeState *state, const SpbinEntry *entry) {
     (void)state;
     FILE *fp = fopen(get_spbin_filename(cfg->progress_base), "ab");

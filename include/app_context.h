@@ -3,6 +3,17 @@
 
 #include "config.h"
 #include "fingerprint_set.h"
+
+/* record_path 批量缓冲 */
+#define RECORD_BATCH_COUNT 4096
+#define RECORD_BATCH_BYTES (1 * 1024 * 1024)
+
+typedef struct {
+    char *paths[RECORD_BATCH_COUNT];
+    struct stat stats[RECORD_BATCH_COUNT];
+    int count;
+    size_t total_bytes;
+} RecordBatch;
 #include "reference_map.h"
 #include "worker_proc.h"
 #include "probe_scheduler.h"
@@ -10,6 +21,7 @@
 #include "async_worker.h"
 #include "output.h"
 #include "spbin.h"
+#include "thread_pool.h"
 
 /* 恢复流程中的历史目录泵送状态 */
 typedef enum {
@@ -50,6 +62,13 @@ typedef struct {
     /* === 输出线程 === */
     AsyncWorker    *async_writer;
     pthread_t       writer_tid;
+    
+    /* === 线程池与事件通知 === */
+    ThreadPool     *thread_pool;
+    int             event_fd;
+    
+    /* === record_path 批量缓冲 === */
+    RecordBatch     record_batch;
     
     /* === 历史目录泵送状态（恢复流程专用） === */
     HistPumpState   hist_pump_state;

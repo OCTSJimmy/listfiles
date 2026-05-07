@@ -53,6 +53,7 @@ struct DeviceManager;
 
 #define DEFAULT_BATCH_SIZE 1024
 #define DEFAULT_ESTIMATED_FILES 10000000
+#define DEFAULT_MASTER_THREADS 4
 
 /* Pbin / fpbin Footer 常量 */
 #define PBIN_FOOTER_MAGIC   0xDEADBEEF66AAC0FFULL
@@ -191,6 +192,7 @@ typedef struct {
     /* === 新增：进程模型与性能参数 === */
     int batch_size;             // Worker batch 大小，默认 1024
     unsigned long estimated_files; // 预估文件数，用于预分配 HashSet
+    int master_threads;         // Master 去重线程数，默认 4
 } Config;
 
 // 运行时状态

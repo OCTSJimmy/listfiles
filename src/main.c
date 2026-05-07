@@ -18,13 +18,27 @@
 static void app_context_init(AppContext *ctx) {
     memset(ctx, 0, sizeof(AppContext));
     ctx->epfd = -1;
+    ctx->event_fd = -1;
     ctx->running = false;
     ctx->hist_pump_state = HIST_PUMP_DONE;
     ctx->next_requeue_worker = 0;
     atomic_init(&ctx->pending_tasks, 0);
+    record_path_batch_init(&ctx->record_batch);
 }
 
 static void app_context_destroy(AppContext *ctx) {
+    /* 刷出残留的 record_path 缓冲 */
+    if (ctx->cfg.progress_base) {
+        record_path_batch_flush(&ctx->cfg, &ctx->state, &ctx->record_batch);
+    }
+    if (ctx->thread_pool) {
+        thread_pool_destroy(ctx->thread_pool);
+        ctx->thread_pool = NULL;
+    }
+    if (ctx->event_fd >= 0) {
+        close(ctx->event_fd);
+        ctx->event_fd = -1;
+    }
     if (ctx->async_writer) {
         async_worker_shutdown(ctx->async_writer);
         ctx->async_writer = NULL;

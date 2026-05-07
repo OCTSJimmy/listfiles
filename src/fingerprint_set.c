@@ -1,4 +1,5 @@
 #include "fingerprint_set.h"
+#define XXH_STATIC_LINKING_ONLY
 #include "xxhash.h"
 #include <stdlib.h>
 #include <string.h>
@@ -10,12 +11,12 @@
 
 void fp_compute(const char *path, uint64_t dev, uint64_t ino, uint8_t out[FP_SIZE]) {
     XXH3_state_t state;
-    XXH3_128bits_canonical_t canonical;
+    XXH128_canonical_t canonical;
     XXH3_128bits_reset(&state);
     if (path) XXH3_128bits_update(&state, path, strlen(path));
     XXH3_128bits_update(&state, &dev, sizeof(dev));
     XXH3_128bits_update(&state, &ino, sizeof(ino));
-    XXH3_128bits_canonicalFromHash(&canonical, XXH3_128bits_digest(&state));
+    XXH128_canonicalFromHash(&canonical, XXH3_128bits_digest(&state));
     memcpy(out, canonical.digest, FP_SIZE);
 }
 

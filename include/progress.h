@@ -10,6 +10,11 @@
 void record_path(const Config *cfg, RuntimeState *state, const char *path, const struct stat *info);
 void record_skip(const Config *cfg, RuntimeState *state, const SpbinEntry *entry);
 
+/* 批量缓冲 */
+void record_path_batch_init(RecordBatch *batch);
+void record_path_batch_flush(const Config *cfg, RuntimeState *state, RecordBatch *batch);
+bool record_path_batch_append(const Config *cfg, RuntimeState *state, RecordBatch *batch, const char *path, const struct stat *info);
+
 /* 索引与游标 */
 void atomic_update_index(const Config *cfg, RuntimeState *state);
 bool load_progress_index(const Config *cfg, RuntimeState *state);

@@ -9,10 +9,13 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/wait.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <dirent.h>
+
+#define EVENTFD_SLOT_ID 0xFFFFFFFFU
 
 /* ================================================================
  * Batch payload parser
@@ -72,6 +75,119 @@ fail:
 }
 
 /* ================================================================
+ * Thread pool callback: CPU-intensive deduplication
+ * ================================================================ */
+static void batch_dedup_worker(TPBatch *batch, void *user_data) {
+    AppContext *ctx = user_data;
+    for (int i = 0; i < batch->count; i++) {
+        const char *path = batch->paths[i];
+        struct stat *st = &batch->stats[i];
+        uint8_t fp[FP_SIZE];
+        fp_compute(path, st->st_dev, st->st_ino, fp);
+        uint8_t result = 0;
+        if (fp_set_insert(ctx->visited_set, fp)) {
+            result |= 1; /* duplicate */
+        }
+        if (dev_mgr_is_blacklisted(ctx->dev_mgr, st->st_dev)) {
+            result |= 2; /* blacklisted */
+        }
+        batch->results[i] = result;
+    }
+}
+
+/* ================================================================
+ * Side effects for a completed batch (must run on main thread)
+ * ================================================================ */
+static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
+    OutputBatch out_batch = {0};
+    
+    for (int i = 0; i < batch->count; i++) {
+        const char *path = batch->paths[i];
+        struct stat *st = &batch->stats[i];
+        uint8_t result = batch->results[i];
+        
+        if (result & 1) continue; /* duplicate */
+        if (result & 2) {
+            ctx->state.has_error = true;
+            continue; /* blacklisted */
+        }
+        
+        if (S_ISDIR(st->st_mode)) {
+            if (ctx->hist_pump_state == HIST_PUMP_OLD) {
+                fpbin_append(ctx, path, st);
+            } else {
+                atomic_fetch_add(&ctx->pending_tasks, 1);
+                uint32_t plen = (uint32_t)strlen(path);
+                ipc_send(ctx->worker_pool->slots[batch->worker_id].fd_in, IPC_MSG_SCAN, path, plen);
+            }
+            
+            ctx->state.dir_count++;
+            if (ctx->cfg.include_dir) {
+                OutputTask *task = calloc(1, sizeof(OutputTask));
+                task->path = strdup(path);
+                task->st = *st;
+                if (out_batch.tail) {
+                    out_batch.tail->next = task;
+                } else {
+                    out_batch.head = task;
+                }
+                out_batch.tail = task;
+                out_batch.count++;
+            }
+            if (ctx->cfg.print_dir && ctx->state.dir_info_fp) {
+                fprintf(ctx->state.dir_info_fp, "%s%s\n", OUTPUT_DIR_PREFIX, path);
+            }
+            if (ctx->cfg.continue_mode && ctx->hist_pump_state != HIST_PUMP_OLD) {
+                record_path_batch_append(&ctx->cfg, &ctx->state, &ctx->record_batch, path, st);
+            }
+        } else {
+            ctx->state.file_count++;
+            OutputTask *task = calloc(1, sizeof(OutputTask));
+            task->path = strdup(path);
+            task->st = *st;
+            if (out_batch.tail) {
+                out_batch.tail->next = task;
+            } else {
+                out_batch.head = task;
+            }
+            out_batch.tail = task;
+            out_batch.count++;
+            if (ctx->cfg.continue_mode) {
+                record_path_batch_append(&ctx->cfg, &ctx->state, &ctx->record_batch, path, st);
+            }
+        }
+        
+        if (out_batch.count >= ASYNC_BATCH_SIZE) {
+            async_writer_submit_batch(ctx->async_writer, &out_batch);
+            out_batch.head = NULL;
+            out_batch.tail = NULL;
+            out_batch.count = 0;
+        }
+    }
+    
+    if (out_batch.count > 0) {
+        async_writer_submit_batch(ctx->async_writer, &out_batch);
+    }
+    
+    atomic_fetch_sub(&ctx->pending_tasks, 1);
+    ctx->state.total_dequeued_count++;
+    
+    /* 释放 batch 内存 */
+    for (int i = 0; i < batch->count; i++) free(batch->paths[i]);
+    free(batch->paths);
+    free(batch->stats);
+    free(batch->results);
+    free(batch);
+}
+
+static void drain_completed_batches(AppContext *ctx) {
+    TPBatch *batch;
+    while ((batch = thread_pool_poll_completed(ctx->thread_pool)) != NULL) {
+        process_completed_batch(ctx, batch);
+    }
+}
+
+/* ================================================================
  * Main loop: epoll event loop
  * ================================================================ */
 
@@ -92,6 +208,33 @@ void main_loop_run(AppContext *ctx) {
         }
     }
 
+    /* 创建 eventfd 用于线程池完成通知 */
+    ctx->event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (ctx->event_fd < 0) {
+        perror("eventfd");
+        close(ctx->epfd);
+        ctx->epfd = -1;
+        return;
+    }
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.u32 = EVENTFD_SLOT_ID;
+    if (epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, ctx->event_fd, &ev) != 0) {
+        perror("epoll_ctl eventfd");
+    }
+
+    /* 创建线程池 */
+    ctx->thread_pool = thread_pool_create(ctx->cfg.master_threads, ctx->event_fd,
+                                          batch_dedup_worker, ctx);
+    if (!ctx->thread_pool) {
+        fprintf(stderr, "[Fatal] 无法创建线程池\n");
+        close(ctx->event_fd);
+        ctx->event_fd = -1;
+        close(ctx->epfd);
+        ctx->epfd = -1;
+        return;
+    }
+
     struct epoll_event events[64];
     ctx->running = true;
 
@@ -100,6 +243,12 @@ void main_loop_run(AppContext *ctx) {
 
         for (int i = 0; i < nfds; i++) {
             uint32_t slot_id = events[i].data.u32;
+            if (slot_id == EVENTFD_SLOT_ID) {
+                uint64_t n;
+                (void)read(ctx->event_fd, &n, sizeof(n));
+                drain_completed_batches(ctx);
+                continue;
+            }
             if (slot_id >= (uint32_t)ctx->worker_pool->num_workers) continue;
 
             IpcMessageHeader hdr;
@@ -156,6 +305,9 @@ void main_loop_run(AppContext *ctx) {
             free(payload);
         }
 
+        /* Drain any completed batches before checking termination */
+        drain_completed_batches(ctx);
+
         /* Monitor routines */
         monitor_check_timeouts(ctx);
         monitor_dispatch_probes(ctx);
@@ -199,6 +351,11 @@ void main_loop_run(AppContext *ctx) {
         }
     }
 
+    /* 退出前刷出所有已完成的 batch */
+    drain_completed_batches(ctx);
+    /* 刷出残留的 record_path 缓冲 */
+    record_path_batch_flush(&ctx->cfg, &ctx->state, &ctx->record_batch);
+
     close(ctx->epfd);
     ctx->epfd = -1;
 }
@@ -208,61 +365,36 @@ void main_loop_run(AppContext *ctx) {
  * ================================================================ */
 
 void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload, uint32_t len) {
-    (void)worker_id;
-    ParsedBatch batch;
-    if (!parse_batch(payload, len, &batch)) return;
+    ParsedBatch parsed;
+    if (!parse_batch(payload, len, &parsed)) return;
 
-    for (int i = 0; i < batch.count; i++) {
-        const char *path = batch.paths[i];
-        struct stat *st = &batch.stats[i];
-
-        /* Compute fingerprint and check visited set */
-        uint8_t fp[FP_SIZE];
-        fp_compute(path, st->st_dev, st->st_ino, fp);
-        if (fp_set_insert(ctx->visited_set, fp)) {
-            continue; /* already visited */
-        }
-
-        /* Device blacklist check */
-        if (dev_mgr_is_blacklisted(ctx->dev_mgr, st->st_dev)) {
-            ctx->state.has_error = true;
-            continue;
-        }
-
-        if (S_ISDIR(st->st_mode)) {
-            if (ctx->hist_pump_state == HIST_PUMP_OLD) {
-                /* Recovery pumping old pbin: new sub-dirs go to fpbin Cache */
-                fpbin_append(ctx, path, st);
-            } else {
-                /* Normal dispatch */
-                atomic_fetch_add(&ctx->pending_tasks, 1);
-                uint32_t plen = (uint32_t)strlen(path);
-                ipc_send(ctx->worker_pool->slots[worker_id].fd_in, IPC_MSG_SCAN, path, plen);
-            }
-
-            ctx->state.dir_count++;
-            if (ctx->cfg.include_dir) {
-                async_writer_submit(ctx->async_writer, path, st);
-            }
-            if (ctx->cfg.print_dir && ctx->state.dir_info_fp) {
-                fprintf(ctx->state.dir_info_fp, "%s%s\n", OUTPUT_DIR_PREFIX, path);
-            }
-            if (ctx->cfg.continue_mode && ctx->hist_pump_state != HIST_PUMP_OLD) {
-                /* In HIST_PUMP_OLD, dirs go to fpbin; don't record to pbin yet */
-                record_path(&ctx->cfg, &ctx->state, path, st);
-            }
-        } else {
-            ctx->state.file_count++;
-            async_writer_submit(ctx->async_writer, path, st);
-            if (ctx->cfg.continue_mode) {
-                record_path(&ctx->cfg, &ctx->state, path, st);
-            }
-        }
+    uint8_t *results = calloc((size_t)parsed.count, 1);
+    if (!results) {
+        parsed_batch_free(&parsed);
+        return;
     }
 
-    atomic_fetch_sub(&ctx->pending_tasks, 1);
-    ctx->state.total_dequeued_count++;
-    parsed_batch_free(&batch);
+    TPBatch *batch = malloc(sizeof(TPBatch));
+    if (!batch) {
+        free(results);
+        parsed_batch_free(&parsed);
+        return;
+    }
+    batch->paths = parsed.paths;
+    batch->stats = parsed.stats;
+    batch->count = parsed.count;
+    batch->results = results;
+    batch->worker_id = worker_id;
+
+    /* 尝试提交到线程池 */
+    if (thread_pool_submit(ctx->thread_pool, batch)) {
+        /* 提交成功，ParsedBatch 内存所有权转移给 batch */
+        return;
+    }
+
+    /* 队列满，降级为同步处理 */
+    batch_dedup_worker(batch, ctx);
+    process_completed_batch(ctx, batch);
 }
 
 void main_loop_handle_heartbeat(AppContext *ctx, int worker_id, uint64_t timestamp) {
@@ -400,5 +532,3 @@ void monitor_reap_probes(AppContext *ctx) {
     g_probe_pid = -1;
     g_probe_dev = 0;
 }
-
-

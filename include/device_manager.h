@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <time.h>
 #include <pthread.h>
 #include <stdatomic.h>

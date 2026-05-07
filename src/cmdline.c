@@ -24,6 +24,7 @@ void show_help() {
     printf("      --skip-interval=秒 设置半增量扫描的时间阈值 (默认: 0)\n");
     printf("      --batch-size=数量  Worker batch 大小 (默认: %d)\n", DEFAULT_BATCH_SIZE);
     printf("      --estimated-files=数量 预估文件数,用于预分配内存 (默认: %u)\n", (unsigned)DEFAULT_ESTIMATED_FILES);
+    printf("      --master-threads=数量  Master 去重线程数 (默认: %d)\n", DEFAULT_MASTER_THREADS);
     printf("  -t, --timeout=秒       心跳超时时间 (默认: %d)\n", HEARTBEAT_TIMEOUT_SEC);
     printf("\n输出控制:\n");
     printf("  -f, --progress-file=文件 进度文件/历史记录前缀 (默认: progress)\n");
@@ -72,6 +73,7 @@ void init_config(Config *cfg) {
     cfg->heartbeat_timeout = HEARTBEAT_TIMEOUT_SEC;
     cfg->batch_size = DEFAULT_BATCH_SIZE;
     cfg->estimated_files = DEFAULT_ESTIMATED_FILES;
+    cfg->master_threads = DEFAULT_MASTER_THREADS;
 }
 
 int parse_arguments(int argc, char *argv[], Config *cfg) {
@@ -109,6 +111,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"csv", no_argument, 0, 22},
         {"batch-size", required_argument, 0, 23},
         {"estimated-files", required_argument, 0, 24},
+        {"master-threads", required_argument, 0, 25},
         {"timeout", required_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
@@ -186,6 +189,10 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 24:
                 cfg->estimated_files = atol(optarg);
                 if (cfg->estimated_files == 0) cfg->estimated_files = DEFAULT_ESTIMATED_FILES;
+                break;
+            case 25:
+                cfg->master_threads = atoi(optarg);
+                if (cfg->master_threads < 1) cfg->master_threads = DEFAULT_MASTER_THREADS;
                 break;
             case 't':
                 cfg->heartbeat_timeout = atol(optarg);
