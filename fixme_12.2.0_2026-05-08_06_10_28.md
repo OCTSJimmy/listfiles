@@ -202,7 +202,39 @@ Worker 收到 IPC_MSG_SCAN(dir_path)
 | 4. `visited_set` 加载与 `.idx` 不同步 | P1 | 恢复缺陷：重复扫描的根源 |
 | 5. Batch flush 与 idx 原子性缺口 | P2 | 一致性风险：stdio 缓冲导致 pbin 与 idx 不一致 |
 
+## 6. [中] Monitor 模块从线程模型遗留代码中恢复并适配进程模型
+
+- **优先级**: P1
+- **影响模块**: `monitor.h`, `monitor.c`, `main_loop.c`, `main.c`, `probe_scheduler.h/c`
+- **根因分析**:
+  1. 从 12.0.0 线程模型重构为进程模型时，`src/monitor.c` 被整体移入 `.bak`，`include/monitor.h` 中基于 `pthread_t` 的 `WorkerHeartbeat` 注册机制在进程模型下完全失效。
+  2. 监控功能被临时内联到 `main_loop.c` 中（`monitor_check_timeouts`/`dispatch_probes`/`reap_probes`），导致主循环同时承担 IPC 消息处理和监控巡检双重职责。
+  3. 内联监控使用全局静态变量 `g_probe_pid`/`g_probe_dev`，无法支持未来多 probe 并发扩展。
+- **已完成的修复**:
+  1. **重写 `monitor.h`**：移除 `WorkerHeartbeat` 注册/注销机制，改为 `Monitor` 结构体直接持有 `AppContext*` 指针，通过遍历 `WorkerPool->slots` 获取 Worker 状态。
+  2. **新建 `src/monitor.c`**：恢复独立的监控线程，职责包括：
+     - `print_progress()`：每 500ms 输出统计面板（运行时间、Worker 活跃度、吞吐速率、进度、设备状态）到 `stderr`
+     - `check_workers_health()`：每秒检查 Worker 心跳超时，直接 kill + 标记 `pid=-1`
+     - `dispatch_probes()` / `reap_probes()`：fork 敢死队探测 + waitpid 收割（逻辑从 `main_loop.c` 迁移）
+  3. **`ProbeScheduler` 线程安全化**：增加 `pthread_mutex_t`，使 `main_loop_handle_error`（主循环 push 探测任务）与监控线程（peek/remove 调度探测）可并发访问。
+  4. **`main_loop.c` 减负**：移除内联的 `monitor_*` 函数和全局变量，主循环专注处理 IPC 消息。
+  5. **`AppContext` 结构体命名**：给匿名 `struct` 加上 `AppContext` 标签，修复 `monitor.h` 前向声明与 typedef 的类型不匹配。
+- **涉及文件**: `include/monitor.h`, `src/monitor.c`, `src/main_loop.c`, `src/main.c`, `include/app_context.h`, `include/probe_scheduler.h`, `src/probe_scheduler.c`
+
+---
+
+## 总结
+
+| 问题 | 优先级 | 本质 |
+|------|--------|------|
+| 1. 僵尸 `process_slice_index` / 缺乏多级游标 | P0 | 架构缺陷：只有一级游标，无法区分"已发送/已处理/已持久化" |
+| 2. `.idx` 更新频率过低 | P0 | 工程缺陷：崩溃恢复时真空带可达 10 万+ 条记录 |
+| 3. `process`/`write` 硬绑定 | P1 | 语义混乱：字段存在但无独立语义 |
+| 4. `visited_set` 加载与 `.idx` 不同步 | P1 | 恢复缺陷：重复扫描的根源 |
+| 5. Batch flush 与 idx 原子性缺口 | P2 | 一致性风险：stdio 缓冲导致 pbin 与 idx 不一致 |
+| 6. Monitor 模块半废弃 | P1 | 架构债务：线程模型遗留代码未适配进程模型 |
+
 **建议修复顺序**:
 1. **立即（P0）**: 如果短期内不做架构改造，至少应删除 `process_slice_index` 避免误导，并在 `record_path_batch_flush()` 后强制调用 `atomic_update_index()`，将真空带从 10 万条降低到 4096 条。
-2. **本周（P0）**: 设计并实施三级游标（或至少两级：Process + Persist），这是断点续传功能"可用"与"可靠"的分水岭。
-3. **下次迭代（P1-P2）**: 修复 flush 原子性和 `visited_set` 加载策略。
+2. **本周（P0）**: 设计并实施两级游标（Process + Persist），这是断点续传功能"可用"与"可靠"的分水岭。
+3. **下次迭代（P1-P2）**: 修复 flush 原子性、`visited_set` 加载策略、Monitor 面板输出格式自定义支持。

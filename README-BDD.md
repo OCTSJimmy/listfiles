@@ -563,6 +563,72 @@ Feature: 分片输出
 
 ## 8. 监控与诊断 (Monitoring & Diagnostics)
 
+### Feature: 独立监控线程
+
+```gherkin
+Feature: 独立监控线程
+  As a 系统管理员
+  I want 通过独立线程持续监控扫描状态
+  So that 主循环专注处理 IPC 消息，不被监控逻辑干扰
+
+  Background:
+    Given 系统为进程模型（fork + pipe + epoll）
+    And Monitor 是独立的 pthread 线程
+
+  Scenario: 监控线程启动
+    Given 程序初始化完成
+    When Master 启动 epoll 主循环前
+    Then 应该创建 Monitor 线程
+    And Monitor 线程持有 AppContext 指针（只读 + 有限写）
+
+  Scenario: 监控线程主循环
+    Given Monitor 线程正在运行
+    When 每 500ms 触发一次循环
+    Then 应该调用 print_progress() 输出统计面板
+    And 每秒触发一次 check_workers_health()
+    And 每秒触发一次 dispatch_probes()
+    And 每轮触发一次 reap_probes()
+
+  Scenario: 静默模式下监控线程仍输出面板到文件
+    Given 用户指定了 -M (--mute)
+    When Monitor 线程执行 print_progress()
+    Then 仍然向 stderr 输出统计面板
+    And 不输出到 stdout（避免污染管道数据）
+```
+
+### Feature: 统计面板输出
+
+```gherkin
+Feature: 统计面板输出
+  As a 系统管理员
+  I want 在终端实时查看扫描进度和系统状态
+  So that 及时发现性能瓶颈和设备异常
+
+  Scenario: 终端环境下的 ANSI 清屏面板
+    Given stderr 是终端（isatty）
+    When Monitor 线程输出统计面板
+    Then 应该先发送 ANSI 清屏序列（\033[2J\033[H）
+    And 显示运行时间、Worker 活跃度、待处理任务数
+    And 显示目录速率、文件速率、消费速率（当前值 + 历史最大值）
+    And 显示已扫描目录数、文件数、当前输出分片
+    And 显示死设备数和判死设备数（如果有）
+
+  Scenario: 非终端环境下的顺序输出
+    Given stderr 被重定向到文件
+    When Monitor 线程输出统计面板
+    Then 不发送 ANSI 控制序列
+    And 以纯文本格式顺序追加输出
+
+  Scenario: 统计采样与滑动窗口速率计算
+    Given 扫描正在进行
+    When Monitor 每秒采集一次统计快照
+    Then 记录当前 dir_count、file_count、dequeued_count
+    And 存入 60 秒环形缓冲区
+    And 计算滑动窗口内的平均速率
+    And 更新 current_dir_rate、current_file_rate、current_dequeue_rate
+    And 如果当前速率超过历史最大值，更新 max 记录
+```
+
 ### Feature: Worker 心跳监控
 
 ```gherkin
@@ -577,29 +643,42 @@ Feature: Worker 心跳监控
     When Worker 发送 IPC_MSG_HEARTBEAT
     Then Master 更新该 slot 的 last_heartbeat 时间戳
 
-  Scenario: Worker 心跳超时
+  Scenario: Worker 心跳超时（Monitor 线程检测）
     Given Worker 因 D-State 阻塞无法发送心跳
     And 当前时间 - last_heartbeat > heartbeat_timeout（默认30秒）
-    When Monitor 巡检线程检查超时
+    When Monitor 线程的 check_workers_health() 执行
     Then 判定该 Worker 卡死
     And 发送 SIGKILL 强制终止
-    And 启动替换 Worker
+    And 以 WNOHANG 方式 reap 僵尸进程
+    And 标记 slot->is_alive = false, slot->pid = -1
+    And WorkerPool->active_count 递减
+    And 主循环的 "Replace dead workers" 段检测到 pid=-1 后启动替换 Worker
 ```
 
-### Feature: 实时统计与速率计算
+### Feature: 敢死队探测调度与收割
 
 ```gherkin
-Feature: 实时统计与速率计算
+Feature: 敢死队探测调度与收割
   As a 系统管理员
-  I want 了解扫描的实时进度和速率
-  So that 评估任务完成时间和系统负载
+  I want 监控线程自动调度设备探测并收割结果
+  So that 主循环无需关心探测生命周期
 
-  Scenario: 每秒采样速率
-    Given 扫描正在进行
-    When Monitor 每秒采集一次统计快照
-    Then 记录当前 dir_count、file_count、dequeued_count
-    And 计算最近 60 秒滑动窗口内的平均速率
-    And 更新 current_dir_rate、current_file_rate
+  Scenario: 监控线程调度探测
+    Given 探测调度器中有到期的探测任务
+    And 当前没有活跃的探测进程
+    When Monitor 线程执行 dispatch_probes()
+    Then 从 ProbeScheduler 取出到期任务
+    And fork 敢死队子进程执行 lstat(probe_path)
+    And 子进程设置 alarm(PROBE_TIMEOUT_SEC)
+    And 记录活跃探测 pid 和 dev 到 Monitor 结构体
+
+  Scenario: 监控线程收割探测
+    Given 有一个活跃的探测子进程
+    When Monitor 线程执行 reap_probes()
+    Then 以 WNOHANG 方式 waitpid 检查子进程状态
+    And 如果子进程正常退出，标记设备为 ALIVE 并重入队积压目录
+    And 如果子进程被杀死，重新将探测任务推入 ProbeScheduler
+    And 清除 Monitor 中的活跃探测记录
 ```
 
 ---

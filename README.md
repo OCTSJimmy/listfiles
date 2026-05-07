@@ -155,7 +155,9 @@ Master 内部另设 **`ThreadPool`**（默认 4 线程），通过 `mutex + cond
 
 `AsyncWorker` 输出线程采用批量提交（攒 256 条记录一次性入队），将锁竞争降至 1/256。
 
-所有诊断信息（`[System]` 消息、设备熔断日志等）统一输出到 **stderr**；扫描数据输出到 **stdout** 或 `-o` / `-O` 指定的文件，便于管道处理。
+**`Monitor`** 是独立的监控线程，每 500ms 刷新一次统计面板（输出到 **stderr**），内容包括：运行时间、活跃 Worker 数、待处理任务数、目录/文件/消费速率、输出进度、设备状态（死设备/判死设备数）、探测状态等。监控线程同时负责 Worker 心跳超时检查和敢死队探测的调度与收割，使主循环专注处理 IPC 消息。
+
+所有诊断信息（`[System]` 消息、设备熔断日志、监控面板等）统一输出到 **stderr**；扫描数据输出到 **stdout** 或 `-o` / `-O` 指定的文件，便于管道处理。
 
 ### 核心模块
 
@@ -170,6 +172,7 @@ Master 内部另设 **`ThreadPool`**（默认 4 线程），通过 `mutex + cond
 | `MainLoop` | `epoll_wait` 循环：处理 `BATCH` / `HEARTBEAT` / `ERROR` / `EXIT` 消息 |
 | `ThreadPool` | Master 内嵌 CPU 去重线程池（`mutex + cond + eventfd`），处理指纹计算与黑名单检查 |
 | `AsyncWorker` | 独立输出线程，接收主循环批量提交的任务，格式化并写入文件 |
+| `Monitor` | 独立监控线程：统计面板输出、Worker 心跳超时检查、敢死队探测调度与收割 |
 | `Progress` | pbin（已处理记录）/ spbin（跳过记录）的写入、归档、恢复 |
 
 ### 分片生命周期与恢复机制

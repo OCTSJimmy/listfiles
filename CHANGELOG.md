@@ -4,6 +4,40 @@
 
 ---
 
+## [Unreleased]
+
+### 架构修复：Monitor 模块从线程模型恢复并适配进程模型
+
+**问题背景**：12.0.0 从线程模型重构为进程模型时，`src/monitor.c` 被整体移入 `.bak`，监控功能被临时内联到 `main_loop.c` 中。这导致：
+1. `include/monitor.h` 中基于 `pthread_t` 的 `WorkerHeartbeat` 注册机制完全失效；
+2. 主循环同时承担 IPC 消息处理和监控巡检双重职责；
+3. 监控面板（统计输出）功能完全丢失。
+
+#### 修复
+
+- **Monitor 模块恢复**：
+  - 重写 `include/monitor.h`：移除 `WorkerHeartbeat` 注册机制，改为直接读取 `WorkerPool->slots`。
+  - 新建 `src/monitor.c`：独立的监控线程，每 500ms 刷新统计面板到 `stderr`（运行时间、Worker 活跃度、吞吐速率、进度、设备状态）。
+  - 面板使用 ANSI 清屏（终端环境下），非终端环境下顺序输出。
+- **监控线程职责分离**：
+  - 心跳超时检查：每秒遍历 `WorkerPool`，kill 超时 Worker 并标记 `pid=-1`。
+  - 敢死队探测调度/收割：fork 子进程探测死设备，waitpid 收割并恢复或重调度。
+  - 主循环 (`main_loop.c`) 专注处理 IPC 消息，不再内联监控逻辑。
+- **`ProbeScheduler` 线程安全化**：增加 `pthread_mutex_t`，支持主循环（push 探测任务）与监控线程（peek/remove 调度探测）并发访问。
+- **`AppContext` 结构体命名**：给匿名 `struct` 加上 `AppContext` 标签，修复 `monitor.h` 前向声明与 typedef 的类型不匹配。
+
+#### 修改的文件
+
+- `include/monitor.h`
+- `src/monitor.c`（新建）
+- `src/main_loop.c`
+- `src/main.c`
+- `include/app_context.h`
+- `include/probe_scheduler.h`
+- `src/probe_scheduler.c`
+
+---
+
 ## [12.2.1] - 2026-05-07
 
 ### 紧急修复与稳定性增强
