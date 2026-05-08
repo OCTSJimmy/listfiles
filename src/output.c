@@ -1,3 +1,15 @@
+/**
+ * @file output.c
+ * @brief 格式化输出引擎
+ *
+ * 负责将扫描结果按照用户指定的格式（自定义格式串、CSV、或动态元数据开关）
+ * 格式化并写入输出流。包含以下核心能力：
+ * - 格式预编译：将 "%p|%s|%u" 等格式模板解析为 FormatSegment 数组，避免运行时重复解析
+ * - CSV/RFC 4180 转义：自动处理字段内的双引号
+ * - 用户/组名缓存：基于 UID/GID 的哈希链表缓存，减少重复 getpwuid/getgrgid 调用
+ * - lsattr 扩展属性探测：通过 ioctl(FS_IOC_GETFLAGS) 获取文件属性字符串
+ * - 输出分片：按行数自动切分输出文件（output_split_dir 模式）
+ */
 #include "output.h"
 #include "utils.h"
 #include <stdio.h>
@@ -13,7 +25,15 @@
 #include <linux/fs.h>
 #include <sys/stat.h>
 
-// 辅助函数：将 st_mode 转换为 ls -l 格式的字符串
+/**
+ * @brief  将 st_mode 转换为 ls -l 格式的权限字符串
+ * @param  mode  mode_t  文件模式位，取值范围: 任意有效的 st_mode 值
+ * @param  buf   char*   输出缓冲区，长度至少为 11 字节（10 个字符 + '\0'），不能为空
+ * @return void
+ *
+ * @note   输出格式示例："-rw-r--r--"、"drwxr-xr-x"、"lrwxrwxrwx"。
+ *         特殊位（SUID/SGID/Sticky）显示为 s/S、t/T。
+ */
 void format_mode_str(mode_t mode, char *buf) {
     strcpy(buf, "----------");
     const char chars[] = "rwxrwxrwx";
@@ -34,15 +54,18 @@ void format_mode_str(mode_t mode, char *buf) {
     if (mode & S_ISVTX) buf[9] = (mode & S_IXOTH) ? 't' : 'T';
     buf[10] = '\0';
 }
-// =======================================================
-// lsattr 探测与缓存 (基于 RuntimeState)
-// =======================================================
 
-// ==========================================
-// 2. 格式化核心
-// ==========================================
+/* =======================================================
+ * lsattr 探测与缓存 (基于 RuntimeState)
+ * ======================================================= */
 
-// [新增] 辅助：获取文件类型字符串
+/**
+ * @brief  获取文件类型字符串
+ * @param  mode  mode_t  文件模式位
+ * @return const char*  文件类型描述字符串，如 "FILE"、"DIR"、"LINK"、"UNKNOWN" 等
+ *
+ * @note   根据 S_ISREG/S_ISDIR/S_ISLNK 等宏判断，未知类型返回 "UNKNOWN"。
+ */
 static const char* get_type_str(mode_t mode) {
     if (S_ISREG(mode)) return "FILE";
     if (S_ISDIR(mode)) return "DIR";
@@ -54,8 +77,15 @@ static const char* get_type_str(mode_t mode) {
     return "UNKNOWN";
 }
 
-// [新增] 辅助：打印 CSV 字段 (RFC 4180)
-// 规则：始终用双引号包裹，内容中的双引号替换为两个双引号
+/**
+ * @brief  按 RFC 4180 标准打印 CSV 字段（始终用双引号包裹）
+ * @param  fp   FILE*       输出文件指针，不能为空
+ * @param  str  const char* 要输出的字符串，允许为 NULL（按空串处理）
+ * @return void
+ *
+ * @note   规则：字段整体用双引号包裹，内容中的每个双引号替换为两个双引号。
+ *         示例：输入 `He said "hi"` → 输出 `"He said ""hi"""`。
+ */
 static void print_csv_field(FILE *fp, const char *str) {
     fputc('"', fp);
     while (*str) {
@@ -68,7 +98,15 @@ static void print_csv_field(FILE *fp, const char *str) {
     fputc('"', fp);
 }
 
-// 查找设备状态 (线程安全)
+/**
+ * @brief  从设备缓存中查找指定设备的状态（线程安全）
+ * @param  dev    dev_t          设备号
+ * @param  state  RuntimeState*  运行时状态指针，不能为空
+ * @return DeviceStatus  设备状态，取值范围: {DEV_STATUS_UNKNOWN, DEV_STATUS_SUPPORTED, DEV_STATUS_UNSUPPORTED}
+ *
+ * @note   内部加锁遍历 dev_cache 数组，时间复杂度 O(MAX_DEV_CACHE)。
+ *         未找到时返回 DEV_STATUS_UNKNOWN。
+ */
 static DeviceStatus get_device_status(dev_t dev, RuntimeState *state) {
     DeviceStatus status = DEV_STATUS_UNKNOWN;
     
@@ -84,7 +122,17 @@ static DeviceStatus get_device_status(dev_t dev, RuntimeState *state) {
     return status;
 }
 
-// 更新设备状态 (线程安全)
+/**
+ * @brief  更新或新增设备状态到缓存（线程安全）
+ * @param  dev     dev_t          设备号
+ * @param  status  DeviceStatus   新的设备状态
+ * @param  state   RuntimeState*  运行时状态指针，不能为空
+ * @return void
+ *
+ * @note   采用双重检查模式：加锁后再次查找，若已存在则更新；
+ *         若不存在且缓存未满，则追加新条目。
+ *         缓存上限为 MAX_DEV_CACHE（64），超出时静默丢弃。
+ */
 static void set_device_status(dev_t dev, DeviceStatus status, RuntimeState *state) {
     pthread_mutex_lock(&state->dev_cache_mutex);
     
@@ -106,7 +154,24 @@ static void set_device_status(dev_t dev, DeviceStatus status, RuntimeState *stat
     pthread_mutex_unlock(&state->dev_cache_mutex);
 }
 
-// 获取 lsattr 字符串 (传入 state)
+/**
+ * @brief  获取文件的 lsattr 扩展属性字符串
+ * @param  state  RuntimeState*       运行时状态指针，不能为空
+ * @param  path   const char*         文件路径，不能为空
+ * @param  info   const struct stat*  文件 stat 信息指针，不能为空（用于获取设备号）
+ * @param  buf    char*               输出缓冲区，长度至少为 16 字节，不能为空
+ * @return void
+ *
+ * @note   流程：
+ *         1. 检查设备缓存：若已知不支持则直接返回 "[unsupported]"
+ *         2. 尝试 open(O_RDONLY | O_NONBLOCK) 获取 fd
+ *         3. 尝试 ioctl(fd, FS_IOC_GETFLAGS, &flags)
+ *            - 成功：解析 flags 为 16 字符属性串（如 "-------------e--"）
+ *            - 失败且 errno 为 ENOTTY/EOPNOTSUPP：标记设备为不支持
+ *            - 其他错误：返回 "[ioctl_error]"
+ *         4. 关闭 fd
+ *         该操作涉及系统调用，性能开销较大，仅在用户指定 --xattr 或格式串含 %%X 时执行。
+ */
 static void get_xattr_str(RuntimeState *state, const char *path, const struct stat *info, char *buf) {
     // 1. 检查设备缓存
     DeviceStatus ds = get_device_status(info->st_dev, state);
@@ -163,8 +228,17 @@ static void get_xattr_str(RuntimeState *state, const char *path, const struct st
     close(fd);
 }
 
-// 获取用户名(哈希表实现)
-const char *get_username( RuntimeState *state, uid_t uid) {
+/**
+ * @brief  获取用户名（含 UID 缓存哈希表）
+ * @param  state  RuntimeState*  运行时状态指针，不能为空
+ * @param  uid    uid_t          用户 ID，取值范围: 任意有效 Linux UID
+ * @return const char*  格式化后的用户名字符串，如 "root(0)" 或 "1005"
+ *
+ * @note   使用哈希链表缓存（桶数 UID_CACHE_SIZE=4096），缓存命中时 O(1) 返回。
+ *         缓存未命中时调用 getpwuid 查询系统，格式化为 "name(uid)" 或纯数字 UID。
+ *         返回的指针指向缓存节点，无需释放，但生命周期与 RuntimeState 一致。
+ */
+const char *get_username(RuntimeState *state, uid_t uid) {
     // 计算哈希桶索引
     unsigned bucket = uid % UID_CACHE_SIZE;
     
@@ -203,7 +277,15 @@ const char *get_username( RuntimeState *state, uid_t uid) {
     return new_entry->name;
 }
 
-// 获取组名(哈希表实现)
+/**
+ * @brief  获取组名（含 GID 缓存哈希表）
+ * @param  state  RuntimeState*  运行时状态指针，不能为空
+ * @param  gid    gid_t          组 ID，取值范围: 任意有效 Linux GID
+ * @return const char*  格式化后的组名字符串，如 "root(0)" 或 "1005"
+ *
+ * @note   逻辑与 get_username 完全相同，使用 GID_CACHE_SIZE=4096 的哈希链表缓存。
+ *         缓存未命中时调用 getgrgid 查询系统。
+ */
 const char *get_groupname(RuntimeState *state, gid_t gid) {
     // 计算哈希桶索引
     unsigned bucket = gid % GID_CACHE_SIZE;
@@ -242,9 +324,15 @@ const char *get_groupname(RuntimeState *state, gid_t gid) {
     return new_entry->name;
 }
 
-/**********************
- * 格式清理函数
- **********************/
+/**
+ * @brief  清理预编译的格式数组并释放内存
+ * @param  cfg  Config*  指向配置结构体的指针，不能为空
+ * @return void
+ *
+ * @note   释放 compiled_format 数组中所有 FMT_TEXT 类型的 text 字符串，
+ *         然后释放 compiled_format 数组本身，最后清零相关字段。
+ *         通常在程序退出前或重新预编译格式时调用。
+ */
 void cleanup_compiled_format(Config *cfg) {
     if (!cfg->compiled_format) return;
     
@@ -258,9 +346,18 @@ void cleanup_compiled_format(Config *cfg) {
     cfg->format_segment_count = 0;
 }
 
-/**********************
- * 格式预编译实现
- **********************/
+/**
+ * @brief  预编译输出格式模板
+ * @param  cfg  Config*  指向配置结构体的指针，不能为空
+ * @return void
+ *
+ * @note   根据 cfg->csv、cfg->format 以及元数据开关（--size、--user 等）
+ *         生成 compiled_format 数组：
+ *         - CSV 模式默认格式："%%i,%%p,%%s,%%u,%%g,%%U,%%G,%%o,%%O,%%t,%%m,%%c"
+ *         - 无格式串时根据元数据开关动态构建默认文本格式
+ *         - 无任何开关时默认输出：path|size|mtime
+ *         预编译后 print_to_stream 可直接遍历数组输出，无需运行时解析格式字符串。
+ */
 void precompile_format(Config *cfg) {
     const char *fmt = cfg->format;
     
@@ -350,7 +447,11 @@ void precompile_format(Config *cfg) {
     cfg->format_segment_count = count;
 }
 
-// 在创建新输出文件或切换切片时加锁
+/**
+ * @brief  创建输出文件
+ * @param  path  const char*  输出文件路径，不能为空
+ * @return FILE*  成功返回打开的文件指针；失败返回 NULL
+ */
 FILE* create_output_file(const char *path) {
     FILE *fp = fopen(path, "w");
     if (!fp) {
@@ -360,13 +461,30 @@ FILE* create_output_file(const char *path) {
     return fp;
 }
 
-// 关闭文件前解锁(或依赖自动解锁,显式解锁更安全)
+/**
+ * @brief  关闭输出文件
+ * @param  fp  FILE*  要关闭的文件指针，允许传入 NULL、stdout 或 stderr（空操作）
+ * @return void
+ */
 void close_output_file(FILE *fp) {
     if (!fp || fp == stdout || fp == stderr) return;
     fclose(fp);
 }
 
-// 新增输出文件管理函数
+/**
+ * @brief  初始化所有输出文件和流
+ * @param  cfg    const Config*  全局配置指针，不能为空
+ * @param  state  RuntimeState*  运行时状态指针，不能为空
+ * @return void
+ *
+ * @note   根据配置选择三种输出模式之一：
+ *         - 分片目录模式（-O）：创建目录并按 PROGRESS_SLICE_FORMAT 命名切片文件
+ *         - 单文件模式（-o）：直接打开指定文件
+ *         - 标准输出模式（默认）：output_fp = stdout
+ *         同时处理 --print-dir 的目录信息输出流：
+ *         若数据走文件，目录流走伴生文件；若数据走 stdout，目录流走 stderr。
+ *         所有文件流均启用大块全缓冲（8MB/1MB）。
+ */
 void init_output_files(const Config *cfg, RuntimeState *state) {
     // 1. 初始化计数器和状态
     state->output_line_count = 0;
@@ -435,6 +553,16 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
     }
 }
 
+/**
+ * @brief  执行输出切片轮转（关闭当前切片并创建新文件）
+ * @param  cfg    const Config*  全局配置指针，不能为空
+ * @param  state  RuntimeState*  运行时状态指针，不能为空
+ * @return void
+ *
+ * @note   仅在 is_output_split_dir 模式下生效。
+ *         递增 output_slice_num，按 OUTPUT_SLICE_FORMAT 生成新文件名。
+ *         若创建新文件失败则调用 perror 并 exit(EXIT_FAILURE)。
+ */
 void rotate_output_slice(const Config *cfg, RuntimeState *state) {
     if (!cfg->is_output_split_dir) return;
     verbose_printf(cfg, 1,"切换输出切片文件\n");
@@ -462,14 +590,23 @@ void rotate_output_slice(const Config *cfg, RuntimeState *state) {
     state->output_line_count = 0;
 }
 
-// 兼容旧接口的占位函数
-// void format_output(const Config *cfg, RuntimeState *state, const char *path, const struct stat *st, char *buffer, size_t size) {
-    // 实际逻辑已移至 print_to_stream
-    // if (size > 0) buffer[0] = '\0';
-// }
-
-// 直接输出到流 (性能更高)
-// 直接输出到流
+/**
+ * @brief  将单个文件记录格式化并输出到指定流
+ * @param  cfg    const Config*       全局配置指针，不能为空
+ * @param  state  RuntimeState*       运行时状态指针，不能为空（用于用户名/组名/扩展属性缓存）
+ * @param  path   const char*         文件路径，不能为空
+ * @param  st     const struct stat*  文件 stat 信息指针，不能为空
+ * @param  fp     FILE*               目标输出流指针，不能为空
+ * @return void
+ *
+ * @note   遍历预编译的 compiled_format 数组，根据每个 FormatSegment 的类型生成对应字段：
+ *         - FMT_TEXT: 原样输出文本
+ *         - FMT_PATH/FMT_SIZE/FMT_USER/...: 调用对应生成函数
+ *         - CSV 模式下所有字段通过 print_csv_field 输出（自动转义）
+ *         - quote 模式下用双引号包裹字段
+ *         每行末尾输出换行符 '\n'。
+ *         使用栈缓冲区 temp_buf 避免频繁堆分配。
+ */
 void print_to_stream(const Config *cfg, RuntimeState *state, const char *path, const struct stat *st, FILE *fp) {
     char temp_buf[MAX_PATH_LENGTH]; // 通用缓冲区
 
@@ -516,7 +653,15 @@ void print_to_stream(const Config *cfg, RuntimeState *state, const char *path, c
     fputc('\n', fp);
 }
 
-// 清理缓存
+/**
+ * @brief  清理 UID/GID 缓存哈希表并释放所有节点内存
+ * @param  state  RuntimeState*  运行时状态指针，不能为空
+ * @return void
+ *
+ * @note   遍历 UID_CACHE_SIZE 和 GID_CACHE_SIZE 个哈希桶，
+ *         释放桶内链表的所有节点及其 name 字符串。
+ *         通常在程序退出前调用。
+ */
 void cleanup_cache(RuntimeState *state) {
     for (int i = 0; i < UID_CACHE_SIZE; i++) {
         UserCacheEntry *entry = state->uid_cache[i];

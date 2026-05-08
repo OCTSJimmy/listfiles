@@ -1,3 +1,12 @@
+/**
+ * @file main.c
+ * @brief listfiles 程序主入口
+ *
+ * 负责全局初始化、命令行解析、资源分配、工作流编排与最终清理。
+ * 主要流程：初始化 AppContext → 解析参数 → 加载历史配置 → 确认任务 →
+ * 创建设备管理器/输出句柄/异步写线程/Worker 池/探测调度器/监控线程 →
+ * 恢复进度（如有）→ 发送根任务 → 运行 epoll 主循环 → 停止监控 → 归档清理 → 释放资源。
+ */
 #define _GNU_SOURCE
 #include "config.h"
 #include "cmdline.h"
@@ -15,6 +24,15 @@
 #include <stdatomic.h>
 #include <sys/sysinfo.h>
 
+/**
+ * @brief  初始化 AppContext 结构体
+ * @param  ctx  AppContext*  指向要初始化的应用上下文指针，不能为空
+ * @return void
+ *
+ * @note   将结构体内存清零，设置 epfd 和 event_fd 为 -1，
+ *         初始化原子计数器 pending_tasks/pending_batches 为 0，
+ *         初始化 record_batch 批量缓冲。
+ */
 static void app_context_init(AppContext *ctx) {
     memset(ctx, 0, sizeof(AppContext));
     ctx->epfd = -1;
@@ -27,6 +45,16 @@ static void app_context_init(AppContext *ctx) {
     record_path_batch_init(&ctx->record_batch);
 }
 
+/**
+ * @brief  销毁 AppContext 并释放所有内部资源
+ * @param  ctx  AppContext*  指向应用上下文的指针，不能为空
+ * @return void
+ *
+ * @note   按依赖反序释放：刷出 record_batch → 销毁线程池 → 关闭 eventfd →
+ *         关闭异步写线程 → 销毁 Worker 池 → 销毁探测调度器 → 销毁设备管理器 →
+ *         销毁指纹集合 → 释放 spbin 缓存 → 关闭 fpbin 文件 → 释放 fpbin 内存数组。
+ *         每个指针释放后均置为 NULL，防止重复释放。
+ */
 static void app_context_destroy(AppContext *ctx) {
     /* 刷出残留的 record_path 缓冲 */
     if (ctx->cfg.progress_base) {
@@ -92,6 +120,16 @@ static void app_context_destroy(AppContext *ctx) {
     }
 }
 
+/**
+ * @brief  加载会话配置快照并进行一致性校验
+ * @param  cfg         Config*  指向当前配置结构体的指针，不能为空
+ * @param  has_history bool*   输出参数，返回 true 表示检测到历史进度文件(.config)
+ * @return void
+ *
+ * @note   读取 {progress_base}.config 文件，校验 path 字段是否与当前 --path 一致。
+ *         若不一致则打印错误并 exit(1)。根据 status 字段自动设置 continue_mode。
+ *         若 archive 策略与历史记录不一致也直接 exit(1)。
+ */
 static void load_session_config(Config *cfg, bool *has_history) {
     *has_history = false;
     if (!cfg->progress_base) return;
@@ -135,6 +173,15 @@ static void load_session_config(Config *cfg, bool *has_history) {
     fclose(fp);
 }
 
+/**
+ * @brief  交互式任务确认（仅在未指定 --yes 时执行）
+ * @param  cfg          const Config*  指向当前配置的只读指针，不能为空
+ * @param  has_history  bool           是否检测到历史进度（影响模式显示）
+ * @return void
+ *
+ * @note   向 stdout 打印任务概要（目标路径、运行模式、输出格式、半增量阈值、batch 大小），
+ *         等待用户输入 'Y' 或 'y' 确认；其他输入则 exit(0) 取消任务。
+ */
 static void interactive_confirm(const Config *cfg, bool has_history) {
     if (cfg->sure) return;
     printf("\n=== 任务确认 ===\n");
@@ -157,6 +204,14 @@ static void interactive_confirm(const Config *cfg, bool has_history) {
     }
 }
 
+/**
+ * @brief  初始化输出流的缓冲区大小
+ * @param  ctx  AppContext*  指向应用上下文的指针，不能为空
+ * @return void
+ *
+ * @note   主数据输出流设置 8MB 全缓冲；目录信息输出流设置 1MB 全缓冲。
+ *         仅在输出流不是 stdout/stderr 时生效，用于减少 fwrite 系统调用次数。
+ */
 static void init_output_buffers(AppContext *ctx) {
     if (ctx->state.output_fp && ctx->state.output_fp != stdout) {
         setvbuf(ctx->state.output_fp, NULL, _IOFBF, 8 * 1024 * 1024);
@@ -166,6 +221,18 @@ static void init_output_buffers(AppContext *ctx) {
     }
 }
 
+/**
+ * @brief  listfiles 程序入口
+ * @param  argc  int     命令行参数个数
+ * @param  argv  char**  命令行参数字符串数组
+ * @return int   返回 0 表示任务成功完成；返回 1 表示发生错误
+ *
+ * @note   完整流程参见文件头部注释。关键设计点：
+ *         - 使用 fork() + pipe 的 Worker 进程模型，通过 COW 共享只读上下文。
+ *         - 半增量模式（skip_interval > 0）下加载 reference_set/map。
+ *         - 单文件目标直接提交到 async_writer，不创建 Worker 任务。
+ *         - 主循环退出后先 join 监控线程，再执行 finalize_progress 归档。
+ */
 int main(int argc, char *argv[]) {
     AppContext ctx;
     app_context_init(&ctx);

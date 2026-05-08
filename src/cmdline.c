@@ -1,3 +1,11 @@
+/**
+ * @file cmdline.c
+ * @brief 命令行参数解析与配置初始化模块
+ *
+ * 负责解析用户传入的命令行选项，填充 Config 结构体，并进行基础合法性校验。
+ * 支持 GNU getopt_long 长/短选项，提供 --help 和 --version 的快速响应。
+ * 所有字符串型配置项均通过 strdup 动态分配，生命周期由 main 函数统一释放。
+ */
 #include "cmdline.h"
 #include "utils.h"
 #include "output.h"
@@ -8,10 +16,21 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+/**
+ * @brief  打印程序版本号到标准输出
+ * @return void
+ */
 void show_version() {
     printf("listfiles 版本 %s\n", VERSION);
 }
 
+/**
+ * @brief  打印程序帮助信息到标准输出
+ * @return void
+ *
+ * @note   包含所有支持的命令行选项说明、默认值以及格式说明符参考。
+ *         在 parse_arguments 中遇到 -h/--help 或参数错误时自动调用。
+ */
 void show_help() {
     printf("\n文件列表器 %s\n", VERSION);
     printf("递归列出文件及其元数据, 支持智能断点续传与半增量扫描\n\n");
@@ -48,6 +67,15 @@ void show_help() {
     printf("  -h, --help             显示此帮助信息\n");
 }
 
+/**
+ * @brief  初始化配置结构体为默认值
+ * @param  cfg  Config*  指向要初始化的配置结构体的指针，不能为空
+ * @return void
+ *
+ * @note   所有指针型字段初始为 NULL 或由 strdup 分配默认字符串。
+ *         数值型字段采用编译期宏定义的默认值（如 DEFAULT_BATCH_SIZE、DEFAULT_MASTER_THREADS 等）。
+ *         调用本函数后，cfg 可直接传入 parse_arguments 进行覆盖更新。
+ */
 void init_config(Config *cfg) {
     memset(cfg, 0, sizeof(Config));
     cfg->progress_base = strdup("progress");
@@ -76,6 +104,18 @@ void init_config(Config *cfg) {
     cfg->master_threads = DEFAULT_MASTER_THREADS;
 }
 
+/**
+ * @brief  解析命令行参数并填充 Config 结构体
+ * @param  argc  int      命令行参数个数，取值范围: >= 1（argv[0] 为程序名）
+ * @param  argv  char**   命令行参数字符串数组，不能为空
+ * @param  cfg   Config*  指向要填充的配置结构体的指针，不能为空；调用前应先执行 init_config
+ * @return int   返回 0 表示解析成功；返回 2 表示遇到 --help 或 --version（已输出信息，应正常退出）；
+ *               返回 -1 表示参数错误（已输出错误信息，应异常退出）
+ *
+ * @note   本函数会对目标路径做 stat 校验（必须存在且为目录、普通文件或符号链接）。
+ *         互斥选项校验：-o 与 -O 不能同时使用；-Z 与 -C 不能同时使用。
+ *         若指定了 --format，解析结束后会自动调用 precompile_format 进行格式预编译。
+ */
 int parse_arguments(int argc, char *argv[], Config *cfg) {
     static struct option long_options[] = {
         {"path", required_argument, 0, 'p'},

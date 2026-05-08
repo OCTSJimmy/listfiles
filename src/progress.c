@@ -1,3 +1,23 @@
+/**
+ * @file progress.c
+ * @brief 进度文件（pbin/spbin/fpbin）的写入、归档、恢复与生命周期管理
+ *
+ * 核心设计哲学：
+ * - 同构分片：pbin 与 fpbin 采用完全相同的物理格式
+ * - 页脚自描述：已封口分片末尾自带 Footer（magic + row_count + crc），无需外部 idx 陪伴
+ * - 两阶段提交：活跃分片使用轻量 .idx 作为临时草稿，封口时"先盖钢印、再烧草稿"
+ * - 崩溃恢复：Footer 优先，idx 兜底
+ *
+ * 进度文件格式（以 --progress-file=task1 为例）：
+ * - task1.idx          原子更新的统一游标索引
+ * - task1_000000.pbin  已封口的已完成记录分片
+ * - task1_00000N.idx   活跃分片的临时草稿索引
+ * - task1.spbin        跳过记录（熔断设备上的目录）
+ * - task1.fpbin_000XXX 恢复期间隔离新发现子目录的临时分片
+ * - task1.fpbin.idx    fpbin 分片的游标索引
+ * - task1.archive      zlib 压缩的历史分片归档
+ * - task1.config       会话配置快照
+ */
 #include "progress.h"
 #include "utils.h"
 #include "archive_format.h"
@@ -17,48 +37,92 @@
 /* ================================================================
  * Filename helpers
  * ================================================================ */
+
+/**
+ * @brief  生成统一索引文件名（{base}.idx）
+ * @param  base  const char*  进度文件前缀，不能为空
+ * @return char*  动态分配的字符串，调用方负责 free
+ */
 char *get_index_filename(const char *base) {
     char *name = safe_malloc(strlen(base) + 32);
     sprintf(name, "%s.idx", base);
     return name;
 }
 
+/**
+ * @brief  生成 pbin 分片文件名（{base}_000000.pbin）
+ * @param  base   const char*   进度文件前缀，不能为空
+ * @param  index  unsigned long 分片编号，取值范围: >= 0
+ * @return char*  动态分配的字符串，调用方负责 free
+ */
 char *get_slice_filename(const char *base, unsigned long index) {
     char *name = safe_malloc(strlen(base) + 32);
     sprintf(name, "%s_%06lu.pbin", base, index);
     return name;
 }
 
+/**
+ * @brief  生成归档文件名（{base}.archive）
+ * @param  base  const char*  进度文件前缀，不能为空
+ * @return char*  动态分配的字符串，调用方负责 free
+ */
 char *get_archive_filename(const char *base) {
     char *name = safe_malloc(strlen(base) + 32);
     sprintf(name, "%s.archive", base);
     return name;
 }
 
+/**
+ * @brief  生成 spbin 文件名（{base}.spbin）
+ * @param  base  const char*  进度文件前缀，不能为空
+ * @return char*  动态分配的字符串，调用方负责 free
+ */
 char *get_spbin_filename(const char *base) {
     char *name = safe_malloc(strlen(base) + 32);
     sprintf(name, "%s.spbin", base);
     return name;
 }
 
+/**
+ * @brief  生成按分片草稿索引文件名（{base}_000000.idx）
+ * @param  base   const char*   进度文件前缀，不能为空
+ * @param  index  unsigned long 分片编号，取值范围: >= 0
+ * @return char*  动态分配的字符串，调用方负责 free
+ */
 char *get_per_slice_index_filename(const char *base, unsigned long index) {
     char *name = safe_malloc(strlen(base) + 32);
     sprintf(name, "%s_%06lu.idx", base, index);
     return name;
 }
 
+/**
+ * @brief  生成 fpbin 分片文件名（{base}.fpbin_000000）
+ * @param  base   const char*   进度文件前缀，不能为空
+ * @param  index  unsigned long 分片编号，取值范围: >= 0
+ * @return char*  动态分配的字符串，调用方负责 free
+ */
 char *get_fpbin_slice_filename(const char *base, unsigned long index) {
     char *name = safe_malloc(strlen(base) + 48);
     sprintf(name, "%s.fpbin_%06lu", base, index);
     return name;
 }
 
+/**
+ * @brief  生成 fpbin 索引文件名（{base}.fpbin.idx）
+ * @param  base  const char*  进度文件前缀，不能为空
+ * @return char*  动态分配的字符串，调用方负责 free
+ */
 char *get_fpbin_index_filename(const char *base) {
     char *name = safe_malloc(strlen(base) + 32);
     sprintf(name, "%s.fpbin.idx", base);
     return name;
 }
 
+/**
+ * @brief  将 stat::st_mode 转换为 dirent::d_type 等价值
+ * @param  mode  mode_t  文件模式位
+ * @return unsigned char  对应的 d_type 值（DT_REG/DT_DIR/DT_LNK/...），未知时返回 DT_UNKNOWN
+ */
 static unsigned char mode_to_dtype(mode_t mode) {
     if (S_ISREG(mode)) return DT_REG;
     if (S_ISDIR(mode)) return DT_DIR;
@@ -74,6 +138,16 @@ static unsigned char mode_to_dtype(mode_t mode) {
  * Footer 读写与校验
  * ================================================================ */
 
+/**
+ * @brief  向 pbin/fpbin 文件末尾写入 Footer（封口操作）
+ * @param  fp        FILE*     已打开的可写文件指针，不能为空
+ * @param  row_count uint64_t  该分片的实际数据行数，取值范围: >= 0
+ * @return bool  返回 true 表示写入并 fsync 成功；false 表示失败
+ *
+ * @note   Footer 为固定 24 字节，通过 O_APPEND 原子追加到文件末尾。
+ *         footer_crc32 覆盖 magic + row_count（前 16 字节）。
+ *         写入后执行 fsync 确保数据落盘。
+ */
 bool write_pbin_footer(FILE *fp, uint64_t row_count) {
     if (!fp) return false;
     fflush(fp);
@@ -94,6 +168,12 @@ bool write_pbin_footer(FILE *fp, uint64_t row_count) {
     return true;
 }
 
+/**
+ * @brief  从 pbin/fpbin 文件末尾读取 Footer
+ * @param  path  const char*   文件路径，不能为空
+ * @param  out   PbinFooter*   输出缓冲区，用于存放读取到的 Footer，不能为空
+ * @return bool  返回 true 表示读取并校验成功；false 表示文件不存在、大小不足或校验失败
+ */
 bool read_pbin_footer(const char *path, PbinFooter *out) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return false;
@@ -116,12 +196,26 @@ bool read_pbin_footer(const char *path, PbinFooter *out) {
     return verify_pbin_footer(out);
 }
 
+/**
+ * @brief  校验 Footer 的 magic 和 crc
+ * @param  f  const PbinFooter*  要校验的 Footer 指针，不能为空
+ * @return bool  返回 true 表示校验通过；false 表示 magic 错误或 crc 不匹配
+ */
 bool verify_pbin_footer(const PbinFooter *f) {
     if (f->magic != PBIN_FOOTER_MAGIC) return false;
     uint32_t expected = (uint32_t)crc32(0, (const Bytef *)&f->magic, sizeof(f->magic) + sizeof(f->row_count));
     return f->footer_crc32 == expected;
 }
 
+/**
+ * @brief  获取指定 pbin 分片的行数（Footer 优先，idx 兜底）
+ * @param  cfg    const Config*   全局配置指针，不能为空
+ * @param  index  unsigned long   分片编号，取值范围: >= 0
+ * @return unsigned long  分片行数；无法确定时返回 0
+ *
+ * @note   先尝试读取分片末尾 Footer，校验通过则返回 footer.row_count。
+ *         若 Footer 校验失败，则尝试读取按分片草稿 idx 文件中的行数。
+ */
 unsigned long get_slice_row_count(const Config *cfg, unsigned long index) {
     char *slice_path = get_slice_filename(cfg->progress_base, index);
     PbinFooter f;
@@ -147,6 +241,16 @@ unsigned long get_slice_row_count(const Config *cfg, unsigned long index) {
  * pbin / spbin 写入
  * ================================================================ */
 
+/**
+ * @brief  向 pbin/fpbin 文件写入单条记录
+ * @param  fp    FILE*             已打开的可写文件指针，不能为空
+ * @param  path  const char*       文件路径，不能为空
+ * @param  info  const struct stat* 文件 stat 信息指针，允许为 NULL（此时写入全 0）
+ * @return void
+ *
+ * @note   单条记录格式：[path_len][path][dev][ino][mtime][d_type]
+ *         各字段大小与平台相关（size_t、dev_t、ino_t、time_t、unsigned char）。
+ */
 static void write_pbin_record(FILE *fp, const char *path, const struct stat *info) {
     size_t path_len = strlen(path);
     dev_t dev = info ? info->st_dev : 0;
@@ -162,6 +266,21 @@ static void write_pbin_record(FILE *fp, const char *path, const struct stat *inf
     fwrite(&d_type, sizeof(unsigned char), 1, fp);
 }
 
+/**
+ * @brief  记录单条已处理路径到当前活跃 pbin 分片
+ * @param  cfg   const Config*       全局配置指针，不能为空
+ * @param  state RuntimeState*       运行时状态指针，不能为空
+ * @param  path  const char*         文件路径，不能为空
+ * @param  info  const struct stat*  文件 stat 信息指针，允许为 NULL
+ * @return void
+ *
+ * @note   若当前无活跃分片，自动创建新的 pbin 文件和对应的 .idx 草稿。
+ *         当 line_count 达到 progress_slice_lines（默认 100000）时执行分片轮转：
+ *         1. 写入 Footer 封口当前分片
+ *         2. 删除草稿 idx（"烧草稿"）
+ *         3. 调用 process_old_slice 处理旧分片（归档或删除）
+ *         4. 创建新分片并更新统一索引
+ */
 void record_path(const Config *cfg, RuntimeState *state, const char *path, const struct stat *info) {
     if (cfg->clean) return;  /* --clean 模式不保留任何进度文件 */
     if (!state->write_slice_file) {
@@ -211,11 +330,23 @@ void record_path(const Config *cfg, RuntimeState *state, const char *path, const
  * record_path 批量缓冲
  * ================================================================ */
 
+/**
+ * @brief  初始化 RecordBatch 批量缓冲结构
+ * @param  batch  RecordBatch*  指向要初始化的缓冲结构，不能为空
+ * @return void
+ */
 void record_path_batch_init(RecordBatch *batch) {
     if (!batch) return;
     memset(batch, 0, sizeof(*batch));
 }
 
+/**
+ * @brief  将批量缓冲中的所有记录刷出到 pbin 文件（内部实现）
+ * @param  cfg    const Config*   全局配置指针，不能为空
+ * @param  state  RuntimeState*   运行时状态指针，不能为空
+ * @param  batch  RecordBatch*    批量缓冲指针，不能为空
+ * @return void
+ */
 static void record_path_batch_flush_internal(const Config *cfg, RuntimeState *state, RecordBatch *batch) {
     if (!batch || batch->count == 0) return;
     for (int i = 0; i < batch->count; i++) {
@@ -227,10 +358,29 @@ static void record_path_batch_flush_internal(const Config *cfg, RuntimeState *st
     batch->total_bytes = 0;
 }
 
+/**
+ * @brief  将批量缓冲中的所有记录刷出到 pbin 文件（外部接口）
+ * @param  cfg    const Config*   全局配置指针，不能为空
+ * @param  state  RuntimeState*   运行时状态指针，不能为空
+ * @param  batch  RecordBatch*    批量缓冲指针，不能为空
+ * @return void
+ */
 void record_path_batch_flush(const Config *cfg, RuntimeState *state, RecordBatch *batch) {
     record_path_batch_flush_internal(cfg, state, batch);
 }
 
+/**
+ * @brief  向批量缓冲追加一条记录（满时自动刷出）
+ * @param  cfg    const Config*       全局配置指针，不能为空
+ * @param  state  RuntimeState*       运行时状态指针，不能为空
+ * @param  batch  RecordBatch*        批量缓冲指针，不能为空
+ * @param  path   const char*         文件路径，不能为空
+ * @param  info   const struct stat*  文件 stat 信息指针，允许为 NULL
+ * @return bool  返回 true 表示追加成功；false 表示内存分配失败
+ *
+ * @note   当 batch->count >= RECORD_BATCH_COUNT（4096）或
+ *         total_bytes + entry_size >= RECORD_BATCH_BYTES（1MB）时自动刷出。
+ */
 bool record_path_batch_append(const Config *cfg, RuntimeState *state, RecordBatch *batch, const char *path, const struct stat *info) {
     if (!batch || !path) return false;
     
@@ -259,6 +409,16 @@ bool record_path_batch_append(const Config *cfg, RuntimeState *state, RecordBatc
     return true;
 }
 
+/**
+ * @brief  将跳过记录（spbin）追加到磁盘文件
+ * @param  cfg    const Config*   全局配置指针，不能为空
+ * @param  state  RuntimeState*   运行时状态指针（当前未使用，保留接口一致性）
+ * @param  entry  const SpbinEntry* 跳过记录条目指针，不能为空
+ * @return void
+ *
+ * @note   以追加模式（"ab"）打开 {base}.spbin，写入 SpbinRecordHeader + path 字节。
+ *         不执行 fsync，依赖操作系统的缓冲策略。
+ */
 void record_skip(const Config *cfg, RuntimeState *state, const SpbinEntry *entry) {
     (void)state;
     FILE *fp = fopen(get_spbin_filename(cfg->progress_base), "ab");
@@ -282,6 +442,17 @@ void record_skip(const Config *cfg, RuntimeState *state, const SpbinEntry *entry
  * 索引与游标
  * ================================================================ */
 
+/**
+ * @brief  原子更新统一索引文件和按分片草稿索引
+ * @param  cfg    const Config*   全局配置指针，不能为空
+ * @param  state  RuntimeState*   运行时状态指针，不能为空
+ * @return void
+ *
+ * @note   采用"写临时文件 + rename"的两阶段提交策略保证原子性：
+ *         1. 统一索引（{base}.idx）：记录 write_slice_index、line_count、processed_count、output_slice_num、output_line_count
+ *         2. 按分片草稿索引（{base}_00000N.idx）：记录当前活跃分片的 line_count
+ *         临时文件命名包含线程 ID 以避免多线程冲突。
+ */
 void atomic_update_index(const Config *cfg, RuntimeState *state) {
     char *idx_file = get_index_filename(cfg->progress_base);
     char *tmp_file = safe_malloc(strlen(idx_file) + 64);
@@ -315,6 +486,12 @@ void atomic_update_index(const Config *cfg, RuntimeState *state) {
     free(per_tmp);
 }
 
+/**
+ * @brief  从磁盘加载统一索引文件到运行时状态
+ * @param  cfg    const Config*   全局配置指针，不能为空
+ * @param  state  RuntimeState*   运行时状态指针，不能为空
+ * @return bool  返回 true 表示成功加载 5 个字段；false 表示文件不存在或格式错误
+ */
 bool load_progress_index(const Config *cfg, RuntimeState *state) {
     char *idx_file = get_index_filename(cfg->progress_base);
     FILE *fp = fopen(idx_file, "r");
@@ -331,6 +508,21 @@ bool load_progress_index(const Config *cfg, RuntimeState *state) {
  * 归档 (archive with block_type)
  * ================================================================ */
 
+/**
+ * @brief  将单个分片文件压缩并追加到归档文件
+ * @param  cfg         const Config*  全局配置指针，不能为空
+ * @param  slice_path  const char*    要归档的分片文件路径，不能为空
+ * @param  block_type  uint8_t        块类型，取值范围: ARCHIVE_BLOCK_NORMAL(0) 或 ARCHIVE_BLOCK_SPBIN(1)
+ * @return void
+ *
+ * @note   流程：
+ *         1. 读取整个分片到内存
+ *         2. 若分片末尾有有效 Footer，则提取 row_count 并从数据区剔除 Footer
+ *         3. 使用 zlib compress 压缩数据区
+ *         4. 追加 ArchiveBlockHeader + 压缩数据到 {base}.archive
+ *         5. 删除原始分片文件（unlink）
+ *         若压缩失败或文件打开失败，则保留原始分片不删除。
+ */
 static void archive_slice_to_file(const Config *cfg, const char *slice_path, uint8_t block_type) {
     FILE *in = fopen(slice_path, "rb");
     if (!in) return;
@@ -384,6 +576,15 @@ static void archive_slice_to_file(const Config *cfg, const char *slice_path, uin
     free(archive_path);
 }
 
+/**
+ * @brief  处理已完成的旧分片（归档或删除）
+ * @param  cfg    const Config*   全局配置指针，不能为空
+ * @param  index  unsigned long   已完成的分片编号，取值范围: >= 0
+ * @return void
+ *
+ * @note   若 cfg->archive 为 true，则调用 archive_slice_to_file 压缩归档；
+ *         否则直接 unlink 删除分片文件。
+ */
 void process_old_slice(const Config *cfg, unsigned long index) {
     char *src_path = get_slice_filename(cfg->progress_base, index);
     if (cfg->archive) {
@@ -394,6 +595,17 @@ void process_old_slice(const Config *cfg, unsigned long index) {
     free(src_path);
 }
 
+/**
+ * @brief  任务结束时归档所有残留分片
+ * @param  cfg    const Config*   全局配置指针，不能为空
+ * @param  state  RuntimeState*   运行时状态指针，不能为空
+ * @return void
+ *
+ * @note   流程：
+ *         1. 若存在活跃分片（write_slice_file），先封口写 Footer，再归档或保留
+ *         2. 归档 spbin 文件（作为 archive 的最后一个块）
+ *         若未开启归档模式，保留当前活跃分片和 spbin 以供后续恢复。
+ */
 void finalize_archive(const Config *cfg, RuntimeState *state) {
     if (state->write_slice_file) {
         /* 正常结束时给活跃分片盖钢印 */
@@ -427,6 +639,20 @@ void finalize_archive(const Config *cfg, RuntimeState *state) {
  * 进度恢复 (从 archive 和散落 pbin)
  * ================================================================ */
 
+/**
+ * @brief  解析 pbin/fpbin 数据缓冲区，提取指纹并插入集合
+ * @param  buf          const uint8_t*    数据缓冲区指针，不能为空
+ * @param  size         size_t            缓冲区大小（字节）
+ * @param  max_rows     uint64_t          最大解析行数，0 表示无限制
+ * @param  visited_set  FingerprintSet*   本次任务的 visited_set（去重），允许为 NULL
+ * @param  ref_set      FingerprintSet*   半增量的 reference_set，允许为 NULL
+ * @param  ref_map      ReferenceMap*     半增量的 reference_map，允许为 NULL
+ * @return void
+ *
+ * @note   按 pbin 记录格式顺序解析：path_len → path → dev → ino → mtime → d_type。
+ *         对每条记录计算指纹并插入 visited_set（若提供）和 ref_set/ref_map（若提供）。
+ *         当 max_rows > 0 且已解析行数达到 max_rows 时提前停止。
+ */
 static void parse_pbin_buffer(const uint8_t *buf, size_t size, uint64_t max_rows,
                               FingerprintSet *visited_set,
                               FingerprintSet *ref_set,
@@ -465,6 +691,17 @@ static void parse_pbin_buffer(const uint8_t *buf, size_t size, uint64_t max_rows
     }
 }
 
+/**
+ * @brief  解析 spbin 数据缓冲区，加载跳过记录到内存缓存
+ * @param  buf  const uint8_t*  数据缓冲区指针，不能为空
+ * @param  size size_t          缓冲区大小（字节）
+ * @param  ctx  AppContext*     应用上下文指针，不能为空
+ * @return void
+ *
+ * @note   按 SpbinRecordHeader + path 的格式顺序解析。
+ *         对每个条目：创建 SpbinEntry 追加到 ctx->spbin_entries 数组，
+ *         并根据状态更新 DeviceManager（CONDEMNED 或 DEAD）和 ProbeScheduler。
+ */
 static void parse_spbin_buffer(const uint8_t *buf, size_t size,
                                AppContext *ctx) {
     size_t pos = 0;
@@ -510,6 +747,20 @@ static void parse_spbin_buffer(const uint8_t *buf, size_t size,
     }
 }
 
+/**
+ * @brief  遍历归档文件，解压并解析所有块
+ * @param  cfg         const Config*   全局配置指针，不能为空
+ * @param  ctx         AppContext*     应用上下文指针，不能为空
+ * @param  visited_set FingerprintSet* 本次任务的 visited_set，允许为 NULL
+ * @param  ref_set     FingerprintSet* 半增量的 reference_set，允许为 NULL
+ * @param  ref_map     ReferenceMap*   半增量的 reference_map，允许为 NULL
+ * @return void
+ *
+ * @note   顺序读取 ArchiveBlockHeader，做 sanity check（block_type、大小上限 512MB）后，
+ *         分配缓冲区、读取压缩数据、调用 uncompress 解压，再根据 block_type 分发到
+ *         parse_pbin_buffer 或 parse_spbin_buffer。
+ *         若某块校验失败或读取不完整，则停止继续解析。
+ */
 static void iterate_archive(const Config *cfg, AppContext *ctx,
                             FingerprintSet *visited_set,
                             FingerprintSet *ref_set,
@@ -546,6 +797,19 @@ static void iterate_archive(const Config *cfg, AppContext *ctx,
     free(archive_path);
 }
 
+/**
+ * @brief  遍历磁盘上散落的 pbin 分片并解析
+ * @param  cfg         const Config*   全局配置指针，不能为空
+ * @param  state       RuntimeState*   运行时状态指针（当前未使用，保留接口一致性）
+ * @param  visited_set FingerprintSet* 本次任务的 visited_set，允许为 NULL
+ * @param  ref_set     FingerprintSet* 半增量的 reference_set，允许为 NULL
+ * @param  ref_map     ReferenceMap*   半增量的 reference_map，允许为 NULL
+ * @return void
+ *
+ * @note   从分片 0 开始顺序尝试打开，连续缺失超过 50 个且已超过 write_slice_index 时停止。
+ *         对每个存在的分片：读取全部内容，若末尾有有效 Footer 则剔除 Footer 后解析数据区，
+ *         否则解析整个文件（可能包含无效数据，但 parse_pbin_buffer 会自动防御）。
+ */
 static void iterate_pbin_slices(const Config *cfg, RuntimeState *state,
                                 FingerprintSet *visited_set,
                                 FingerprintSet *ref_set,
@@ -583,8 +847,11 @@ static void iterate_pbin_slices(const Config *cfg, RuntimeState *state,
     }
 }
 
-/* Count normal (pbin-equivalent) compressed blocks inside the archive file.
- * SPBIN blocks are skipped records, not progress slices, so they are not counted. */
+/**
+ * @brief  统计归档文件中 Normal 块的数量（SPBIN 块不计入）
+ * @param  cfg  const Config*  全局配置指针，不能为空
+ * @return unsigned long  Normal 块的数量
+ */
 static unsigned long count_archive_blocks(const Config *cfg) {
     char *archive_path = get_archive_filename(cfg->progress_base);
     FILE *fp = fopen(archive_path, "rb");
@@ -604,7 +871,13 @@ static unsigned long count_archive_blocks(const Config *cfg) {
     return count;
 }
 
-/* Count scattered pbin slices on disk */
+/**
+ * @brief  统计磁盘上散落 pbin 分片的数量
+ * @param  cfg  const Config*  全局配置指针，不能为空
+ * @return unsigned long  存在的分片数量
+ *
+ * @note   从分片 0 开始顺序检查，连续缺失超过 50 个时停止。
+ */
 static unsigned long count_pbin_slices(const Config *cfg) {
     unsigned long count = 0;
     int consecutive_missing = 0;
@@ -628,7 +901,13 @@ static unsigned long count_pbin_slices(const Config *cfg) {
 
 #define FPBIN_MEM_WATERMARK 10000
 
-/* 更新 fpbin.idx：记录当前分片号与行数 */
+/**
+ * @brief  原子更新 fpbin 索引文件（fpbin.idx）
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ *
+ * @note   记录当前 fpbin 分片号与行数，采用写临时文件 + rename 的原子更新策略。
+ */
 static void atomic_update_fpbin_index(AppContext *ctx) {
     char *idx_file = get_fpbin_index_filename(ctx->cfg.progress_base);
     char *tmp_file = safe_malloc(strlen(idx_file) + 64);
@@ -644,7 +923,13 @@ static void atomic_update_fpbin_index(AppContext *ctx) {
     free(tmp_file);
 }
 
-/* 打开或创建新的 fpbin 活跃分片 */
+/**
+ * @brief  打开或创建新的 fpbin 活跃分片
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ *
+ * @note   关闭当前活跃分片（如有），以 "wb" 模式打开新分片文件，重置 fpbin_line_count 为 0。
+ */
 static void fpbin_open_slice(AppContext *ctx) {
     if (ctx->fpbin_slice_file) {
         fclose(ctx->fpbin_slice_file);
@@ -656,7 +941,13 @@ static void fpbin_open_slice(AppContext *ctx) {
     ctx->fpbin_line_count = 0;
 }
 
-/* rotate fpbin 分片（已满，封口写 Footer） */
+/**
+ * @brief  轮转 fpbin 分片（封口当前分片并创建新分片）
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ *
+ * @note   写入 Footer 封口当前分片，关闭文件，递增分片编号，打开新分片，更新 fpbin.idx。
+ */
 static void fpbin_rotate_slice(AppContext *ctx) {
     if (ctx->fpbin_slice_file) {
         write_pbin_footer(ctx->fpbin_slice_file, ctx->fpbin_line_count);
@@ -668,6 +959,17 @@ static void fpbin_rotate_slice(AppContext *ctx) {
     atomic_update_fpbin_index(ctx);
 }
 
+/**
+ * @brief  向 fpbin 追加一条记录（新发现的子目录，恢复模式专用）
+ * @param  ctx   AppContext*         应用上下文指针，不能为空
+ * @param  path  const char*         目录路径，不能为空
+ * @param  st    const struct stat*  目录 stat 信息指针，不能为空
+ * @return void
+ *
+ * @note   当内存中条目数小于 FPBIN_MEM_WATERMARK（10000）时，缓存到内存数组；
+ *         达到水位后，将内存数组批量刷出到当前 fpbin 分片文件，清空内存后继续追加。
+ *         当分片行数达到 progress_slice_lines 时自动轮转。
+ */
 void fpbin_append(AppContext *ctx, const char *path, const struct stat *st) {
     if (!ctx->fpbin_slice_file) {
         fpbin_open_slice(ctx);
@@ -710,6 +1012,11 @@ void fpbin_append(AppContext *ctx, const char *path, const struct stat *st) {
     }
 }
 
+/**
+ * @brief  清空 fpbin 内存缓存数组
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ */
 static void fpbin_clear_mem(AppContext *ctx) {
     for (size_t i = 0; i < ctx->fpbin_count; i++) {
         free(ctx->fpbin_entries[i]);
@@ -717,7 +1024,13 @@ static void fpbin_clear_mem(AppContext *ctx) {
     ctx->fpbin_count = 0;
 }
 
-/* 查找当前最大的 pbin 分片索引 */
+/**
+ * @brief  查找当前最大的 pbin 分片索引
+ * @param  cfg  const Config*  全局配置指针，不能为空
+ * @return unsigned long  最大存在的分片编号；无分片时返回 0
+ *
+ * @note   从 0 开始顺序检查，连续缺失超过 50 个时停止。
+ */
 static unsigned long find_max_pbin_index(const Config *cfg) {
     unsigned long max_idx = 0;
     int consecutive_missing = 0;
@@ -734,7 +1047,21 @@ static unsigned long find_max_pbin_index(const Config *cfg) {
     return max_idx;
 }
 
-/* Promote fpbin to pbin: seal all fpbin slices, rename, verify, cleanup */
+/**
+ * @brief  将 fpbin 临时分片转正为正式 pbin 分片
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ *
+ * @note   转正流程（fpbin → pbin）：
+ *         1. 将内存中残留条目刷出到当前 fpbin 分片
+ *         2. 封口最后一个 fpbin 分片（写 Footer）
+ *         3. 若从未创建过 fpbin 文件但有内存数据，创建 slice 0 并写入
+ *         4. 计算 pbin 起始编号（max_pbin_index + 1），rename 所有 fpbin 分片
+ *         5. 逐个读取转正后 pbin 的 Footer 进行校验
+ *         6. 校验全部通过后删除 fpbin.idx 和残留 fpbin 文件
+ *         7. 更新 pump 源到第一个转正后的 pbin，状态切换为 HIST_PUMP_NEW
+ *         若校验失败，保留 fpbin.idx 以便下次恢复时重试转正。
+ */
 static void promote_fpbin_to_pbin(AppContext *ctx) {
     /* 1. Flush any remaining memory entries to current fpbin slice */
     if (ctx->fpbin_slice_file && ctx->fpbin_count > 0) {
@@ -828,7 +1155,14 @@ static void promote_fpbin_to_pbin(AppContext *ctx) {
     ctx->hist_pump_state = HIST_PUMP_NEW;
 }
 
-/* Called when current pbin slice is fully consumed */
+/**
+ * @brief  当前 pbin 分片消费完毕时的回调
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ *
+ * @note   关闭当前分片，尝试打开下一个散落分片；若无更多散落分片则检查 fpbin；
+ *         若 fpbin 存在则触发转正流程；否则标记泵送完成（HIST_PUMP_DONE）。
+ */
 static void on_pbin_slice_consumed(AppContext *ctx) {
     if (ctx->hist_pump_fp) {
         fclose(ctx->hist_pump_fp);
@@ -856,7 +1190,17 @@ static void on_pbin_slice_consumed(AppContext *ctx) {
     ctx->hist_pump_state = HIST_PUMP_DONE;
 }
 
-/* Read next record from current pbin file, return true on success */
+/**
+ * @brief  从当前 pbin 文件读取下一条记录
+ * @param  fp          FILE*              已打开的 pbin 文件指针，不能为空
+ * @param  out_path    char**             输出路径字符串指针的指针，成功时指向新分配的字符串，调用方负责 free
+ * @param  out_st      struct stat*       输出 stat 结构体指针，不能为空
+ * @param  out_d_type  unsigned char*     输出文件类型指针，不能为空
+ * @return bool  返回 true 表示读取成功；false 表示 EOF 或格式错误
+ *
+ * @note   对 path_len 做防御性校验（> MAX_PATH_LENGTH 则视为损坏数据）。
+ *         根据 d_type 填充 stat::st_mode 中的文件类型位。
+ */
 static bool read_next_pbin_record(FILE *fp, char **out_path, struct stat *out_st, unsigned char *out_d_type) {
     size_t path_len;
     if (fread(&path_len, sizeof(size_t), 1, fp) != 1) return false;
@@ -893,7 +1237,16 @@ static bool read_next_pbin_record(FILE *fp, char **out_path, struct stat *out_st
     return true;
 }
 
-/* Pump a batch of directories from current pbin to workers */
+/**
+ * @brief  从历史 pbin 分片中泵送一批目录给 Worker
+ * @param  ctx        AppContext*  应用上下文指针，不能为空
+ * @param  batch_size int          每批发送的目录数量，取值范围: > 0
+ * @return void
+ *
+ * @note   从 hist_pump_fp 顺序读取记录，仅对 DT_DIR 类型的条目创建扫描任务并发送给 Worker。
+ *         每批最多发送 batch_size 个目录。读取的目录会重新计算指纹并插入 visited_set 避免重复输出。
+ *         当当前分片读完后自动调用 on_pbin_slice_consumed 切换到下一片或结束泵送。
+ */
 void pump_pbin_batch(AppContext *ctx, int batch_size) {
     if (!ctx->hist_pump_fp) return;
 
@@ -928,7 +1281,25 @@ void pump_pbin_batch(AppContext *ctx, int batch_size) {
     }
 }
 
-/* Resume mode: load from archive + pbin slices, set up pump state */
+/**
+ * @brief  恢复模式：从归档和散落 pbin 加载进度并设置泵送状态
+ * @param  cfg  const Config*  全局配置指针，不能为空
+ * @param  ctx  AppContext*     应用上下文指针，不能为空
+ * @return int  返回 0 表示恢复成功（或无需恢复）
+ *
+ * @note   恢复流程：
+ *         1. 重置 fpbin 和 pump 状态
+ *         2. 加载统一索引文件（idx）
+ *         3. 统计归档块数和散落分片数
+ *         4. 加载归档文件内容到 visited_set
+ *         5. 若无索引且历史块数超过 1，执行全量重扫；否则加载散落分片
+ *         6. 对有索引的情况，逐个加载散落 pbin 分片：
+ *            - 已完成的旧分片（< write_slice_index）：完整解析
+ *            - 活跃分片（== write_slice_index）：仅解析 line_count 行
+ *            - Footer 有效时删除残留草稿 idx（"钢印清晰则烧草稿"）
+ *         7. 处理残留 fpbin（上次转正中断）：重新执行 promote_fpbin_to_pbin
+ *         8. 打开当前活跃分片，跳过已处理的 line_count 行，设置 pump 状态
+ */
 int restore_progress(const Config *cfg, AppContext *ctx) {
     /* 1. Reset fpbin state (keep residual files for potential re-promotion) */
     fpbin_clear_mem(ctx);
@@ -1106,7 +1477,16 @@ int restore_progress(const Config *cfg, AppContext *ctx) {
     return 0;
 }
 
-/* Incremental mode: load reference set/map from archive */
+/**
+ * @brief  半增量模式：将历史索引加载到内存中的 reference_set/map
+ * @param  cfg  const Config*  全局配置指针，不能为空
+ * @param  ctx  AppContext*     应用上下文指针，不能为空
+ * @return void
+ *
+ * @note   遍历归档文件和散落 pbin 分片，将指纹插入 reference_set，
+ *         将 (mtime, d_type) 插入 reference_map。
+ *         用于支撑半增量扫描的 blind-trust 机制。
+ */
 void restore_progress_to_memory(const Config *cfg, AppContext *ctx) {
     verbose_printf(cfg, 1, "开始加载半增量索引...\n");
     iterate_archive(cfg, ctx, NULL, ctx->reference_set, ctx->reference_map);
@@ -1118,6 +1498,14 @@ void restore_progress_to_memory(const Config *cfg, AppContext *ctx) {
  * 其他辅助
  * ================================================================ */
 
+/**
+ * @brief  将当前会话配置快照保存到磁盘
+ * @param  cfg  const Config*  全局配置指针，不能为空
+ * @return void
+ *
+ * @note   写入 {base}.config 文件，包含：目标路径、输出文件、归档策略、CSV 模式、启动时间等。
+ *         --clean 模式不创建任何进度文件。
+ */
 void save_config_to_disk(const Config* cfg) {
     if (!cfg->progress_base) return;
     if (cfg->clean) return; /* --clean mode should not leave any progress files */
@@ -1136,6 +1524,19 @@ void save_config_to_disk(const Config* cfg) {
     fclose(fp);
 }
 
+/**
+ * @brief  任务结束时的进度收尾处理
+ * @param  cfg    const Config*   全局配置指针，不能为空
+ * @param  state  RuntimeState*   运行时状态指针，不能为空
+ * @return void
+ *
+ * @note   非 --clean 模式：
+ *         1. 调用 finalize_archive 封口活跃分片并归档
+ *         2. 原子更新统一索引
+ *         3. 追加状态行到 .config（Success/Incomplete + 结束时间）
+ *         --clean 模式：
+ *         关闭并删除活跃分片文件，不保留任何进度记录。
+ */
 void finalize_progress(const Config *cfg, RuntimeState *state) {
     if (!cfg->clean) {
         finalize_archive(cfg, state);
@@ -1168,6 +1569,16 @@ void finalize_progress(const Config *cfg, RuntimeState *state) {
     }
 }
 
+/**
+ * @brief  清理所有进度文件（--clean 或 --runone 时调用）
+ * @param  cfg    const Config*   全局配置指针，不能为空
+ * @param  state  RuntimeState*   运行时状态指针，不能为空
+ * @return void
+ *
+ * @note   删除：统一索引、所有分片文件、按分片草稿 idx、归档文件、spbin、
+ *         错误日志、config、fpbin 索引和分片、以及兼容旧版本的 progress.fpbin。
+ *         注意：仅删除到 write_slice_index + 200 为止的分片，保留可能更远的残留。
+ */
 void cleanup_progress(const Config *cfg, RuntimeState *state) {
     char *idx_path = get_index_filename(cfg->progress_base);
     unlink(idx_path);
@@ -1217,6 +1628,15 @@ void cleanup_progress(const Config *cfg, RuntimeState *state) {
     unlink("progress.fpbin");
 }
 
+/**
+ * @brief  获取文件锁（防止多实例同时操作同一进度文件）
+ * @param  cfg    const Config*   全局配置指针，不能为空
+ * @param  state  RuntimeState*   运行时状态指针，不能为空
+ * @return int  返回 0 表示加锁成功；返回 -1 表示失败（文件不存在或其他进程已持有锁）
+ *
+ * @note   仅在 continue_mode 下生效。锁文件为 {base}.lock，使用 flock(LOCK_EX | LOCK_NB)。
+ *         成功后将 fd 和路径记录到 state 中，由 release_lock 释放。
+ */
 int acquire_lock(const Config *cfg, RuntimeState *state) {
     if (!cfg->continue_mode) return 0;
     char *lock_path = safe_malloc(strlen(cfg->progress_base) + 32);
@@ -1229,6 +1649,11 @@ int acquire_lock(const Config *cfg, RuntimeState *state) {
     return 0;
 }
 
+/**
+ * @brief  释放文件锁并删除锁文件
+ * @param  state  RuntimeState*  运行时状态指针，不能为空
+ * @return void
+ */
 void release_lock(RuntimeState *state) {
     if (state->lock_fd != -1) { flock(state->lock_fd, LOCK_UN); close(state->lock_fd); state->lock_fd = -1; }
     if (state->lock_file_path) { unlink(state->lock_file_path); free(state->lock_file_path); state->lock_file_path = NULL; }
@@ -1238,6 +1663,15 @@ void release_lock(RuntimeState *state) {
  * Spbin memory cache
  * ================================================================ */
 
+/**
+ * @brief  向 spbin 内存缓存追加一条记录
+ * @param  ctx    AppContext*         应用上下文指针，不能为空
+ * @param  entry  const SpbinEntry*   要追加的跳过记录指针，不能为空
+ * @return void
+ *
+ * @note   当缓存满时自动扩容至 2 倍容量。内存缓存用于设备恢复时快速重入队，
+ *         避免重复读取 spbin 磁盘文件。
+ */
 void spbin_append(AppContext *ctx, const SpbinEntry *entry) {
     if (ctx->spbin_count >= ctx->spbin_capacity) {
         size_t new_cap = ctx->spbin_capacity ? ctx->spbin_capacity * 2 : 64;
@@ -1250,6 +1684,16 @@ void spbin_append(AppContext *ctx, const SpbinEntry *entry) {
     ctx->spbin_count++;
 }
 
+/**
+ * @brief  设备恢复后，将 spbin 中该设备的积压路径重新入队扫描
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @param  dev  dev_t        已恢复的设备号
+ * @return void
+ *
+ * @note   遍历 spbin_entries 数组，找到匹配 dev 且状态非 CONDEMNED 的条目，
+ *         增加 pending_tasks 并通过 ipc_send 发送 IPC_MSG_SCAN 给 Worker。
+ *         使用 next_requeue_worker 轮询选择 Worker，实现负载均衡。
+ */
 void spbin_requeue_recovered(AppContext *ctx, dev_t dev) {
     for (size_t i = 0; i < ctx->spbin_count; i++) {
         if (ctx->spbin_entries[i].dev == dev && ctx->spbin_entries[i].s_status != SP_STATUS_CONDEMNED) {
