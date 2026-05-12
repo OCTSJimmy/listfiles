@@ -340,8 +340,10 @@ int main(int argc, char *argv[]) {
         if (S_ISDIR(root_info.st_mode)) {
             atomic_fetch_add(&ctx.pending_tasks, 1);
             uint32_t plen = (uint32_t)strlen(ctx.cfg.target_path);
-            ipc_send(ctx.worker_pool->slots[0].fd_in, IPC_MSG_SCAN,
-                     ctx.cfg.target_path, plen);
+            WorkerSlot *slot = ctx.worker_pool->slots;
+            slot->current_dev = root_info.st_dev;
+            safe_strcpy(slot->current_path, ctx.cfg.target_path, sizeof(slot->current_path));
+            ipc_send(slot->fd_in, IPC_MSG_SCAN, ctx.cfg.target_path, plen);
         } else {
             /* Single file target */
             async_writer_submit(ctx.async_writer, ctx.cfg.target_path, &root_info);

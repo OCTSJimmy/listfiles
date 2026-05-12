@@ -548,6 +548,10 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     int flags = fcntl(in_pipe[1], F_GETFL);
     fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
 
+    /* Master read end should also be non-blocking to avoid hanging on D-State workers */
+    flags = fcntl(out_pipe[0], F_GETFL);
+    fcntl(out_pipe[0], F_SETFL, flags | O_NONBLOCK);
+
     WorkerSlot *slot = &pool->slots[slot_id];
     slot->pid = pid;
     slot->fd_in = in_pipe[1];

@@ -186,7 +186,10 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
             } else {
                 atomic_fetch_add(&ctx->pending_tasks, 1);
                 uint32_t plen = (uint32_t)strlen(path);
-                int rc = ipc_send(ctx->worker_pool->slots[batch->worker_id].fd_in, IPC_MSG_SCAN, path, plen);
+                WorkerSlot *slot = &ctx->worker_pool->slots[batch->worker_id];
+                slot->current_dev = st->st_dev;
+                safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
+                int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
                 if (rc == -2) {
                     /* fd_in is full (EAGAIN); enqueue to backlog to avoid deadlock */
                     WorkerSlot *slot = &ctx->worker_pool->slots[batch->worker_id];
@@ -403,6 +406,9 @@ void main_loop_run(AppContext *ctx) {
                 continue;
             }
             if (slot_id >= (uint32_t)ctx->worker_pool->num_workers) continue;
+
+            /* Skip events from workers already marked dead by monitor */
+            if (!ctx->worker_pool->slots[slot_id].is_alive) continue;
 
             IpcMessageHeader hdr;
             if (ipc_recv_header(ctx->worker_pool->slots[slot_id].fd_out, &hdr) != 0) {

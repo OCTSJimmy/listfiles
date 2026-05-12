@@ -226,8 +226,11 @@ static void check_workers_health(Monitor *mon) {
         if (!slot->is_alive) continue;
 
         if (now - slot->last_heartbeat > timeout) {
-            fprintf(stderr, "[Monitor] Worker %d heartbeat timeout (dev=%lu, path=%s). Replacing.\n",
-                    i, (unsigned long)slot->current_dev, slot->current_path);
+            char timebuf[32];
+            struct tm *tm_info = localtime(&now);
+            strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
+            fprintf(stderr, "[%s] [Monitor] Worker %d heartbeat timeout (dev=%lu, path=%s). Replacing.\n",
+                    timebuf, i, (unsigned long)slot->current_dev, slot->current_path);
 
             kill(slot->pid, SIGKILL);
             int status;
@@ -237,6 +240,8 @@ static void check_workers_health(Monitor *mon) {
             slot->pid = -1;
             ctx->worker_pool->active_count--;
             ctx->state.has_error = true;
+            /* Decrement pending_tasks so the system doesn't wait forever for a dead worker */
+            atomic_fetch_sub(&ctx->pending_tasks, 1);
         }
     }
 }

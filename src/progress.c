@@ -1274,7 +1274,10 @@ void pump_pbin_batch(AppContext *ctx, int batch_size) {
             static int next_wid = 0;
             int wid = next_wid % ctx->worker_pool->num_workers;
             next_wid++;
-            ipc_send(ctx->worker_pool->slots[wid].fd_in, IPC_MSG_SCAN, path, plen);
+            WorkerSlot *slot = &ctx->worker_pool->slots[wid];
+            slot->current_dev = st.st_dev;
+            safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
+            ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
             sent++;
         }
         free(path);
@@ -1700,6 +1703,9 @@ void spbin_requeue_recovered(AppContext *ctx, dev_t dev) {
             atomic_fetch_add(&ctx->pending_tasks, 1);
             uint32_t plen = (uint32_t)strlen(ctx->spbin_entries[i].path);
             int wid = ctx->next_requeue_worker % ctx->worker_pool->num_workers;
+            WorkerSlot *slot = &ctx->worker_pool->slots[wid];
+            slot->current_dev = ctx->spbin_entries[i].dev;
+            safe_strcpy(slot->current_path, ctx->spbin_entries[i].path, sizeof(slot->current_path));
             ctx->next_requeue_worker++;
             ipc_send(ctx->worker_pool->slots[wid].fd_in, IPC_MSG_SCAN,
                      ctx->spbin_entries[i].path, plen);
