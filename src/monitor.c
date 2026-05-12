@@ -3,12 +3,12 @@
  * @brief 监控线程实现
  *
  * 独立的监控线程负责：
- * 1. 每 500ms 刷新一次统计面板（输出到 stderr），显示运行时间、Worker 状态、吞吐量、进度、设备状态等
+ * 1. 每 500ms 刷新一次统计面板（输出到 stdout），显示运行时间、Worker 状态、吞吐量、进度、设备状态等
  * 2. 每 1s 检查一次 Worker 心跳超时，对超时的 Worker 发送 SIGKILL 并标记为死亡
  * 3. 调度敢死队探测进程：对熔断设备 fork 子进程执行 lstat 探测
  * 4. 收割已完成的探测进程，根据退出状态决定设备恢复或重新调度探测
  *
- * 所有诊断信息统一输出到 stderr，避免污染 stdout 上的扫描数据。
+ * 监控面板输出到 stdout，便于用户在终端实时查看进度；其他诊断信息（日志、错误等）统一输出到 stderr。
  */
 #define _GNU_SOURCE
 #include "monitor.h"
@@ -112,11 +112,11 @@ static void format_elapsed_time(time_t start_time, char *buffer, size_t buf_size
  * ================================================================ */
 
 /**
- * @brief  打印实时监控面板到 stderr
+ * @brief  打印实时监控面板到 stdout
  * @param  mon  Monitor*  监控器指针，不能为空
  * @return void
  *
- * @note   若 stderr 为终端（isatty），则先清屏（ANSI 转义序列）。
+ * @note   若 stdout 为终端（isatty），则先清屏（ANSI 转义序列）。
  *         面板内容包括：版本号、运行时间、活跃 Worker 数、待处理任务数、
  *         目录/文件/消费速率、已扫描目录/文件数、输出切片状态、
  *         进度分片状态、设备熔断状态、敢死队探测状态。
@@ -130,7 +130,7 @@ void print_progress(Monitor *mon) {
 
     update_statistics(state);
 
-    FILE *fp = stderr;
+    FILE *fp = stdout;
 
     char time_str[32];
     format_elapsed_time(state->start_time, time_str, sizeof(time_str));
@@ -336,8 +336,9 @@ static void reap_probes(Monitor *mon) {
  * @return void*  始终返回 NULL
  *
  * @note   循环周期约为 MONITOR_INTERVAL_MS（500ms）。每轮循环：
- *         1. 若未开启 mute，打印监控面板
+ *         1. 若未开启 mute，打印监控面板到 stdout
  *         2. 每 CHECK_INTERVAL_SEC（1s）执行一次健康检查和探测调度
+ *         -M (--mute) 仅静默监控面板和诊断信息，不影响扫描数据输出
  *         3. 每轮都尝试收割探测进程（因为探测可能在任意时刻完成）
  *         4. usleep 500ms 后继续下一轮
  *         当 mon->running 被主线程设为 false 时退出循环。

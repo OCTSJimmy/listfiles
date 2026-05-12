@@ -531,7 +531,9 @@ Feature: 灵活的输出格式
   Scenario: 静默模式
     Given 用户指定了 -M (--mute)
     When 扫描执行期间
-    Then 所有正常扫描数据不输出到 stdout 或文件
+    Then 监控面板不输出到 stdout
+    And 诊断日志（[System]、--verbose）不输出到 stderr
+    And 扫描数据正常输出到文件或 stdout
     And 错误和诊断信息仍输出到 stderr
 ```
 
@@ -605,11 +607,12 @@ Feature: 独立监控线程
     And 每秒触发一次 dispatch_probes()
     And 每轮触发一次 reap_probes()
 
-  Scenario: 静默模式下监控线程仍输出面板到文件
+  Scenario: 静默模式下监控线程不输出面板
     Given 用户指定了 -M (--mute)
     When Monitor 线程执行 print_progress()
-    Then 仍然向 stderr 输出统计面板
-    And 不输出到 stdout（避免污染管道数据）
+    Then 不向 stdout 输出统计面板
+    And 不输出到 stderr
+    And 不输出到 stderr（避免污染日志）
 ```
 
 ### Feature: 统计面板输出
@@ -621,7 +624,7 @@ Feature: 统计面板输出
   So that 及时发现性能瓶颈和设备异常
 
   Scenario: 终端环境下的 ANSI 清屏面板
-    Given stderr 是终端（isatty）
+    Given stdout 是终端（isatty）
     When Monitor 线程输出统计面板
     Then 应该先发送 ANSI 清屏序列（\033[2J\033[H）
     And 显示运行时间、Worker 活跃度、待处理任务数
@@ -630,7 +633,7 @@ Feature: 统计面板输出
     And 显示死设备数和判死设备数（如果有）
 
   Scenario: 非终端环境下的顺序输出
-    Given stderr 被重定向到文件
+    Given stdout 被重定向到文件
     When Monitor 线程输出统计面板
     Then 不发送 ANSI 控制序列
     And 以纯文本格式顺序追加输出

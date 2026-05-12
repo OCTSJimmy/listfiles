@@ -46,7 +46,7 @@ static void *async_writer_thread(void *arg) {
         OutputTask *task = local_head;
         while (task) {
             OutputTask *next = task->next;
-            if (w->state->output_fp && !w->cfg->mute) {
+            if (w->state->output_fp) {
                 print_to_stream(w->cfg, w->state, task->path, &task->st, w->state->output_fp);
                 w->state->output_line_count++;
                 if (w->cfg->is_output_split_dir && w->state->output_line_count >= w->cfg->output_slice_lines) {
