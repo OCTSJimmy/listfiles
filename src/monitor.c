@@ -242,6 +242,23 @@ static void check_workers_health(Monitor *mon) {
             ctx->state.has_error = true;
             /* Decrement pending_tasks so the system doesn't wait forever for a dead worker */
             atomic_fetch_sub(&ctx->pending_tasks, 1);
+            
+            /* [FIX] 将超时 Worker 的当前任务保存到 lost_tasks，稍后重新分发 */
+            if (slot->current_path[0] != '\0') {
+                if (ctx->lost_count >= ctx->lost_capacity) {
+                    size_t new_cap = ctx->lost_capacity ? ctx->lost_capacity * 2 : 64;
+                    char **new_arr = realloc(ctx->lost_tasks, new_cap * sizeof(char *));
+                    if (new_arr) {
+                        ctx->lost_tasks = new_arr;
+                        ctx->lost_capacity = new_cap;
+                    }
+                }
+                if (ctx->lost_count < ctx->lost_capacity) {
+                    ctx->lost_tasks[ctx->lost_count++] = strdup(slot->current_path);
+                    /* pending_tasks 在 monitor 中已减 1，重新分发时会再加 1 */
+                    atomic_fetch_add(&ctx->pending_tasks, 1);
+                }
+            }
         }
     }
 }

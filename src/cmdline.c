@@ -44,6 +44,7 @@ void show_help() {
     printf("      --batch-size=数量  Worker batch 大小 (默认: %d)\n", DEFAULT_BATCH_SIZE);
     printf("      --estimated-files=数量 预估文件数,用于预分配内存 (默认: %u)\n", (unsigned)DEFAULT_ESTIMATED_FILES);
     printf("      --master-threads=数量  Master 去重线程数 (默认: %d)\n", DEFAULT_MASTER_THREADS);
+    printf("      --worker-count=数量  Worker 进程数 (默认: 自动, 上限 8)\n");
     printf("  -t, --timeout=秒       心跳超时时间 (默认: %d)\n", HEARTBEAT_TIMEOUT_SEC);
     printf("\n输出控制:\n");
     printf("  -f, --progress-file=文件 进度文件/历史记录前缀 (默认: progress)\n");
@@ -102,6 +103,7 @@ void init_config(Config *cfg) {
     cfg->batch_size = DEFAULT_BATCH_SIZE;
     cfg->estimated_files = DEFAULT_ESTIMATED_FILES;
     cfg->master_threads = DEFAULT_MASTER_THREADS;
+    cfg->worker_count = 0;
 }
 
 /**
@@ -152,6 +154,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"batch-size", required_argument, 0, 23},
         {"estimated-files", required_argument, 0, 24},
         {"master-threads", required_argument, 0, 25},
+        {"worker-count", required_argument, 0, 26},
         {"timeout", required_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
@@ -233,6 +236,10 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 25:
                 cfg->master_threads = atoi(optarg);
                 if (cfg->master_threads < 1) cfg->master_threads = DEFAULT_MASTER_THREADS;
+                break;
+            case 26:
+                cfg->worker_count = atoi(optarg);
+                if (cfg->worker_count < 1) cfg->worker_count = 0;
                 break;
             case 't':
                 cfg->heartbeat_timeout = atol(optarg);

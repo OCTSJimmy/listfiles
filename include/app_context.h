@@ -55,6 +55,12 @@ typedef struct AppContext {
     int             epfd;
     bool            running;
     int             next_requeue_worker;
+    int             next_dispatch_worker;   // [新增] 轮询分发 Worker 索引
+    
+    /* === 丢失任务重入队（Worker 超时死亡时保存） === */
+    char          **lost_tasks;
+    size_t          lost_count;
+    size_t          lost_capacity;
     
     /* === 任务计数 === */
     _Atomic long    pending_tasks;

@@ -193,6 +193,7 @@ typedef struct {
     int batch_size;             // Worker batch 大小，默认 1024
     unsigned long estimated_files; // 预估文件数，用于预分配 HashSet
     int master_threads;         // Master 去重线程数，默认 4
+    int worker_count;           // [新增] Worker 进程数，0 表示自动（默认上限 8）
 } Config;
 
 // 运行时状态

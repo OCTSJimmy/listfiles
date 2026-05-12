@@ -308,9 +308,13 @@ int main(int argc, char *argv[]) {
     worker_set_context(&ctx.cfg, ctx.reference_set, ctx.reference_map);
 
     /* Create worker pool */
-    int num_cores = get_nprocs();
-    if (num_cores < 1) num_cores = 4;
-    int num_workers = num_cores * 2;
+    int num_workers = ctx.cfg.worker_count;
+    if (num_workers <= 0) {
+        int num_cores = get_nprocs();
+        if (num_cores < 1) num_cores = 4;
+        num_workers = num_cores * 2;
+        if (num_workers > 8) num_workers = 8;  // 默认上限 8，防止 NFS 过载
+    }
     ctx.worker_pool = worker_pool_create(num_workers);
     ctx.probe_scheduler = probe_scheduler_create();
     ctx.monitor = monitor_create(&ctx);

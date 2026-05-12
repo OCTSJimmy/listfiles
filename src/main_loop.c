@@ -186,13 +186,15 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
             } else {
                 atomic_fetch_add(&ctx->pending_tasks, 1);
                 uint32_t plen = (uint32_t)strlen(path);
-                WorkerSlot *slot = &ctx->worker_pool->slots[batch->worker_id];
+                /* [FIX] 轮询分发任务，避免所有任务堆积在单个 Worker 上 */
+                int wid = ctx->next_dispatch_worker % ctx->worker_pool->num_workers;
+                ctx->next_dispatch_worker++;
+                WorkerSlot *slot = &ctx->worker_pool->slots[wid];
                 slot->current_dev = st->st_dev;
                 safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
                 int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
                 if (rc == -2) {
                     /* fd_in is full (EAGAIN); enqueue to backlog to avoid deadlock */
-                    WorkerSlot *slot = &ctx->worker_pool->slots[batch->worker_id];
                     if (slot->backlog_count >= slot->backlog_capacity) {
                         int new_cap = slot->backlog_capacity ? slot->backlog_capacity * 2 : 64;
                         char **new_arr = realloc(slot->backlog_paths, new_cap * sizeof(char *));
@@ -206,7 +208,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                     } else {
                         /* Backlog full: drop task (rare with 1MB pipe buffer) */
                         atomic_fetch_sub(&ctx->pending_tasks, 1);
-                        fprintf(stderr, "[Warning] Worker %d backlog full, dropping task %s\n", batch->worker_id, path);
+                        fprintf(stderr, "[Warning] Worker %d backlog full, dropping task %s\n", wid, path);
                     }
                 }
             }
@@ -319,6 +321,59 @@ static void flush_worker_backlogs(AppContext *ctx) {
  *         对每个完成的 batch 调用 process_completed_batch 执行主线程副作用。
  *         本函数在 epoll eventfd 事件触发后和主循环每轮末尾调用。
  */
+/**
+ * @brief  将丢失的任务重新分发给 Worker
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ *
+ * @note   Worker 超时死亡时，其正在处理的任务会被保存到 lost_tasks 队列。
+ *         本函数在 epoll 循环中定期调用，将丢失的任务重新轮询分发给存活的 Worker。
+ *         若 ipc_send 返回 EAGAIN，则任务保留在队列中等待下次重试。
+ */
+static void dispatch_lost_tasks(AppContext *ctx) {
+    if (ctx->lost_count == 0) return;
+    
+    size_t dispatched = 0;
+    for (size_t i = 0; i < ctx->lost_count; i++) {
+        char *path = ctx->lost_tasks[i];
+        if (!path) continue;
+        
+        /* 轮询选择存活 Worker */
+        int wid = ctx->next_dispatch_worker % ctx->worker_pool->num_workers;
+        ctx->next_dispatch_worker++;
+        WorkerSlot *slot = &ctx->worker_pool->slots[wid];
+        if (!slot->is_alive) {
+            /* 该 Worker 已死亡，跳过，留待下次循环（可能已被替换） */
+            continue;
+        }
+        
+        uint32_t plen = (uint32_t)strlen(path);
+        int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
+        if (rc == -2) {
+            /* fd_in 满，停止分发，留待下次循环 */
+            break;
+        }
+        
+        /* 发送成功 */
+        slot->current_dev = 0;  /* 未知，将在 Worker 心跳中更新 */
+        safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
+        free(path);
+        ctx->lost_tasks[i] = NULL;
+        dispatched++;
+    }
+    
+    /* 压缩数组 */
+    if (dispatched > 0) {
+        size_t new_count = 0;
+        for (size_t i = 0; i < ctx->lost_count; i++) {
+            if (ctx->lost_tasks[i]) {
+                ctx->lost_tasks[new_count++] = ctx->lost_tasks[i];
+            }
+        }
+        ctx->lost_count = new_count;
+    }
+}
+
 static void drain_completed_batches(AppContext *ctx) {
     TPBatch *batch;
     while ((batch = thread_pool_poll_completed(ctx->thread_pool)) != NULL) {
@@ -477,6 +532,32 @@ void main_loop_run(AppContext *ctx) {
             WorkerSlot *slot = &ctx->worker_pool->slots[i];
             if (!slot->is_alive && slot->pid == -1) {
                 /* pid == -1 means killed by monitor but not yet reaped/replaced */
+                
+                /* [FIX] 将 backlog 中未发送的任务迁移到 lost_tasks，防止任务丢失 */
+                for (int j = 0; j < slot->backlog_count; j++) {
+                    char *path = slot->backlog_paths[j];
+                    if (!path) continue;
+                    if (ctx->lost_count >= ctx->lost_capacity) {
+                        size_t new_cap = ctx->lost_capacity ? ctx->lost_capacity * 2 : 64;
+                        char **new_arr = realloc(ctx->lost_tasks, new_cap * sizeof(char *));
+                        if (new_arr) {
+                            ctx->lost_tasks = new_arr;
+                            ctx->lost_capacity = new_cap;
+                        }
+                    }
+                    if (ctx->lost_count < ctx->lost_capacity) {
+                        ctx->lost_tasks[ctx->lost_count++] = path;
+                    } else {
+                        fprintf(stderr, "[Warning] Lost task queue full, dropping %s\n", path);
+                        free(path);
+                        atomic_fetch_sub(&ctx->pending_tasks, 1);
+                    }
+                }
+                free(slot->backlog_paths);
+                slot->backlog_paths = NULL;
+                slot->backlog_count = 0;
+                slot->backlog_capacity = 0;
+                
                 epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, slot->fd_out, NULL);
                 close(slot->fd_in);
                 close(slot->fd_out);
@@ -489,6 +570,9 @@ void main_loop_run(AppContext *ctx) {
             }
         }
 
+        /* Dispatch lost tasks (from timed-out workers) */
+        dispatch_lost_tasks(ctx);
+        
         /* Flush any backlogged tasks to workers (deadlock prevention) */
         flush_worker_backlogs(ctx);
 
