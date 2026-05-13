@@ -16,6 +16,7 @@
 #include "progress.h"
 #include "utils.h"
 #include "worker_proc.h"
+#include "main_loop.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,32 +237,8 @@ static void check_workers_health(Monitor *mon) {
             kill(slot->pid, SIGKILL);
             int status;
             waitpid(slot->pid, &status, WNOHANG);
-
-            /* [FIX] 排空 fd_in 中已写入但未读取的任务，防止 pending_tasks 幽灵化 */
-            int orphaned = 0;
-            if (slot->fd_in_rd >= 0) {
-                orphaned = ipc_drain_and_count_tasks(slot->fd_in_rd);
-                if (orphaned > 0) {
-                    fprintf(stderr, "[Monitor] Worker %d drained %d orphaned tasks from fd_in\n", i, orphaned);
-                }
-                close(slot->fd_in_rd);
-                slot->fd_in_rd = -1;
-            }
-            if (slot->fd_in >= 0) {
-                close(slot->fd_in);
-                slot->fd_in = -1;
-            }
-            if (slot->fd_out >= 0) {
-                close(slot->fd_out);
-                slot->fd_out = -1;
-            }
-
-            slot->is_alive = false;
-            slot->pid = -1;
-            ctx->worker_pool->active_count--;
+            cleanup_dead_worker_slot(ctx, i);
             ctx->state.has_error = true;
-            /* Decrement pending_tasks: 1 for the current task + orphaned tasks in fd_in */
-            atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
             
             /* [FIX] 将超时 Worker 的当前任务保存到 lost_tasks，稍后重新分发 */
             if (slot->current_path[0] != '\0') {
@@ -275,7 +252,7 @@ static void check_workers_health(Monitor *mon) {
                 }
                 if (ctx->lost_count < ctx->lost_capacity) {
                     ctx->lost_tasks[ctx->lost_count++] = strdup(slot->current_path);
-                    /* pending_tasks 在 monitor 中已减 1，重新分发时会再加 1 */
+                    /* pending_tasks 在 cleanup 中已减 1，重新分发时会再加 1 */
                     atomic_fetch_add(&ctx->pending_tasks, 1);
                 }
             }

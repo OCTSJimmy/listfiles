@@ -14,6 +14,7 @@
 #include "main_loop.h"
 #include "utils.h"
 #include "progress.h"
+#include "worker_proc.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -28,6 +29,85 @@
 #include <dirent.h>
 
 #define EVENTFD_SLOT_ID 0xFFFFFFFFU
+
+/**
+ * @brief  统一清理死亡 Worker 的资源并修正 pending_tasks
+ * @param  ctx       AppContext*  应用上下文
+ * @param  worker_id int          Worker 编号
+ * @return void
+ *
+ * @note   本函数用于所有 Worker 死亡路径（monitor timeout、epoll error、normal exit）。
+ *         会 drain fd_in_rd 中未读的 SCAN 任务，将 backlog 迁移到 lost_tasks，
+ *         关闭所有 fd，从 epoll 移除，并精确调整 pending_tasks。
+ *         幂等设计：重复调用同一 slot 安全（检查 fd >= 0）。
+ */
+void cleanup_dead_worker_slot(AppContext *ctx, int worker_id) {
+    if (!ctx || !ctx->worker_pool) return;
+    if (worker_id < 0 || worker_id >= ctx->worker_pool->num_workers) return;
+    WorkerSlot *slot = &ctx->worker_pool->slots[worker_id];
+    if (!slot->is_alive && slot->pid == -1) return; /* already cleaned */
+
+    /* Drain fd_in_rd to count orphaned SCAN tasks */
+    int orphaned = 0;
+    if (slot->fd_in_rd >= 0) {
+        orphaned = ipc_drain_and_count_tasks(slot->fd_in_rd);
+        if (orphaned > 0) {
+            fprintf(stderr, "[Cleanup] Worker %d drained %d orphaned tasks from fd_in_rd\n", worker_id, orphaned);
+        }
+        close(slot->fd_in_rd);
+        slot->fd_in_rd = -1;
+    }
+
+    /* Migrate backlog to lost_tasks */
+    for (int j = 0; j < slot->backlog_count; j++) {
+        char *path = slot->backlog_paths[j];
+        if (!path) continue;
+        if (ctx->lost_count >= ctx->lost_capacity) {
+            size_t new_cap = ctx->lost_capacity ? ctx->lost_capacity * 2 : 64;
+            char **new_arr = realloc(ctx->lost_tasks, new_cap * sizeof(char *));
+            if (new_arr) {
+                ctx->lost_tasks = new_arr;
+                ctx->lost_capacity = new_cap;
+            }
+        }
+        if (ctx->lost_count < ctx->lost_capacity) {
+            ctx->lost_tasks[ctx->lost_count++] = path;
+        } else {
+            fprintf(stderr, "[Warning] Lost task queue full, dropping %s\n", path);
+            free(path);
+            atomic_fetch_sub(&ctx->pending_tasks, 1);
+        }
+    }
+    free(slot->backlog_paths);
+    slot->backlog_paths = NULL;
+    slot->backlog_count = 0;
+    slot->backlog_capacity = 0;
+
+    /* Close write-end fd_in */
+    if (slot->fd_in >= 0) {
+        close(slot->fd_in);
+        slot->fd_in = -1;
+    }
+
+    /* Remove from epoll and close read-end fd_out */
+    if (ctx->epfd >= 0 && slot->fd_out >= 0) {
+        epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, slot->fd_out, NULL);
+    }
+    if (slot->fd_out >= 0) {
+        close(slot->fd_out);
+        slot->fd_out = -1;
+    }
+
+    /* Adjust counters: 1 for the current task + orphaned from fd_in_rd */
+    atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
+
+    /* Mark dead */
+    if (slot->is_alive) {
+        slot->is_alive = false;
+        ctx->worker_pool->active_count--;
+    }
+    slot->pid = -1;
+}
 
 /* ================================================================
  * Batch payload parser
@@ -480,15 +560,7 @@ void main_loop_run(AppContext *ctx) {
                 fprintf(stderr, "[Epoll] Worker %u recv_header failed (events=0x%x, fd=%d). Mark dead. active=%d->%d\n",
                         slot_id, events[i].events, ctx->worker_pool->slots[slot_id].fd_out,
                         ctx->worker_pool->active_count, ctx->worker_pool->active_count - 1);
-                WorkerSlot *slot = &ctx->worker_pool->slots[slot_id];
-                slot->is_alive = false;
-                ctx->worker_pool->active_count--;
-                if (ctx->epfd >= 0) {
-                    epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, slot->fd_out, NULL);
-                }
-                close(slot->fd_in);
-                close(slot->fd_out);
-                slot->pid = -1;
+                cleanup_dead_worker_slot(ctx, (int)slot_id);
                 continue;
             }
 
@@ -555,48 +627,10 @@ void main_loop_run(AppContext *ctx) {
         for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
             WorkerSlot *slot = &ctx->worker_pool->slots[i];
             if (!slot->is_alive && slot->pid == -1) {
-                /* pid == -1 means killed by monitor but not yet reaped/replaced */
-                fprintf(stderr, "[Replace] Replacing dead worker %d (pid=-1, backlog=%d)\n",
-                        i, slot->backlog_count);
+                /* Ensure cleanup has been performed (idempotent if already done) */
+                cleanup_dead_worker_slot(ctx, i);
                 
-                /* [FIX] 将 backlog 中未发送的任务迁移到 lost_tasks，防止任务丢失 */
-                for (int j = 0; j < slot->backlog_count; j++) {
-                    char *path = slot->backlog_paths[j];
-                    if (!path) continue;
-                    if (ctx->lost_count >= ctx->lost_capacity) {
-                        size_t new_cap = ctx->lost_capacity ? ctx->lost_capacity * 2 : 64;
-                        char **new_arr = realloc(ctx->lost_tasks, new_cap * sizeof(char *));
-                        if (new_arr) {
-                            ctx->lost_tasks = new_arr;
-                            ctx->lost_capacity = new_cap;
-                        }
-                    }
-                    if (ctx->lost_count < ctx->lost_capacity) {
-                        ctx->lost_tasks[ctx->lost_count++] = path;
-                    } else {
-                        fprintf(stderr, "[Warning] Lost task queue full, dropping %s\n", path);
-                        free(path);
-                        atomic_fetch_sub(&ctx->pending_tasks, 1);
-                    }
-                }
-                free(slot->backlog_paths);
-                slot->backlog_paths = NULL;
-                slot->backlog_count = 0;
-                slot->backlog_capacity = 0;
-                
-                if (slot->fd_out >= 0) {
-                    epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, slot->fd_out, NULL);
-                    close(slot->fd_out);
-                    slot->fd_out = -1;
-                }
-                if (slot->fd_in_rd >= 0) {
-                    close(slot->fd_in_rd);
-                    slot->fd_in_rd = -1;
-                }
-                if (slot->fd_in >= 0) {
-                    close(slot->fd_in);
-                    slot->fd_in = -1;
-                }
+                fprintf(stderr, "[Replace] Replacing dead worker %d\n", i);
                 worker_pool_replace(ctx->worker_pool, i);
                 /* Re-add new fd_out to epoll */
                 memset(&ev, 0, sizeof(ev));
@@ -759,16 +793,8 @@ void main_loop_handle_exit(AppContext *ctx, int worker_id) {
     WorkerSlot *slot = &ctx->worker_pool->slots[worker_id];
     fprintf(stderr, "[Exit] Worker %d normal exit (pid=%d). active=%d->%d\n",
             worker_id, slot->pid, ctx->worker_pool->active_count, ctx->worker_pool->active_count - 1);
-    slot->is_alive = false;
-    ctx->worker_pool->active_count--;
     /* Reap zombie immediately */
     int status;
     waitpid(slot->pid, &status, WNOHANG);
-    /* Clean up epoll fd and pipes so replacement can happen */
-    if (ctx->epfd >= 0) {
-        epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, slot->fd_out, NULL);
-    }
-    close(slot->fd_in);
-    close(slot->fd_out);
-    slot->pid = -1;
+    cleanup_dead_worker_slot(ctx, worker_id);
 }
