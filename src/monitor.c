@@ -236,6 +236,16 @@ static void check_workers_health(Monitor *mon) {
             int status;
             waitpid(slot->pid, &status, WNOHANG);
 
+            /* [FIX] 关闭管道 fd，防止主线程继续向 dead worker 写入数据导致任务幽灵化 */
+            if (slot->fd_in >= 0) {
+                close(slot->fd_in);
+                slot->fd_in = -1;
+            }
+            if (slot->fd_out >= 0) {
+                close(slot->fd_out);
+                slot->fd_out = -1;
+            }
+
             slot->is_alive = false;
             slot->pid = -1;
             ctx->worker_pool->active_count--;

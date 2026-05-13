@@ -190,14 +190,14 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                 int wid = ctx->next_dispatch_worker % ctx->worker_pool->num_workers;
                 ctx->next_dispatch_worker++;
                 WorkerSlot *slot = &ctx->worker_pool->slots[wid];
-                slot->current_dev = st->st_dev;
-                safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
-                int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
                 if (!slot->is_alive) {
                     fprintf(stderr, "[Dispatch] WARNING: selected dead worker %d (path=%s), skipping\n", wid, path);
                     atomic_fetch_sub(&ctx->pending_tasks, 1);
                     continue;
                 }
+                slot->current_dev = st->st_dev;
+                safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
+                int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
                 if (rc == -1) {
                     fprintf(stderr, "[Dispatch] ipc_send to worker %d failed: errno=%d (%s), path=%s\n",
                             wid, errno, strerror(errno), path);
@@ -546,6 +546,11 @@ void main_loop_run(AppContext *ctx) {
             pump_pbin_batch(ctx, ctx->cfg.batch_size);
         }
 
+        /* Reap any zombie children first */
+        for (int i = 0; i < ctx->worker_pool->num_workers * 2; i++) {
+            if (waitpid(-1, NULL, WNOHANG) <= 0) break;
+        }
+
         /* Replace dead workers */
         for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
             WorkerSlot *slot = &ctx->worker_pool->slots[i];
@@ -579,9 +584,15 @@ void main_loop_run(AppContext *ctx) {
                 slot->backlog_count = 0;
                 slot->backlog_capacity = 0;
                 
-                epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, slot->fd_out, NULL);
-                close(slot->fd_in);
-                close(slot->fd_out);
+                if (slot->fd_out >= 0) {
+                    epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, slot->fd_out, NULL);
+                    close(slot->fd_out);
+                    slot->fd_out = -1;
+                }
+                if (slot->fd_in >= 0) {
+                    close(slot->fd_in);
+                    slot->fd_in = -1;
+                }
                 worker_pool_replace(ctx->worker_pool, i);
                 /* Re-add new fd_out to epoll */
                 memset(&ev, 0, sizeof(ev));

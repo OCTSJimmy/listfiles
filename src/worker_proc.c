@@ -321,6 +321,7 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
     }
 
     struct dirent *entry;
+    int entries_since_hb = 0;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.' &&
             (entry->d_name[1] == '\0' || (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) {
@@ -349,6 +350,13 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
             paths[count] = strdup(full_path);
             stats[count] = st;
             count++;
+        }
+
+        /* Send intermediate heartbeat every 256 entries to prevent monitor timeout on huge dirs */
+        if (++entries_since_hb >= 256) {
+            IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
+            ipc_send(fd_out, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
+            entries_since_hb = 0;
         }
 
         if (count >= batch_size) {
