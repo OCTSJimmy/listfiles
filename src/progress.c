@@ -1169,15 +1169,18 @@ static void on_pbin_slice_consumed(AppContext *ctx) {
         ctx->hist_pump_fp = NULL;
     }
 
-    /* Try to open next scattered slice */
-    ctx->hist_pump_slice_idx++;
-    char *next_path = get_slice_filename(ctx->cfg.progress_base, ctx->hist_pump_slice_idx);
-    ctx->hist_pump_fp = fopen(next_path, "rb");
-    free(next_path);
-
-    if (ctx->hist_pump_fp) {
-        ctx->hist_pump_line_no = 0;
-        return;  /* Continue pumping next slice */
+    /* Try to open next scattered slice, skipping gaps (archived slices) */
+    int missing = 0;
+    while (missing <= 50) {
+        ctx->hist_pump_slice_idx++;
+        char *next_path = get_slice_filename(ctx->cfg.progress_base, ctx->hist_pump_slice_idx);
+        ctx->hist_pump_fp = fopen(next_path, "rb");
+        free(next_path);
+        if (ctx->hist_pump_fp) {
+            ctx->hist_pump_line_no = 0;
+            return;  /* Continue pumping next slice */
+        }
+        missing++;
     }
 
     /* No more scattered slices. Check fpbin. */
@@ -1473,6 +1476,19 @@ int restore_progress(const Config *cfg, AppContext *ctx) {
             ctx->hist_pump_state = HIST_PUMP_OLD;
             ctx->hist_pump_slice_idx = ctx->state.write_slice_index;
             ctx->hist_pump_line_no = ctx->state.line_count;
+        }
+    }
+
+    /* Fallback: if current slice is empty/missing, try pumping from slice 0
+     * to replay all scattered slices (needed after abnormal termination) */
+    if (ctx->hist_pump_state == HIST_PUMP_DONE) {
+        char *first_slice = get_slice_filename(cfg->progress_base, 0);
+        ctx->hist_pump_fp = fopen(first_slice, "rb");
+        free(first_slice);
+        if (ctx->hist_pump_fp) {
+            ctx->hist_pump_state = HIST_PUMP_OLD;
+            ctx->hist_pump_slice_idx = 0;
+            ctx->hist_pump_line_no = 0;
         }
     }
 

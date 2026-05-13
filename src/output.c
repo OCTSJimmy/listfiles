@@ -488,7 +488,9 @@ void close_output_file(FILE *fp) {
 void init_output_files(const Config *cfg, RuntimeState *state) {
     // 1. 初始化计数器和状态
     state->output_line_count = 0;
-    state->output_slice_num = 1;
+    if (state->output_slice_num == 0) {
+        state->output_slice_num = 1;  /* 仅当未从索引恢复时才重置 */
+    }
     state->start_time = time(NULL);
     state->completed_count = 0;
     state->current_path = NULL;
