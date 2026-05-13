@@ -193,6 +193,14 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                 slot->current_dev = st->st_dev;
                 safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
                 int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
+                if (!slot->is_alive) {
+                    fprintf(stderr, "[Dispatch] WARNING: task sent to dead worker %d (path=%s, fd_in=%d, rc=%d)\n",
+                            wid, path, slot->fd_in, rc);
+                }
+                if (rc == -1) {
+                    fprintf(stderr, "[Dispatch] ipc_send to worker %d failed: errno=%d (%s), path=%s\n",
+                            wid, errno, strerror(errno), path);
+                }
                 if (rc == -2) {
                     /* fd_in is full (EAGAIN); enqueue to backlog to avoid deadlock */
                     if (slot->backlog_count >= slot->backlog_capacity) {
@@ -343,7 +351,7 @@ static void dispatch_lost_tasks(AppContext *ctx) {
         ctx->next_dispatch_worker++;
         WorkerSlot *slot = &ctx->worker_pool->slots[wid];
         if (!slot->is_alive) {
-            /* 该 Worker 已死亡，跳过，留待下次循环（可能已被替换） */
+            fprintf(stderr, "[LostTasks] skip dead worker %d (path=%s)\n", wid, path);
             continue;
         }
         
@@ -468,6 +476,9 @@ void main_loop_run(AppContext *ctx) {
             IpcMessageHeader hdr;
             if (ipc_recv_header(ctx->worker_pool->slots[slot_id].fd_out, &hdr) != 0) {
                 /* Worker pipe broken, mark dead */
+                fprintf(stderr, "[Epoll] Worker %u recv_header failed (events=0x%x, fd=%d). Mark dead. active=%d->%d\n",
+                        slot_id, events[i].events, ctx->worker_pool->slots[slot_id].fd_out,
+                        ctx->worker_pool->active_count, ctx->worker_pool->active_count - 1);
                 ctx->worker_pool->slots[slot_id].is_alive = false;
                 ctx->worker_pool->active_count--;
                 continue;
@@ -532,6 +543,8 @@ void main_loop_run(AppContext *ctx) {
             WorkerSlot *slot = &ctx->worker_pool->slots[i];
             if (!slot->is_alive && slot->pid == -1) {
                 /* pid == -1 means killed by monitor but not yet reaped/replaced */
+                fprintf(stderr, "[Replace] Replacing dead worker %d (pid=-1, backlog=%d)\n",
+                        i, slot->backlog_count);
                 
                 /* [FIX] 将 backlog 中未发送的任务迁移到 lost_tasks，防止任务丢失 */
                 for (int j = 0; j < slot->backlog_count; j++) {
@@ -721,6 +734,8 @@ void main_loop_handle_error(AppContext *ctx, int worker_id, const IpcErrorHeader
 void main_loop_handle_exit(AppContext *ctx, int worker_id) {
     if (worker_id < 0 || worker_id >= ctx->worker_pool->num_workers) return;
     WorkerSlot *slot = &ctx->worker_pool->slots[worker_id];
+    fprintf(stderr, "[Exit] Worker %d normal exit (pid=%d). active=%d->%d\n",
+            worker_id, slot->pid, ctx->worker_pool->active_count, ctx->worker_pool->active_count - 1);
     slot->is_alive = false;
     ctx->worker_pool->active_count--;
     /* Reap zombie immediately */

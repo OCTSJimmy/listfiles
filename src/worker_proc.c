@@ -99,8 +99,17 @@ int ipc_recv_header(int fd, IpcMessageHeader *hdr) {
     size_t nread = 0;
     while (nread < sizeof(*hdr)) {
         ssize_t n = read(fd, (char*)hdr + nread, sizeof(*hdr) - nread);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
-        if (n == 0) return -1; /* EOF */
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            int saved_errno = errno;
+            fprintf(stderr, "[IPC] recv_header error on fd=%d: errno=%d (%s)\n",
+                    fd, saved_errno, strerror(saved_errno));
+            return -1;
+        }
+        if (n == 0) {
+            fprintf(stderr, "[IPC] recv_header EOF on fd=%d\n", fd);
+            return -1; /* EOF */
+        }
         nread += n;
     }
     return 0;
@@ -384,7 +393,10 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
     (void)worker_id;
     while (1) {
         IpcMessageHeader hdr;
-        if (ipc_recv_header(fd_in, &hdr) != 0) break;
+        if (ipc_recv_header(fd_in, &hdr) != 0) {
+            fprintf(stderr, "[Worker] worker_main exiting: ipc_recv_header failed on fd_in=%d\n", fd_in);
+            break;
+        }
 
         if (hdr.msg_type == IPC_MSG_STOP) {
             ipc_send(fd_out, IPC_MSG_EXIT, NULL, 0);
