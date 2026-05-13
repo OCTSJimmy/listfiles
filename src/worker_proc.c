@@ -137,6 +137,49 @@ int ipc_recv_payload(int fd, void *buf, uint32_t len) {
     return 0;
 }
 
+/**
+ * @brief  排空 worker 的 fd_in 管道并统计其中未处理的 SCAN 任务数量
+ * @param  fd_in  int  worker 的输入管道 fd（master 写入端已关闭，此处读取剩余端）
+ * @return int  返回排空的 SCAN 任务数量
+ *
+ * @note   在 monitor kill worker 后调用，用于精确递减 pending_tasks，防止任务幽灵化。
+ *         对 EAGAIN 静默处理（非阻塞管道正常结束条件），不打印错误日志。
+ */
+int ipc_drain_and_count_tasks(int fd_in) {
+    if (fd_in < 0) return 0;
+    int count = 0;
+    while (1) {
+        IpcMessageHeader hdr;
+        ssize_t n = read(fd_in, (char*)&hdr, sizeof(hdr));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break; /* EAGAIN or real error -> pipe empty */
+        }
+        if (n == 0) break; /* EOF */
+        if ((size_t)n < sizeof(hdr)) break; /* partial header -> stop */
+
+        if (hdr.msg_type == IPC_MSG_SCAN) count++;
+
+        if (hdr.payload_len > 0) {
+            uint8_t *buf = malloc(hdr.payload_len);
+            if (buf) {
+                size_t nread = 0;
+                while (nread < hdr.payload_len) {
+                    ssize_t nr = read(fd_in, buf + nread, hdr.payload_len - nread);
+                    if (nr < 0) {
+                        if (errno == EINTR) continue;
+                        break;
+                    }
+                    if (nr == 0) break;
+                    nread += nr;
+                }
+                free(buf);
+            }
+        }
+    }
+    return count;
+}
+
 /* ================================================================
  * Worker-side scan logic
  * ================================================================ */
@@ -481,6 +524,7 @@ void worker_pool_destroy(WorkerPool *pool) {
         if (slot->is_alive) {
             kill(slot->pid, SIGKILL);
             close(slot->fd_in);
+            if (slot->fd_in_rd >= 0) close(slot->fd_in_rd);
             close(slot->fd_out);
         }
         /* Free backlog paths */
@@ -560,8 +604,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
         _exit(0);
     }
 
-    /* Parent */
-    close(in_pipe[0]);
+    /* Parent: keep in_pipe[0] for draining orphaned tasks after worker death */
     close(out_pipe[1]);
 
     /* Master write end must be non-blocking to prevent bidirectional pipe deadlock */
@@ -571,6 +614,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     WorkerSlot *slot = &pool->slots[slot_id];
     slot->pid = pid;
     slot->fd_in = in_pipe[1];
+    slot->fd_in_rd = in_pipe[0];
     slot->fd_out = out_pipe[0];
     slot->is_alive = true;
     slot->last_heartbeat = time(NULL);
@@ -600,6 +644,10 @@ bool worker_pool_replace(WorkerPool *pool, int slot_id) {
         /* Do NOT block on waitpid: process may be stuck in D-state.
          * Zombie will be reaped later by main loop's periodic waitpid(-1, WNOHANG). */
         close(slot->fd_in);
+        if (slot->fd_in_rd >= 0) {
+            close(slot->fd_in_rd);
+            slot->fd_in_rd = -1;
+        }
         close(slot->fd_out);
         slot->is_alive = false;
         pool->active_count--;

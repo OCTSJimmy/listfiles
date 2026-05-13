@@ -13,6 +13,7 @@ typedef struct {
     int      slot_id;
     pid_t    pid;
     int      fd_in;            /* master write end */
+    int      fd_in_rd;         /* master read end of fd_in pipe (for draining orphaned tasks) */
     int      fd_out;           /* master read end */
     time_t   last_heartbeat;
     bool     is_alive;
@@ -45,6 +46,7 @@ void worker_set_context(const Config *cfg, const FingerprintSet *ref_set, const 
 int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_len);
 int ipc_recv_header(int fd, IpcMessageHeader *hdr);
 int ipc_recv_payload(int fd, void *buf, uint32_t len);
+int ipc_drain_and_count_tasks(int fd_in);
 
 /* Worker process entry point (called in child after fork) */
 void worker_main(int fd_in, int fd_out, int worker_id);

@@ -589,6 +589,10 @@ void main_loop_run(AppContext *ctx) {
                     close(slot->fd_out);
                     slot->fd_out = -1;
                 }
+                if (slot->fd_in_rd >= 0) {
+                    close(slot->fd_in_rd);
+                    slot->fd_in_rd = -1;
+                }
                 if (slot->fd_in >= 0) {
                     close(slot->fd_in);
                     slot->fd_in = -1;

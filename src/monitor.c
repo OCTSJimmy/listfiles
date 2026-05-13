@@ -15,6 +15,7 @@
 #include "app_context.h"
 #include "progress.h"
 #include "utils.h"
+#include "worker_proc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,7 +237,16 @@ static void check_workers_health(Monitor *mon) {
             int status;
             waitpid(slot->pid, &status, WNOHANG);
 
-            /* [FIX] 关闭管道 fd，防止主线程继续向 dead worker 写入数据导致任务幽灵化 */
+            /* [FIX] 排空 fd_in 中已写入但未读取的任务，防止 pending_tasks 幽灵化 */
+            int orphaned = 0;
+            if (slot->fd_in_rd >= 0) {
+                orphaned = ipc_drain_and_count_tasks(slot->fd_in_rd);
+                if (orphaned > 0) {
+                    fprintf(stderr, "[Monitor] Worker %d drained %d orphaned tasks from fd_in\n", i, orphaned);
+                }
+                close(slot->fd_in_rd);
+                slot->fd_in_rd = -1;
+            }
             if (slot->fd_in >= 0) {
                 close(slot->fd_in);
                 slot->fd_in = -1;
@@ -250,8 +260,8 @@ static void check_workers_health(Monitor *mon) {
             slot->pid = -1;
             ctx->worker_pool->active_count--;
             ctx->state.has_error = true;
-            /* Decrement pending_tasks so the system doesn't wait forever for a dead worker */
-            atomic_fetch_sub(&ctx->pending_tasks, 1);
+            /* Decrement pending_tasks: 1 for the current task + orphaned tasks in fd_in */
+            atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
             
             /* [FIX] 将超时 Worker 的当前任务保存到 lost_tasks，稍后重新分发 */
             if (slot->current_path[0] != '\0') {
