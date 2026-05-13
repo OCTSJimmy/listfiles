@@ -461,6 +461,15 @@ FILE* create_output_file(const char *path) {
     return fp;
 }
 
+FILE* open_output_file_append(const char *path) {
+    FILE *fp = fopen(path, "a");
+    if (!fp) {
+        fprintf(stderr, "打开输出文件%s失败", path);
+        return NULL;
+    }
+    return fp;
+}
+
 /**
  * @brief  关闭输出文件
  * @param  fp  FILE*  要关闭的文件指针，允许传入 NULL、stdout 或 stderr（空操作）
@@ -487,7 +496,9 @@ void close_output_file(FILE *fp) {
  */
 void init_output_files(const Config *cfg, RuntimeState *state) {
     // 1. 初始化计数器和状态
-    state->output_line_count = 0;
+    if (!cfg->continue_mode) {
+        state->output_line_count = 0;
+    }
     if (state->output_slice_num == 0) {
         state->output_slice_num = 1;  /* 仅当未从索引恢复时才重置 */
     }
@@ -504,11 +515,19 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
         }
         char slice_path[1024];
         snprintf(slice_path, sizeof(slice_path), "%s/" OUTPUT_SLICE_FORMAT, cfg->output_split_dir, state->output_slice_num);
-        state->output_fp = create_output_file(slice_path);
+        if (cfg->continue_mode && access(slice_path, F_OK) == 0) {
+            state->output_fp = open_output_file_append(slice_path);
+        } else {
+            state->output_fp = create_output_file(slice_path);
+        }
         if (!state->output_fp) state->output_fp = stdout;
     } else if (cfg->is_output_file && cfg->output_file) {
         // 模式 B: 单文件
-        state->output_fp = create_output_file(cfg->output_file);
+        if (cfg->continue_mode && access(cfg->output_file, F_OK) == 0) {
+            state->output_fp = open_output_file_append(cfg->output_file);
+        } else {
+            state->output_fp = create_output_file(cfg->output_file);
+        }
         if (!state->output_fp) state->output_fp = stdout;
     } else {
         // 模式 C: 标准输出
@@ -528,7 +547,7 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
             // 场景 6-Split: 写入 output_dir/scan_dirs.log
             char dir_log_path[1024];
             snprintf(dir_log_path, sizeof(dir_log_path), "%s/scan_dirs.log", cfg->output_split_dir);
-            state->dir_info_fp = fopen(dir_log_path, "w"); // 覆盖模式
+            state->dir_info_fp = fopen(dir_log_path, "a"); // 追加模式
             if (!state->dir_info_fp) {
                 fprintf(stderr, "[警告] 无法创建目录日志文件 %s，回退到 stderr\n", dir_log_path);
                 state->dir_info_fp = stderr;
@@ -537,7 +556,7 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
             // 场景 6-File: 写入 output_file.dir (例如 data.csv.dir)
             char dir_log_path[1024];
             snprintf(dir_log_path, sizeof(dir_log_path), "%s.dir", cfg->output_file);
-            state->dir_info_fp = fopen(dir_log_path, "w"); // 覆盖模式
+            state->dir_info_fp = fopen(dir_log_path, "a"); // 追加模式
             if (!state->dir_info_fp) {
                 fprintf(stderr, "[警告] 无法创建目录日志文件 %s，回退到 stderr\n", dir_log_path);
                 state->dir_info_fp = stderr;

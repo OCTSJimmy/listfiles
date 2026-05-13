@@ -264,9 +264,6 @@ int main(int argc, char *argv[]) {
     ctx.state.start_time = time(NULL);
     ctx.state.has_error = false;
     ctx.dev_mgr = dev_mgr_create();
-    init_output_files(&ctx.cfg, &ctx.state);
-    init_output_buffers(&ctx);
-    ctx.async_writer = async_worker_init(&ctx.cfg, &ctx.state);
 
     if (!ctx.cfg.continue_mode || ctx.cfg.runone || !has_history) {
         save_config_to_disk(&ctx.cfg);
@@ -337,6 +334,11 @@ int main(int argc, char *argv[]) {
     if (ctx.cfg.continue_mode && !ctx.reference_set) {
         restore_progress(&ctx.cfg, &ctx);
     }
+
+    /* [FIX] 必须在 restore_progress 之后初始化输出文件，否则 output_slice_num 等状态会被覆盖 */
+    init_output_files(&ctx.cfg, &ctx.state);
+    init_output_buffers(&ctx);
+    ctx.async_writer = async_worker_init(&ctx.cfg, &ctx.state);
 
     /* Seed root task */
     struct stat root_info;
