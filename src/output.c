@@ -517,16 +517,20 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
         snprintf(slice_path, sizeof(slice_path), "%s/" OUTPUT_SLICE_FORMAT, cfg->output_split_dir, state->output_slice_num);
         if (cfg->continue_mode && access(slice_path, F_OK) == 0) {
             state->output_fp = open_output_file_append(slice_path);
+            verbose_printf(cfg, 1, "恢复输出切片文件: %s\n", slice_path);
         } else {
             state->output_fp = create_output_file(slice_path);
+            verbose_printf(cfg, 1, "打开新切片文件: %s\n", slice_path);
         }
         if (!state->output_fp) state->output_fp = stdout;
     } else if (cfg->is_output_file && cfg->output_file) {
         // 模式 B: 单文件
         if (cfg->continue_mode && access(cfg->output_file, F_OK) == 0) {
             state->output_fp = open_output_file_append(cfg->output_file);
+            verbose_printf(cfg, 1, "恢复输出文件: %s\n", cfg->output_file);
         } else {
             state->output_fp = create_output_file(cfg->output_file);
+            verbose_printf(cfg, 1, "打开输出文件: %s\n", cfg->output_file);
         }
         if (!state->output_fp) state->output_fp = stdout;
     } else {
