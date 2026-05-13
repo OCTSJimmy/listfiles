@@ -194,8 +194,9 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                 safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
                 int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
                 if (!slot->is_alive) {
-                    fprintf(stderr, "[Dispatch] WARNING: task sent to dead worker %d (path=%s, fd_in=%d, rc=%d)\n",
-                            wid, path, slot->fd_in, rc);
+                    fprintf(stderr, "[Dispatch] WARNING: selected dead worker %d (path=%s), skipping\n", wid, path);
+                    atomic_fetch_sub(&ctx->pending_tasks, 1);
+                    continue;
                 }
                 if (rc == -1) {
                     fprintf(stderr, "[Dispatch] ipc_send to worker %d failed: errno=%d (%s), path=%s\n",
@@ -475,12 +476,19 @@ void main_loop_run(AppContext *ctx) {
 
             IpcMessageHeader hdr;
             if (ipc_recv_header(ctx->worker_pool->slots[slot_id].fd_out, &hdr) != 0) {
-                /* Worker pipe broken, mark dead */
+                /* Worker pipe broken, mark dead and clean up fd */
                 fprintf(stderr, "[Epoll] Worker %u recv_header failed (events=0x%x, fd=%d). Mark dead. active=%d->%d\n",
                         slot_id, events[i].events, ctx->worker_pool->slots[slot_id].fd_out,
                         ctx->worker_pool->active_count, ctx->worker_pool->active_count - 1);
-                ctx->worker_pool->slots[slot_id].is_alive = false;
+                WorkerSlot *slot = &ctx->worker_pool->slots[slot_id];
+                slot->is_alive = false;
                 ctx->worker_pool->active_count--;
+                if (ctx->epfd >= 0) {
+                    epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, slot->fd_out, NULL);
+                }
+                close(slot->fd_in);
+                close(slot->fd_out);
+                slot->pid = -1;
                 continue;
             }
 
@@ -741,4 +749,11 @@ void main_loop_handle_exit(AppContext *ctx, int worker_id) {
     /* Reap zombie immediately */
     int status;
     waitpid(slot->pid, &status, WNOHANG);
+    /* Clean up epoll fd and pipes so replacement can happen */
+    if (ctx->epfd >= 0) {
+        epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, slot->fd_out, NULL);
+    }
+    close(slot->fd_in);
+    close(slot->fd_out);
+    slot->pid = -1;
 }
