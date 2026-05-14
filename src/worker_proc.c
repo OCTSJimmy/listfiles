@@ -522,7 +522,7 @@ void worker_pool_destroy(WorkerPool *pool) {
     if (!pool) return;
     for (int i = 0; i < pool->num_workers; i++) {
         WorkerSlot *slot = &pool->slots[i];
-        if (slot->is_alive) {
+        if (atomic_load(&slot->is_alive)) {
             kill(slot->pid, SIGKILL);
             close(slot->fd_in);
             if (slot->fd_in_rd >= 0) close(slot->fd_in_rd);
@@ -625,8 +625,8 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     slot->fd_in = in_pipe[1];
     slot->fd_in_rd = in_pipe[0];
     slot->fd_out = out_pipe[0];
-    slot->is_alive = true;
-    slot->last_heartbeat = time(NULL);
+    atomic_store(&slot->is_alive, true);
+    atomic_store(&slot->last_heartbeat, time(NULL));
     slot->current_dev = 0;
     slot->current_path[0] = '\0';
     slot->backlog_paths = NULL;
@@ -648,7 +648,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
  */
 bool worker_pool_replace(WorkerPool *pool, int slot_id) {
     WorkerSlot *slot = &pool->slots[slot_id];
-    if (slot->is_alive) {
+    if (atomic_load(&slot->is_alive)) {
         kill(slot->pid, SIGKILL);
         /* Do NOT block on waitpid: process may be stuck in D-state.
          * Zombie will be reaped later by main loop's periodic waitpid(-1, WNOHANG). */
@@ -658,7 +658,7 @@ bool worker_pool_replace(WorkerPool *pool, int slot_id) {
             slot->fd_in_rd = -1;
         }
         close(slot->fd_out);
-        slot->is_alive = false;
+        atomic_store(&slot->is_alive, false);
         atomic_fetch_sub(&pool->active_count, 1);
     }
     return worker_pool_spawn(pool, slot_id);

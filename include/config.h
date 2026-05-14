@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "12.2.13" // 版本号升级：修复 active_count 和 lost_tasks 数据竞争
+#define VERSION "12.2.14" // 版本号升级：修复 active_count 和 lost_tasks 数据竞争
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000

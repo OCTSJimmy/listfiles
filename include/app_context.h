@@ -23,6 +23,7 @@ typedef struct {
 #include "spbin.h"
 #include "thread_pool.h"
 #include "monitor.h"
+#include "lost_tasks.h"
 
 /* 恢复流程中的历史目录泵送状态 */
 typedef enum {
@@ -57,10 +58,7 @@ typedef struct AppContext {
     int             next_requeue_worker;
     int             next_dispatch_worker;   // [新增] 轮询分发 Worker 索引
     
-    pthread_mutex_t lost_tasks_mutex;  /* 保护 lost_tasks 数组的并发访问 */
-    char          **lost_tasks;
-    size_t          lost_count;
-    size_t          lost_capacity;
+    LostTasksQueue  lost_tasks;
     
     /* === 任务计数 === */
     _Atomic long    pending_tasks;

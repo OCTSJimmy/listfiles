@@ -43,7 +43,7 @@ static void app_context_init(AppContext *ctx) {
     ctx->next_requeue_worker = 0;
     atomic_init(&ctx->pending_tasks, 0);
     atomic_init(&ctx->pending_batches, 0);
-    pthread_mutex_init(&ctx->lost_tasks_mutex, NULL);
+    lost_tasks_init(&ctx->lost_tasks);
     record_path_batch_init(&ctx->record_batch);
 }
 
@@ -90,7 +90,7 @@ static void app_context_destroy(AppContext *ctx) {
         fp_set_destroy(ctx->visited_set);
         ctx->visited_set = NULL;
     }
-    pthread_mutex_destroy(&ctx->lost_tasks_mutex);
+    lost_tasks_destroy(&ctx->lost_tasks);
     if (ctx->reference_set) {
         fp_set_destroy(ctx->reference_set);
         ctx->reference_set = NULL;

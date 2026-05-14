@@ -142,7 +142,7 @@ void print_progress(Monitor *mon) {
     if (ctx->worker_pool) {
         total_workers = ctx->worker_pool->num_workers;
         for (int i = 0; i < total_workers; i++) {
-            if (ctx->worker_pool->slots[i].is_alive) alive_workers++;
+            if (atomic_load(&ctx->worker_pool->slots[i].is_alive)) alive_workers++;
         }
     }
 
@@ -225,9 +225,9 @@ static void check_workers_health(Monitor *mon) {
 
     for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
         WorkerSlot *slot = &ctx->worker_pool->slots[i];
-        if (!slot->is_alive) continue;
+        if (!atomic_load(&slot->is_alive)) continue;
 
-        if (now - slot->last_heartbeat > timeout) {
+        if (now - atomic_load(&slot->last_heartbeat) > timeout) {
             char timebuf[32];
             struct tm *tm_info = localtime(&now);
             strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
@@ -237,7 +237,7 @@ static void check_workers_health(Monitor *mon) {
             kill(slot->pid, SIGKILL);
             int status;
             waitpid(slot->pid, &status, WNOHANG);
-            cleanup_dead_worker_slot(ctx, i);
+            cleanup_dead_worker_slot(ctx, i, true);
             ctx->state.has_error = true;
         }
     }

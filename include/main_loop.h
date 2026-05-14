@@ -6,7 +6,7 @@
 void main_loop_run(AppContext *ctx);
 
 /* Worker death cleanup: drain fd_in_rd, migrate backlog, adjust pending_tasks, close fds */
-void cleanup_dead_worker_slot(AppContext *ctx, int worker_id);
+void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_current);
 
 /* Internal handlers exposed for testing if needed */
 void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload, uint32_t len);

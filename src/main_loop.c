@@ -105,11 +105,11 @@ static int safe_ipc_recv_payload(int fd, void *buf, uint32_t len) {
  *         关闭所有 fd，从 epoll 移除，并精确调整 pending_tasks。
  *         幂等设计：重复调用同一 slot 安全（检查 fd >= 0）。
  */
-void cleanup_dead_worker_slot(AppContext *ctx, int worker_id) {
+void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_current) {
     if (!ctx || !ctx->worker_pool) return;
     if (worker_id < 0 || worker_id >= ctx->worker_pool->num_workers) return;
     WorkerSlot *slot = &ctx->worker_pool->slots[worker_id];
-    if (!slot->is_alive && slot->pid == -1) return; /* already cleaned */
+    if (!atomic_load(&slot->is_alive) && slot->pid == -1) return; /* already cleaned */
     if (atomic_flag_test_and_set(&slot->cleanup_done)) return; /* already cleaned by another path */
 
     /* Drain fd_in_rd to count orphaned SCAN tasks */
@@ -123,28 +123,8 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id) {
         slot->fd_in_rd = -1;
     }
 
-    /* Migrate backlog to lost_tasks */
-    pthread_mutex_lock(&ctx->lost_tasks_mutex);
-    for (int j = 0; j < slot->backlog_count; j++) {
-        char *path = slot->backlog_paths[j];
-        if (!path) continue;
-        if (ctx->lost_count >= ctx->lost_capacity) {
-            size_t new_cap = ctx->lost_capacity ? ctx->lost_capacity * 2 : 64;
-            char **new_arr = realloc(ctx->lost_tasks, new_cap * sizeof(char *));
-            if (new_arr) {
-                ctx->lost_tasks = new_arr;
-                ctx->lost_capacity = new_cap;
-            }
-        }
-        if (ctx->lost_count < ctx->lost_capacity) {
-            ctx->lost_tasks[ctx->lost_count++] = path;
-        } else {
-            fprintf(stderr, "[Warning] Lost task queue full, dropping %s\n", path);
-            free(path);
-            atomic_fetch_sub(&ctx->pending_tasks, 1);
-        }
-    }
-    pthread_mutex_unlock(&ctx->lost_tasks_mutex);
+    /* Migrate backlog to lost_tasks (all locking hidden inside LostTasksQueue) */
+    lost_tasks_push_backlog(&ctx->lost_tasks, slot->backlog_paths, slot->backlog_count);
     free(slot->backlog_paths);
     slot->backlog_paths = NULL;
     slot->backlog_count = 0;
@@ -168,9 +148,17 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id) {
     /* Adjust counters: 1 for the current task + orphaned from fd_in_rd */
     atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
 
+    /* Redispatch current_path if worker died unexpectedly (timeout / epoll error) */
+    if (redispatch_current && slot->current_path[0] != '\0') {
+        if (lost_tasks_push(&ctx->lost_tasks, strdup(slot->current_path))) {
+            /* pending_tasks 上面已减 1，重新分发时会由 process_completed_batch 最终 -1 */
+            atomic_fetch_add(&ctx->pending_tasks, 1);
+        }
+    }
+
     /* Mark dead */
-    if (slot->is_alive) {
-        slot->is_alive = false;
+    if (atomic_load(&slot->is_alive)) {
+        atomic_store(&slot->is_alive, false);
         atomic_fetch_sub(&ctx->worker_pool->active_count, 1);
     }
     slot->pid = -1;
@@ -337,7 +325,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                 int wid = ctx->next_dispatch_worker % ctx->worker_pool->num_workers;
                 ctx->next_dispatch_worker++;
                 WorkerSlot *slot = &ctx->worker_pool->slots[wid];
-                if (!slot->is_alive) {
+                if (!atomic_load(&slot->is_alive)) {
                     fprintf(stderr, "[Dispatch] WARNING: selected dead worker %d (path=%s), skipping\n", wid, path);
                     atomic_fetch_sub(&ctx->pending_tasks, 1);
                     continue;
@@ -443,7 +431,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
 static void flush_worker_backlogs(AppContext *ctx) {
     for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
         WorkerSlot *slot = &ctx->worker_pool->slots[i];
-        if (!slot->is_alive || slot->backlog_count == 0) continue;
+        if (!atomic_load(&slot->is_alive) || slot->backlog_count == 0) continue;
         
         int sent = 0;
         for (int j = 0; j < slot->backlog_count; j++) {
@@ -493,57 +481,40 @@ static void flush_worker_backlogs(AppContext *ctx) {
  *         若 ipc_send 返回 EAGAIN，则任务保留在队列中等待下次重试。
  */
 static void dispatch_lost_tasks(AppContext *ctx) {
-    if (ctx->lost_count == 0) return;
-
-    pthread_mutex_lock(&ctx->lost_tasks_mutex);
-    size_t dispatched = 0;
-    for (size_t i = 0; i < ctx->lost_count; i++) {
-        char *path = ctx->lost_tasks[i];
+    char *path;
+    while (lost_tasks_pop(&ctx->lost_tasks, &path)) {
         if (!path) continue;
-        
+
         /* 轮询选择存活 Worker */
         int wid = ctx->next_dispatch_worker % ctx->worker_pool->num_workers;
         ctx->next_dispatch_worker++;
         WorkerSlot *slot = &ctx->worker_pool->slots[wid];
-        if (!slot->is_alive) {
-            fprintf(stderr, "[LostTasks] skip dead worker %d (path=%s)\n", wid, path);
+        if (!atomic_load(&slot->is_alive)) {
+            fprintf(stderr, "[LostTasks] skip dead worker %d (path=%s), requeue\n", wid, path);
+            lost_tasks_push(&ctx->lost_tasks, path);
             continue;
         }
-        
+
         uint32_t plen = (uint32_t)strlen(path);
         int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
         if (rc == -2) {
-            /* fd_in 满，停止分发，留待下次循环 */
+            /* fd_in 满，送回队列，留待下次循环 */
+            lost_tasks_push(&ctx->lost_tasks, path);
             break;
         }
         if (rc == -1) {
             fprintf(stderr, "[LostTasks] ipc_send failed for %s, dropping\n", path);
             atomic_fetch_sub(&ctx->pending_tasks, 1);
             free(path);
-            ctx->lost_tasks[i] = NULL;
-            dispatched++;
             continue;
         }
-        
+
         /* 发送成功 */
         slot->current_dev = 0;  /* 未知，将在 Worker 心跳中更新 */
         safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
         free(path);
-        ctx->lost_tasks[i] = NULL;
-        dispatched++;
     }
-    
-    /* 压缩数组 */
-    if (dispatched > 0) {
-        size_t new_count = 0;
-        for (size_t i = 0; i < ctx->lost_count; i++) {
-            if (ctx->lost_tasks[i]) {
-                ctx->lost_tasks[new_count++] = ctx->lost_tasks[i];
-            }
-        }
-        ctx->lost_count = new_count;
-    }
-    pthread_mutex_unlock(&ctx->lost_tasks_mutex);
+    lost_tasks_compact(&ctx->lost_tasks);
 }
 
 static void drain_completed_batches(AppContext *ctx) {
@@ -639,12 +610,12 @@ void main_loop_run(AppContext *ctx) {
                 fprintf(stderr, "[Epoll] Worker %u fd error/hup (events=0x%x, fd=%d). Mark dead. active=%d->%d\n",
                         slot_id, events[i].events, ctx->worker_pool->slots[slot_id].fd_out,
                         atomic_load(&ctx->worker_pool->active_count), atomic_load(&ctx->worker_pool->active_count) - 1);
-                cleanup_dead_worker_slot(ctx, (int)slot_id);
+                cleanup_dead_worker_slot(ctx, (int)slot_id, true);
                 continue;
             }
 
             /* Skip events from workers already marked dead by monitor */
-            if (!ctx->worker_pool->slots[slot_id].is_alive) continue;
+            if (!atomic_load(&ctx->worker_pool->slots[slot_id].is_alive)) continue;
 
             IpcMessageHeader hdr;
             int rc_hdr = safe_ipc_recv_header(ctx->worker_pool->slots[slot_id].fd_out, &hdr);
@@ -657,7 +628,7 @@ void main_loop_run(AppContext *ctx) {
                 fprintf(stderr, "[Epoll] Worker %u recv_header failed (events=0x%x, fd=%d). Mark dead. active=%d->%d\n",
                         slot_id, events[i].events, ctx->worker_pool->slots[slot_id].fd_out,
                         atomic_load(&ctx->worker_pool->active_count), atomic_load(&ctx->worker_pool->active_count) - 1);
-                cleanup_dead_worker_slot(ctx, (int)slot_id);
+                cleanup_dead_worker_slot(ctx, (int)slot_id, true);
                 continue;
             }
 
@@ -681,7 +652,7 @@ void main_loop_run(AppContext *ctx) {
                     } else {
                         fprintf(stderr, "[Epoll] Worker %u payload recv failed (fd=%d). Mark dead.\n",
                                 slot_id, ctx->worker_pool->slots[slot_id].fd_out);
-                        cleanup_dead_worker_slot(ctx, (int)slot_id);
+                        cleanup_dead_worker_slot(ctx, (int)slot_id, true);
                     }
                     continue;
                 }
@@ -733,10 +704,9 @@ void main_loop_run(AppContext *ctx) {
         /* Replace dead workers */
         for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
             WorkerSlot *slot = &ctx->worker_pool->slots[i];
-            if (!slot->is_alive && slot->pid == -1) {
+            if (!atomic_load(&slot->is_alive) && slot->pid == -1) {
                 /* Ensure cleanup has been performed (idempotent if already done) */
-                cleanup_dead_worker_slot(ctx, i);
-                
+                cleanup_dead_worker_slot(ctx, i, true);
                 fprintf(stderr, "[Replace] Replacing dead worker %d\n", i);
                 worker_pool_replace(ctx->worker_pool, i);
                 /* Re-add new fd_out to epoll */
@@ -833,7 +803,7 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
  */
 void main_loop_handle_heartbeat(AppContext *ctx, int worker_id, uint64_t timestamp) {
     if (worker_id < 0 || worker_id >= ctx->worker_pool->num_workers) return;
-    ctx->worker_pool->slots[worker_id].last_heartbeat = (time_t)timestamp;
+    atomic_store(&ctx->worker_pool->slots[worker_id].last_heartbeat, (time_t)timestamp);
 }
 
 /**
@@ -903,5 +873,5 @@ void main_loop_handle_exit(AppContext *ctx, int worker_id) {
     /* Reap zombie immediately */
     int status;
     waitpid(slot->pid, &status, WNOHANG);
-    cleanup_dead_worker_slot(ctx, worker_id);
+    cleanup_dead_worker_slot(ctx, worker_id, false);
 }

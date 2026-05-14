@@ -16,8 +16,8 @@ typedef struct {
     int      fd_in;            /* master write end */
     int      fd_in_rd;         /* master read end of fd_in pipe (for draining orphaned tasks) */
     int      fd_out;           /* master read end */
-    time_t   last_heartbeat;
-    bool     is_alive;
+    _Atomic time_t last_heartbeat;
+    _Atomic bool   is_alive;
     uint64_t current_dev;
     char     current_path[4096]; /* 从 40 扩展到 4096，防止路径截断 */
     char   **backlog_paths;
@@ -53,6 +53,6 @@ void worker_main(int fd_in, int fd_out, int worker_id);
 struct AppContext;
 
 /* Main loop cleanup */
-void cleanup_dead_worker_slot(struct AppContext *ctx, int worker_id);
+void cleanup_dead_worker_slot(struct AppContext *ctx, int worker_id, bool redispatch_current);
 
 #endif
