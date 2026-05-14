@@ -57,7 +57,7 @@ typedef struct AppContext {
     int             next_requeue_worker;
     int             next_dispatch_worker;   // [新增] 轮询分发 Worker 索引
     
-    /* === 丢失任务重入队（Worker 超时死亡时保存） === */
+    pthread_mutex_t lost_tasks_mutex;  /* 保护 lost_tasks 数组的并发访问 */
     char          **lost_tasks;
     size_t          lost_count;
     size_t          lost_capacity;

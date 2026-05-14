@@ -505,7 +505,7 @@ WorkerPool* worker_pool_create(int num_workers) {
     pool->slots = calloc(num_workers, sizeof(WorkerSlot));
     if (!pool->slots) { free(pool); return NULL; }
     pool->num_workers = num_workers;
-    pool->active_count = 0;
+    atomic_store(&pool->active_count, 0);
     return pool;
 }
 
@@ -632,7 +632,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     slot->backlog_paths = NULL;
     slot->backlog_count = 0;
     slot->backlog_capacity = 0;
-    pool->active_count++;
+    atomic_fetch_add(&pool->active_count, 1);
     return true;
 }
 
@@ -659,7 +659,7 @@ bool worker_pool_replace(WorkerPool *pool, int slot_id) {
         }
         close(slot->fd_out);
         slot->is_alive = false;
-        pool->active_count--;
+        atomic_fetch_sub(&pool->active_count, 1);
     }
     return worker_pool_spawn(pool, slot_id);
 }

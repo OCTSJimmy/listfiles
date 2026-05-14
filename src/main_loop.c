@@ -124,6 +124,7 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id) {
     }
 
     /* Migrate backlog to lost_tasks */
+    pthread_mutex_lock(&ctx->lost_tasks_mutex);
     for (int j = 0; j < slot->backlog_count; j++) {
         char *path = slot->backlog_paths[j];
         if (!path) continue;
@@ -143,6 +144,7 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id) {
             atomic_fetch_sub(&ctx->pending_tasks, 1);
         }
     }
+    pthread_mutex_unlock(&ctx->lost_tasks_mutex);
     free(slot->backlog_paths);
     slot->backlog_paths = NULL;
     slot->backlog_count = 0;
@@ -169,7 +171,7 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id) {
     /* Mark dead */
     if (slot->is_alive) {
         slot->is_alive = false;
-        ctx->worker_pool->active_count--;
+        atomic_fetch_sub(&ctx->worker_pool->active_count, 1);
     }
     slot->pid = -1;
 }
@@ -492,7 +494,8 @@ static void flush_worker_backlogs(AppContext *ctx) {
  */
 static void dispatch_lost_tasks(AppContext *ctx) {
     if (ctx->lost_count == 0) return;
-    
+
+    pthread_mutex_lock(&ctx->lost_tasks_mutex);
     size_t dispatched = 0;
     for (size_t i = 0; i < ctx->lost_count; i++) {
         char *path = ctx->lost_tasks[i];
@@ -540,6 +543,7 @@ static void dispatch_lost_tasks(AppContext *ctx) {
         }
         ctx->lost_count = new_count;
     }
+    pthread_mutex_unlock(&ctx->lost_tasks_mutex);
 }
 
 static void drain_completed_batches(AppContext *ctx) {
@@ -634,7 +638,7 @@ void main_loop_run(AppContext *ctx) {
             if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                 fprintf(stderr, "[Epoll] Worker %u fd error/hup (events=0x%x, fd=%d). Mark dead. active=%d->%d\n",
                         slot_id, events[i].events, ctx->worker_pool->slots[slot_id].fd_out,
-                        ctx->worker_pool->active_count, ctx->worker_pool->active_count - 1);
+                        atomic_load(&ctx->worker_pool->active_count), atomic_load(&ctx->worker_pool->active_count) - 1);
                 cleanup_dead_worker_slot(ctx, (int)slot_id);
                 continue;
             }
@@ -652,7 +656,7 @@ void main_loop_run(AppContext *ctx) {
                 /* Worker pipe broken, mark dead and clean up fd */
                 fprintf(stderr, "[Epoll] Worker %u recv_header failed (events=0x%x, fd=%d). Mark dead. active=%d->%d\n",
                         slot_id, events[i].events, ctx->worker_pool->slots[slot_id].fd_out,
-                        ctx->worker_pool->active_count, ctx->worker_pool->active_count - 1);
+                        atomic_load(&ctx->worker_pool->active_count), atomic_load(&ctx->worker_pool->active_count) - 1);
                 cleanup_dead_worker_slot(ctx, (int)slot_id);
                 continue;
             }
@@ -895,7 +899,7 @@ void main_loop_handle_exit(AppContext *ctx, int worker_id) {
     if (worker_id < 0 || worker_id >= ctx->worker_pool->num_workers) return;
     WorkerSlot *slot = &ctx->worker_pool->slots[worker_id];
     fprintf(stderr, "[Exit] Worker %d normal exit (pid=%d). active=%d->%d\n",
-            worker_id, slot->pid, ctx->worker_pool->active_count, ctx->worker_pool->active_count - 1);
+            worker_id, slot->pid, atomic_load(&ctx->worker_pool->active_count), atomic_load(&ctx->worker_pool->active_count) - 1);
     /* Reap zombie immediately */
     int status;
     waitpid(slot->pid, &status, WNOHANG);

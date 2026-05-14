@@ -29,7 +29,7 @@ typedef struct {
 typedef struct {
     WorkerSlot *slots;
     int         num_workers;
-    int         active_count;
+    _Atomic int active_count;
 } WorkerPool;
 
 /* Master-side */
