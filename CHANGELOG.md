@@ -6,6 +6,33 @@
 
 ## [Unreleased]
 
+---
+
+### 紧急修复：poll 超时替代阻塞 read，彻底消除 Master hang 死（P0 阻断性）
+
+**问题背景**：v12.2.9 恢复 `fd_out` 的 `O_NONBLOCK` 后，strace 确认标志已生效，但 Master 仍然阻塞在 `pipe_read`。根本原因是：即使 `O_NONBLOCK` 设置正确，当 Worker 写了一半 header 后死亡（或处于特定竞态），Master 的 `ipc_recv_header()` 循环会在 `read()` 上等待剩余字节，导致 epoll 循环停滞，所有 Worker 的 `pipe_write` 因缓冲区满而阻塞。
+
+**v12.2.10 修复**（poll 超时）：
+- 新增 `safe_ipc_recv_header()` 和 `safe_ipc_recv_payload()`：在 `read()` 前先执行 `poll(fd, POLLIN, 100ms)` 超时检查。
+- 超时返回 `-2`，主循环 `continue` 安全跳过，不阻塞、不触发 cleanup，等待下一轮 epoll。
+- `payload` 接收也带 poll 超时，防止部分数据到达后永远等待剩余字节。
+- 保留 v12.2.9 的所有修复（`O_NONBLOCK`、`EPOLLERR|EPOLLHUP`、`EAGAIN` 处理、`pending_tasks` 泄漏修复），poll 超时作为第二道防线。
+
+**v12.2.11 修复**（O_NONBLOCK 原生创建）：
+- `pipe2(out_pipe, O_CLOEXEC | O_NONBLOCK)`：out_pipe 在创建时就自带 `O_NONBLOCK`，读写两端出生即非阻塞，彻底消除 `fcntl(F_SETFL)` 可能失败或不可靠的问题。
+- 移除 `worker_pool_spawn()` 中对 `out_pipe[0]` 的冗余 `fcntl` 调用。
+- `fcntl(in_pipe[1])` 增加错误检查，失败时输出警告日志。
+
+#### 修改的文件
+
+- `src/main_loop.c`
+- `src/worker_proc.c`
+- `include/worker_proc.h`
+- `include/main_loop.h`
+- `include/config.h`
+
+---
+
 ### 紧急修复：主循环 fd 号重用竞争死锁（P0 阻断性）
 
 **问题背景**：v12.2.2 为修复 "worker epoll busy-loop"，移除了 master 读 fd_out 的 `O_NONBLOCK`。当 Worker 超时死亡后，cleanup 关闭 fd_out，但 epoll 上一轮返回的 events 数组中仍包含该 fd 的 `EPOLLIN` 残留事件。主循环处理该残留事件时调用阻塞 `read(fd_out)`，恰好新 Worker spawn 重用了相同 fd 号且尚未写数据，master 永久阻塞在 `pipe_wait` → 主循环 hang 死 → 所有 Worker 空等 → 完美死锁。
