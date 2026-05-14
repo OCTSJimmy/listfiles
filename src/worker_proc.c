@@ -571,7 +571,9 @@ static void enlarge_pipe(int fd) {
 bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     int in_pipe[2], out_pipe[2];
     if (pipe2(in_pipe, O_CLOEXEC) != 0) return false;
-    if (pipe2(out_pipe, O_CLOEXEC) != 0) {
+    /* O_NONBLOCK on out_pipe: prevents master read hang on stale fd reuse,
+     * and prevents worker write hang when pipe buffer is full. */
+    if (pipe2(out_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
         close(in_pipe[0]); close(in_pipe[1]);
         return false;
     }
@@ -610,11 +612,11 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
 
     /* Master write end must be non-blocking to prevent bidirectional pipe deadlock */
     int flags = fcntl(in_pipe[1], F_GETFL);
-    fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
-
-    /* Master read end must also be non-blocking to prevent hang on stale fd reuse */
-    flags = fcntl(out_pipe[0], F_GETFL);
-    fcntl(out_pipe[0], F_SETFL, flags | O_NONBLOCK);
+    if (flags >= 0) {
+        fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
+    } else {
+        fprintf(stderr, "[worker_pool_spawn] WARNING: fcntl(F_GETFL) on fd_in failed: errno=%d\n", errno);
+    }
 
     WorkerSlot *slot = &pool->slots[slot_id];
     slot->pid = pid;
