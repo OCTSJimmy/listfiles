@@ -131,7 +131,7 @@ int ipc_recv_payload(int fd, void *buf, uint32_t len) {
     size_t nread = 0;
     while (nread < len) {
         ssize_t n = read(fd, (char*)buf + nread, len - nread);
-        if (n < 0) { if (errno == EINTR) continue; return -1; }
+        if (n < 0) { if (errno == EINTR) continue; if (errno == EAGAIN || errno == EWOULDBLOCK) return -2; return -1; }
         if (n == 0) return -1;
         nread += n;
     }
@@ -618,6 +618,8 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
         fprintf(stderr, "[worker_pool_spawn] WARNING: fcntl(F_GETFL) on fd_in failed: errno=%d\n", errno);
     }
 
+    /* out_pipe already has O_NONBLOCK from pipe2; no need for fragile fcntl here */
+
     WorkerSlot *slot = &pool->slots[slot_id];
     slot->pid = pid;
     slot->fd_in = in_pipe[1];
@@ -630,7 +632,6 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     slot->backlog_paths = NULL;
     slot->backlog_count = 0;
     slot->backlog_capacity = 0;
-    atomic_flag_clear(&slot->cleanup_done);
     pool->active_count++;
     return true;
 }

@@ -237,7 +237,7 @@ static void check_workers_health(Monitor *mon) {
             kill(slot->pid, SIGKILL);
             int status;
             waitpid(slot->pid, &status, WNOHANG);
-            cleanup_dead_worker_slot(ctx, i, true);
+            cleanup_dead_worker_slot(ctx, i);
             ctx->state.has_error = true;
         }
     }
