@@ -41,11 +41,15 @@
  *         关闭所有 fd,从 epoll 移除,并精确调整 pending_tasks。
  *         幂等设计:重复调用同一 slot 安全(检查 fd >= 0)。
  */
-void cleanup_dead_worker_slot(AppContext *ctx, int worker_id) {
+void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_current) {
     if (!ctx || !ctx->worker_pool) return;
     if (worker_id < 0 || worker_id >= ctx->worker_pool->num_workers) return;
     WorkerSlot *slot = &ctx->worker_pool->slots[worker_id];
-    if (!slot->is_alive && slot->pid == -1) return; /* already cleaned */
+
+    /* Atomic guard: ensure only one thread (monitor or epoll) executes cleanup */
+    if (atomic_flag_test_and_set(&slot->cleanup_done)) {
+        return; /* another thread is already cleaning this slot */
+    }
 
     /* Drain fd_in_rd to count orphaned SCAN tasks */
     int orphaned = 0;
@@ -100,6 +104,23 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id) {
 
     /* Adjust counters: 1 for the current task + orphaned from fd_in_rd */
     atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
+
+    /* Redispatch current_path if worker died unexpectedly (timeout / epoll error) */
+    if (redispatch_current && slot->current_path[0] != '\0') {
+        if (ctx->lost_count >= ctx->lost_capacity) {
+            size_t new_cap = ctx->lost_capacity ? ctx->lost_capacity * 2 : 64;
+            char **new_arr = realloc(ctx->lost_tasks, new_cap * sizeof(char *));
+            if (new_arr) {
+                ctx->lost_tasks = new_arr;
+                ctx->lost_capacity = new_cap;
+            }
+        }
+        if (ctx->lost_count < ctx->lost_capacity) {
+            ctx->lost_tasks[ctx->lost_count++] = strdup(slot->current_path);
+            /* pending_tasks 上面已减 1，重新分发时会再加 1（dispatch_lost_tasks 不加，但 process_completed_batch 最终仍会 -1） */
+            atomic_fetch_add(&ctx->pending_tasks, 1);
+        }
+    }
 
     /* Mark dead */
     if (slot->is_alive) {
@@ -584,7 +605,7 @@ void main_loop_run(AppContext *ctx) {
                 fprintf(stderr, "[Epoll] Worker %u fd=%d events=0x%x (ERR|HUP). Mark dead. active=%d->%d\n",
                         slot_id, ctx->worker_pool->slots[slot_id].fd_out, events[i].events,
                         ctx->worker_pool->active_count, ctx->worker_pool->active_count - 1);
-                cleanup_dead_worker_slot(ctx, (int)slot_id);
+                cleanup_dead_worker_slot(ctx, (int)slot_id, true);
                 continue;
             }
 
@@ -599,7 +620,7 @@ void main_loop_run(AppContext *ctx) {
                 fprintf(stderr, "[Epoll] Worker %u recv_header failed (events=0x%x, fd=%d). Mark dead. active=%d->%d\n",
                         slot_id, events[i].events, ctx->worker_pool->slots[slot_id].fd_out,
                         ctx->worker_pool->active_count, ctx->worker_pool->active_count - 1);
-                cleanup_dead_worker_slot(ctx, (int)slot_id);
+                cleanup_dead_worker_slot(ctx, (int)slot_id, true);
                 continue;
             }
 
@@ -667,8 +688,7 @@ void main_loop_run(AppContext *ctx) {
             WorkerSlot *slot = &ctx->worker_pool->slots[i];
             if (!slot->is_alive && slot->pid == -1) {
                 /* Ensure cleanup has been performed (idempotent if already done) */
-                cleanup_dead_worker_slot(ctx, i);
-
+                cleanup_dead_worker_slot(ctx, i, true);
                 fprintf(stderr, "[Replace] Replacing dead worker %d\n", i);
                 worker_pool_replace(ctx->worker_pool, i);
                 /* Re-add new fd_out to epoll */
@@ -835,5 +855,5 @@ void main_loop_handle_exit(AppContext *ctx, int worker_id) {
     /* Reap zombie immediately */
     int status;
     waitpid(slot->pid, &status, WNOHANG);
-    cleanup_dead_worker_slot(ctx, worker_id);
+    cleanup_dead_worker_slot(ctx, worker_id, false);
 }

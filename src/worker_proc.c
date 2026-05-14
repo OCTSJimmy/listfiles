@@ -628,6 +628,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     slot->backlog_paths = NULL;
     slot->backlog_count = 0;
     slot->backlog_capacity = 0;
+    atomic_flag_clear(&slot->cleanup_done);
     pool->active_count++;
     return true;
 }

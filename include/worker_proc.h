@@ -1,6 +1,7 @@
 #ifndef WORKER_PROC_H
 #define WORKER_PROC_H
 
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <time.h>
 #include <sys/types.h>
@@ -24,6 +25,7 @@ typedef struct {
     char   **backlog_paths;
     int      backlog_count;
     int      backlog_capacity;
+    atomic_flag cleanup_done;  /* 防止 monitor/epoll 双路径并发清理 */
 } WorkerSlot;
 
 typedef struct {
