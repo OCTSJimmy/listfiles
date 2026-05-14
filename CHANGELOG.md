@@ -6,6 +6,29 @@
 
 ## [Unreleased]
 
+### 紧急修复：主循环 fd 号重用竞争死锁（P0 阻断性）
+
+**问题背景**：v12.2.2 为修复 "worker epoll busy-loop"，移除了 master 读 fd_out 的 `O_NONBLOCK`。当 Worker 超时死亡后，cleanup 关闭 fd_out，但 epoll 上一轮返回的 events 数组中仍包含该 fd 的 `EPOLLIN` 残留事件。主循环处理该残留事件时调用阻塞 `read(fd_out)`，恰好新 Worker spawn 重用了相同 fd 号且尚未写数据，master 永久阻塞在 `pipe_wait` → 主循环 hang 死 → 所有 Worker 空等 → 完美死锁。
+
+**症状**：Monitor 秒表冻结，pbin/scan_dir.log/输出不再更新，进程 hang 死数小时。
+
+#### 修复
+
+- **恢复 fd_out 的 O_NONBLOCK**：`worker_pool_spawn()` 中给 `out_pipe[0]`（master 读端）重新设置 `O_NONBLOCK`，消除阻塞读死锁。
+- **ipc_recv_header 处理 EAGAIN**：返回 `-2`（`EAGAIN`/`EWOULDBLOCK`）而非 `-1`，允许调用方区分"暂时无数据"与"致命错误"。
+- **epoll 注册 EPOLLERR|EPOLLHUP**：事件循环中优先处理 Worker 死亡事件，避免在残留事件上尝试读取。
+- **EAGAIN 安全跳过**：主循环中 `ipc_recv_header` 返回 `-2` 时直接 `continue`，不触发 `cleanup_dead_worker_slot`，防止误杀新 Worker。
+- **ipc_send 失败时防幽灵化**：`process_completed_batch()` 和 `dispatch_lost_tasks()`、`flush_worker_backlogs()` 中 `rc == -1`（管道破裂）时递减 `pending_tasks` 并将路径加入 `lost_tasks` 重试队列，避免任务永久丢失导致 `pending_tasks` 不归零。
+- **根任务发送失败 fatal**：`main.c` 中根任务 `ipc_send` 失败时打印致命错误并立即退出，防止无任务可执行的空转。
+
+#### 修改的文件
+
+- `src/worker_proc.c`
+- `src/main_loop.c`
+- `src/main.c`
+
+---
+
 ### 紧急修复：双向管道死锁（P0 阻断性）
 
 **问题背景**：Master 与 Worker 通过 `pipe2(O_CLOEXEC)` 双向通信。`ipc_send()` 使用阻塞 `write()`，当 Worker 的 `fd_in` 管道缓冲区（默认 64KB）被 >580 个 SCAN 任务填满时，Master 阻塞在 `write(fd_in)`。与此同时，Worker 可能正在发送大 BATCH 并阻塞在 `write(fd_out)`。双方互相等待，形成**永久死锁**。

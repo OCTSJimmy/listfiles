@@ -23,6 +23,7 @@
 #include <time.h>
 #include <stdatomic.h>
 #include <sys/sysinfo.h>
+#include <errno.h>
 
 /**
  * @brief  初始化 AppContext 结构体
@@ -349,7 +350,13 @@ int main(int argc, char *argv[]) {
             WorkerSlot *slot = ctx.worker_pool->slots;
             slot->current_dev = root_info.st_dev;
             safe_strcpy(slot->current_path, ctx.cfg.target_path, sizeof(slot->current_path));
-            ipc_send(slot->fd_in, IPC_MSG_SCAN, ctx.cfg.target_path, plen);
+            int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, ctx.cfg.target_path, plen);
+            if (rc != 0) {
+                fprintf(stderr, "[Fatal] 根任务发送失败: worker 0 fd=%d rc=%d errno=%d (%s)\n",
+                        slot->fd_in, rc, errno, strerror(errno));
+                app_context_destroy(&ctx);
+                return 1;
+            }
         } else {
             /* Single file target */
             async_writer_submit(ctx.async_writer, ctx.cfg.target_path, &root_info);

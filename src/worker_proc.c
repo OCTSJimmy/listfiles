@@ -101,6 +101,7 @@ int ipc_recv_header(int fd, IpcMessageHeader *hdr) {
         ssize_t n = read(fd, (char*)hdr + nread, sizeof(*hdr) - nread);
         if (n < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
             int saved_errno = errno;
             fprintf(stderr, "[IPC] recv_header error on fd=%d: errno=%d (%s)\n",
                     fd, saved_errno, strerror(saved_errno));
@@ -610,6 +611,10 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     /* Master write end must be non-blocking to prevent bidirectional pipe deadlock */
     int flags = fcntl(in_pipe[1], F_GETFL);
     fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
+
+    /* Master read end must also be non-blocking to prevent hang on stale fd reuse */
+    flags = fcntl(out_pipe[0], F_GETFL);
+    fcntl(out_pipe[0], F_SETFL, flags | O_NONBLOCK);
 
     WorkerSlot *slot = &pool->slots[slot_id];
     slot->pid = pid;
