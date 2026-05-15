@@ -395,11 +395,16 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             cleanup_dead_worker_slot(ctx, msg->slot_id, true);
             break;
         }
+        case RET_EXIT: {
+            log_info("[Bus] Worker %d normal exit", msg->slot_id);
+            cleanup_dead_worker_slot(ctx, msg->slot_id, false);
+            break;
+        }
         case MSG_DROP: {
             if (msg->data_len >= sizeof(DropPayload)) {
                 DropPayload *drop = (DropPayload*)msg->data;
-                if (lost_tasks_push(&ctx->lost_tasks, strdup(drop->path))) {
-                    atomic_fetch_sub(&ctx->pending_tasks, 1);
+                if (!lost_tasks_push(&ctx->lost_tasks, strdup(drop->path))) {
+                    log_warn("[Bus] MSG_DROP requeue failed: %s", drop->path);
                 }
             }
             break;

@@ -253,6 +253,7 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
                 }
             } else if (rc == -1) {
                 log_error("[IPC-%d] CMD_SCAN ipc_send failed, marking worker dead", ctx->slot_id);
+                eagain_retry_count = 0;
                 worker_mark_dead(ctx, true);
             } else {
                 eagain_retry_count = 0;
