@@ -9,6 +9,7 @@
 #define LOG_H
 
 #include <stdbool.h>
+#include <stdarg.h>
 
 /* 日志级别 */
 typedef enum {
@@ -61,5 +62,10 @@ void log_msg(LogLevel level, const char *fmt, ...);
  * 仅加时间戳，不加 [LEVEL]。用于兼容旧的中文错误消息等。
  */
 void log_raw(const char *fmt, ...);
+
+/**
+ * @brief va_list 版本的 log_raw
+ */
+void log_vraw(const char *fmt, va_list args);
 
 #endif /* LOG_H */

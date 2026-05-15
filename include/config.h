@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "13.0.0" // 版本号升级：修复 cleanup_done 未重置 + 日志系统 + dispatch 轮询缺陷
+#define VERSION "13.0.1" // 版本号升级：修复 IPC 协议失步 + 栈值污染/历史块数异常 + archive 无限循环防呆 + va_list noinline
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000

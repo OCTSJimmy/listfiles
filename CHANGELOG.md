@@ -9,6 +9,50 @@
 ---
 ---
 
+## [13.0.1] - 2026-05-15
+
+### Bugfix：IPC 协议失步 + 栈值污染/历史块数异常 + archive 无限循环防呆
+
+**问题背景**：v13.0.0 重构后的首次运行时出现两个独立阻断性问题：
+1. `[IPC-0] payload timeout (len=42)` — 启动即死，IPC 线程在 fd_out 上读到孤悬 Header 后 poll payload 超时。
+2. `无索引文件，历史块数 140734670153448` — `total_blocks` 打印出异常大值（`0x7FFF5805A6E8`，x86_64 栈地址特征），导致恢复逻辑走入错误分支。
+
+**根因 A：IPC 协议 Header/Payload 断裂**
+- `ipc_send()` 分两次 `write()`（先 8 字节 Header，再 payload）。
+- 第二次 `write()` 遇 `EAGAIN` 时，第一次的 Header 已留在 pipe 中。函数返回 `-2`，调用方重试时重新发送 Header + payload。
+- 结果：pipe 中出现多个孤悬 Header。IPC 线程读到第一个 Header 后等待 payload，永远等不到。
+
+**根因 B：`total_blocks` 栈值污染 / `va_list` 传递异常**
+- `count_archive_blocks()` 与 `count_pbin_slices()` 均显式初始化为 0，返回值理论上为 0。
+- `0x7FFF5805A6E8` 是 x86_64 下未初始化栈内存 / `va_list` 因编译器优化/ABI 边界传递异常时读取到的栈残留值。
+- 非野指针，是栈值污染。`verbose_printf` → `log_vraw` → `vfprintf` 的 `va_list` 跨编译单元传递在特定栈布局下可能读取错误位置。
+
+**根因 C：`compressed_size == 0` 未防呆**
+- `count_archive_blocks()` 中若 `.archive` 文件损坏且 `bh.compressed_size == 0`，`fseek` 不移动，`fread` 原地重复读取同一 Header，`count` 无限增加。
+- 虽然单秒内不可能达到 `140734670153448`，但作为防御性修复必须堵住。
+
+#### 修复
+
+- **`ipc_send()` 合并为单次原子写入**：
+  - 分配 `sizeof(IpcMessageHeader) + payload_len` 连续缓冲区，一次 `write()` 发送全部数据。
+  - 对 SCAN 等小消息（<< `PIPE_BUF=4096`）天然原子，彻底消除 Header 孤悬问题。
+- **`count_archive_blocks()` 增加 `compressed_size == 0` 检查**：
+  - `bh.compressed_size == 0 || bh.compressed_size > 512MB` 时 `break`，防止无限循环。
+- **`restore_progress()` 增加 `total_blocks` sanity check**：
+  - 若 `total_blocks > 1000000000UL`，打印警告并强制置为 0，防止异常值触发错误的全量重扫分支。
+- **`verbose_printf` / `log_vraw` 添加 `__attribute__((noinline))`**：
+  - 防止编译器内联导致 `va_start` / `va_copy` 的寄存器保存区布局异常，确保 `va_list` 跨编译单元传递的 ABI 稳定性。
+
+#### 修改的文件
+
+- `src/worker_proc.c`（`ipc_send()` 合并写入）
+- `src/progress.c`（`count_archive_blocks` 防呆 + `total_blocks` sanity check）
+- `src/utils.c`（`verbose_printf` noinline）
+- `src/log.c`（`log_vraw` noinline）
+- `include/config.h`（版本号 13.0.1）
+
+---
+
 ## [13.0.0] - 2026-05-15
 
 ### 架构重构：IPC 线程隔离（v13.0.0）

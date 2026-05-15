@@ -25,7 +25,7 @@
  *         当 cfg->verbose_type 为 VERBOSE_TYPE_VERSIONED 且 level < cfg->verbose_level 时也不输出。
  *         所有输出均定向到标准错误流(stderr)。
  */
-void verbose_printf(const Config *cfg, int level, const char *format, ...) {
+void __attribute__((noinline)) verbose_printf(const Config *cfg, int level, const char *format, ...) {
     if (!cfg->verbose) return;
 
     if (cfg->verbose_type == VERBOSE_TYPE_VERSIONED && level < cfg->verbose_level) {
@@ -34,7 +34,7 @@ void verbose_printf(const Config *cfg, int level, const char *format, ...) {
 
     va_list args;
     va_start(args, format);
-    log_raw(format, args);
+    log_vraw(format, args);
     va_end(args);
 }
 

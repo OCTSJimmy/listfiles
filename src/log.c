@@ -62,14 +62,21 @@ void log_msg(LogLevel level, const char *fmt, ...) {
 }
 
 void log_raw(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    log_vraw(fmt, args);
+    va_end(args);
+}
+
+void __attribute__((noinline)) log_vraw(const char *fmt, va_list args) {
     char ts[32];
     log_timestamp(ts, sizeof(ts));
     fprintf(stderr, "[%s] ", ts);
 
-    va_list args;
-    va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
-    va_end(args);
+    va_list args_copy;
+    va_copy(args_copy, args);
+    vfprintf(stderr, fmt, args_copy);
+    va_end(args_copy);
 
     size_t len = strlen(fmt);
     if (len == 0 || fmt[len - 1] != '\n') {

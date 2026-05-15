@@ -21,6 +21,8 @@
 #include "progress.h"
 #include "utils.h"
 #include "archive_format.h"
+#include "msg_format.h"
+#include "msg_queue.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -862,7 +864,7 @@ static unsigned long count_archive_blocks(const Config *cfg) {
     ArchiveBlockHeader bh;
     while (fread(&bh, sizeof(bh), 1, fp) == 1) {
         if (bh.block_type != ARCHIVE_BLOCK_NORMAL && bh.block_type != ARCHIVE_BLOCK_SPBIN) break;
-        if (bh.compressed_size > 512 * 1024 * 1024) break;
+        if (bh.compressed_size == 0 || bh.compressed_size > 512 * 1024 * 1024) break;
         if (bh.block_type == ARCHIVE_BLOCK_NORMAL)
             count++;
         if (fseek(fp, bh.compressed_size, SEEK_CUR) != 0) break;
@@ -1281,7 +1283,30 @@ void pump_pbin_batch(AppContext *ctx, int batch_size) {
             WorkerSlot *slot = &ctx->worker_pool->slots[wid];
             slot->current_dev = st.st_dev;
             safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
-            ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
+            
+            /* v13.0.0: Send CMD_SCAN through cmd_queue instead of direct ipc_send */
+            CmdScanPayload *scan = malloc(sizeof(CmdScanPayload));
+            if (!scan) {
+                log_warn("[Pump] malloc failed for CMD_SCAN, dropping %s", path);
+                atomic_fetch_sub(&ctx->pending_tasks, 1);
+                lost_tasks_push(&ctx->lost_tasks, strdup(path));
+            } else {
+                scan->path_len = plen;
+                scan->dev = st.st_dev;
+                safe_strcpy(scan->path, path, sizeof(scan->path));
+                IpcThreadMsg msg = {
+                    .type = CMD_SCAN,
+                    .slot_id = wid,
+                    .data = scan,
+                    .data_len = sizeof(*scan)
+                };
+                if (!msg_queue_send(ctx->ipc_cmd_queues[wid], &msg)) {
+                    free(scan);
+                    log_warn("[Pump] cmd_queue full, dropping %s", path);
+                    atomic_fetch_sub(&ctx->pending_tasks, 1);
+                    lost_tasks_push(&ctx->lost_tasks, strdup(path));
+                }
+            }
             sent++;
         }
         free(path);
@@ -1325,6 +1350,15 @@ int restore_progress(const Config *cfg, AppContext *ctx) {
     unsigned long pbin_count  = count_pbin_slices(cfg);
     unsigned long archive_blk = count_archive_blocks(cfg);
     unsigned long total_blocks = pbin_count + archive_blk;
+
+    /* Sanity check: total_blocks should never exceed a reasonable limit.
+     * If it does, treat as corrupted state and force full rescan. */
+    if (total_blocks > 1000000000UL) {
+        log_warn("[restore] total_blocks=%lu exceeds sanity limit, forcing full rescan", total_blocks);
+        total_blocks = 0;
+        pbin_count = 0;
+        archive_blk = 0;
+    }
 
     /* 2. Load archive (completed slices) into visited_set */
     iterate_archive(cfg, ctx, ctx->visited_set, NULL, NULL);
@@ -1724,8 +1758,30 @@ void spbin_requeue_recovered(AppContext *ctx, dev_t dev) {
             slot->current_dev = ctx->spbin_entries[i].dev;
             safe_strcpy(slot->current_path, ctx->spbin_entries[i].path, sizeof(slot->current_path));
             ctx->next_requeue_worker++;
-            ipc_send(ctx->worker_pool->slots[wid].fd_in, IPC_MSG_SCAN,
-                     ctx->spbin_entries[i].path, plen);
+            
+            /* v13.0.0: Send CMD_SCAN through cmd_queue instead of direct ipc_send */
+            CmdScanPayload *scan = malloc(sizeof(CmdScanPayload));
+            if (!scan) {
+                log_warn("[SPBIN] malloc failed for CMD_SCAN, dropping %s", ctx->spbin_entries[i].path);
+                atomic_fetch_sub(&ctx->pending_tasks, 1);
+                lost_tasks_push(&ctx->lost_tasks, strdup(ctx->spbin_entries[i].path));
+            } else {
+                scan->path_len = plen;
+                scan->dev = ctx->spbin_entries[i].dev;
+                safe_strcpy(scan->path, ctx->spbin_entries[i].path, sizeof(scan->path));
+                IpcThreadMsg msg = {
+                    .type = CMD_SCAN,
+                    .slot_id = wid,
+                    .data = scan,
+                    .data_len = sizeof(*scan)
+                };
+                if (!msg_queue_send(ctx->ipc_cmd_queues[wid], &msg)) {
+                    free(scan);
+                    log_warn("[SPBIN] cmd_queue full, dropping %s", ctx->spbin_entries[i].path);
+                    atomic_fetch_sub(&ctx->pending_tasks, 1);
+                    lost_tasks_push(&ctx->lost_tasks, strdup(ctx->spbin_entries[i].path));
+                }
+            }
         }
     }
 }

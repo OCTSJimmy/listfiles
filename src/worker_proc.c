@@ -61,29 +61,29 @@ void worker_set_context(const Config *cfg, const FingerprintSet *ref_set, const 
  *         遇到 -2 时应将任务缓存到 WorkerSlot::backlog_paths。
  */
 int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_len) {
-    IpcMessageHeader hdr = { msg_type, payload_len };
+    size_t total_len = sizeof(IpcMessageHeader) + payload_len;
+    char *buf = malloc(total_len);
+    if (!buf) return -1;
+
+    IpcMessageHeader *hdr = (IpcMessageHeader*)buf;
+    hdr->msg_type = msg_type;
+    hdr->payload_len = payload_len;
+    if (payload_len > 0 && payload) {
+        memcpy(buf + sizeof(IpcMessageHeader), payload, payload_len);
+    }
+
     size_t written = 0;
-    while (written < sizeof(hdr)) {
-        ssize_t n = write(fd, (const char*)&hdr + written, sizeof(hdr) - written);
+    while (written < total_len) {
+        ssize_t n = write(fd, buf + written, total_len - written);
         if (n < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { free(buf); return -2; }
+            free(buf);
             return -1;
         }
         written += n;
     }
-    if (payload_len > 0 && payload) {
-        written = 0;
-        while (written < payload_len) {
-            ssize_t n = write(fd, (const char*)payload + written, payload_len - written);
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
-                return -1;
-            }
-            written += n;
-        }
-    }
+    free(buf);
     return 0;
 }
 
