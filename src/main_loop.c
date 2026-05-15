@@ -15,6 +15,7 @@
 #include "utils.h"
 #include "progress.h"
 #include "worker_proc.h"
+#include "log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -49,12 +50,12 @@ static int safe_ipc_recv_header(int fd, IpcMessageHeader *hdr) {
     }
     if (rc < 0) {
         if (errno == EINTR) return -2;  /* Interrupted, try again next loop */
-        fprintf(stderr, "[IPC] poll error on fd=%d: errno=%d (%s)\n",
+        log_error("[IPC] poll error on fd=%d: errno=%d (%s)",
                 fd, errno, strerror(errno));
         return -1;
     }
     if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        fprintf(stderr, "[IPC] poll error/hup on fd=%d (revents=0x%x)\n",
+        log_error("[IPC] poll error/hup on fd=%d (revents=0x%x)",
                 fd, pfd.revents);
         return -1;
     }
@@ -117,7 +118,7 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
     if (slot->fd_in_rd >= 0) {
         orphaned = ipc_drain_and_count_tasks(slot->fd_in_rd);
         if (orphaned > 0) {
-            fprintf(stderr, "[Cleanup] Worker %d drained %d orphaned tasks from fd_in_rd\n", worker_id, orphaned);
+            log_debug("[Cleanup] Worker %d drained %d orphaned tasks from fd_in_rd", worker_id, orphaned);
         }
         close(slot->fd_in_rd);
         slot->fd_in_rd = -1;
@@ -326,7 +327,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                 ctx->next_dispatch_worker++;
                 WorkerSlot *slot = &ctx->worker_pool->slots[wid];
                 if (!atomic_load(&slot->is_alive)) {
-                    fprintf(stderr, "[Dispatch] WARNING: selected dead worker %d (path=%s), skipping\n", wid, path);
+                    log_warn("[Dispatch] WARNING: selected dead worker %d (path=%s), skipping", wid, path);
                     atomic_fetch_sub(&ctx->pending_tasks, 1);
                     continue;
                 }
@@ -334,7 +335,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                 safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
                 int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
                 if (rc == -1) {
-                    fprintf(stderr, "[Dispatch] ipc_send to worker %d failed: errno=%d (%s), path=%s\n",
+                    log_error("[Dispatch] ipc_send to worker %d failed: errno=%d (%s), path=%s",
                             wid, errno, strerror(errno), path);
                     atomic_fetch_sub(&ctx->pending_tasks, 1);
                 }
@@ -353,7 +354,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                     } else {
                         /* Backlog full: drop task (rare with 1MB pipe buffer) */
                         atomic_fetch_sub(&ctx->pending_tasks, 1);
-                        fprintf(stderr, "[Warning] Worker %d backlog full, dropping task %s\n", wid, path);
+                        log_warn("[Warning] Worker %d backlog full, dropping task %s", wid, path);
                     }
                 }
             }
@@ -440,7 +441,7 @@ static void flush_worker_backlogs(AppContext *ctx) {
             int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
             if (rc == -2) break; /* Still full, stop and retry next cycle */
             if (rc == -1) {
-                fprintf(stderr, "[Backlog] ipc_send failed for %s, dropping\n", path);
+                log_error("[Backlog] ipc_send failed for %s, dropping", path);
                 atomic_fetch_sub(&ctx->pending_tasks, 1);
                 free(path);
                 slot->backlog_paths[j] = NULL;
@@ -490,7 +491,7 @@ static void dispatch_lost_tasks(AppContext *ctx) {
         ctx->next_dispatch_worker++;
         WorkerSlot *slot = &ctx->worker_pool->slots[wid];
         if (!atomic_load(&slot->is_alive)) {
-            fprintf(stderr, "[LostTasks] skip dead worker %d (path=%s), requeue\n", wid, path);
+            log_warn("[LostTasks] skip dead worker %d (path=%s), requeue", wid, path);
             lost_tasks_push(&ctx->lost_tasks, path);
             continue;
         }
@@ -498,12 +499,12 @@ static void dispatch_lost_tasks(AppContext *ctx) {
         uint32_t plen = (uint32_t)strlen(path);
         int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, path, plen);
         if (rc == -2) {
-            /* fd_in 满，送回队列，留待下次循环 */
+            /* fd_in 满，送回队列，尝试下一个 Worker */
             lost_tasks_push(&ctx->lost_tasks, path);
-            break;
+            continue;  /* [FIX] 不 break，轮询尝试其他 Worker */
         }
         if (rc == -1) {
-            fprintf(stderr, "[LostTasks] ipc_send failed for %s, dropping\n", path);
+            log_error("[LostTasks] ipc_send failed for %s, dropping", path);
             atomic_fetch_sub(&ctx->pending_tasks, 1);
             free(path);
             continue;
@@ -581,7 +582,7 @@ void main_loop_run(AppContext *ctx) {
     ctx->thread_pool = thread_pool_create(ctx->cfg.master_threads, ctx->event_fd,
                                           batch_dedup_worker, ctx);
     if (!ctx->thread_pool) {
-        fprintf(stderr, "[Fatal] 无法创建线程池\n");
+        log_fatal("无法创建线程池");
         close(ctx->event_fd);
         ctx->event_fd = -1;
         close(ctx->epfd);
@@ -607,7 +608,7 @@ void main_loop_run(AppContext *ctx) {
 
             /* Handle EPOLLERR/EPOLLHUP directly: worker fd is broken */
             if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                fprintf(stderr, "[Epoll] Worker %u fd error/hup (events=0x%x, fd=%d). Mark dead. active=%d->%d\n",
+                log_error("[Epoll] Worker %u fd error/hup (events=0x%x, fd=%d). Mark dead. active=%d->%d",
                         slot_id, events[i].events, ctx->worker_pool->slots[slot_id].fd_out,
                         atomic_load(&ctx->worker_pool->active_count), atomic_load(&ctx->worker_pool->active_count) - 1);
                 cleanup_dead_worker_slot(ctx, (int)slot_id, true);
@@ -625,7 +626,7 @@ void main_loop_run(AppContext *ctx) {
             }
             if (rc_hdr != 0) {
                 /* Worker pipe broken, mark dead and clean up fd */
-                fprintf(stderr, "[Epoll] Worker %u recv_header failed (events=0x%x, fd=%d). Mark dead. active=%d->%d\n",
+                log_error("[Epoll] Worker %u recv_header failed (events=0x%x, fd=%d). Mark dead. active=%d->%d",
                         slot_id, events[i].events, ctx->worker_pool->slots[slot_id].fd_out,
                         atomic_load(&ctx->worker_pool->active_count), atomic_load(&ctx->worker_pool->active_count) - 1);
                 cleanup_dead_worker_slot(ctx, (int)slot_id, true);
@@ -647,10 +648,10 @@ void main_loop_run(AppContext *ctx) {
                     free(payload);
                     if (rc_payload == -2) {
                         /* Partial payload timeout: data may be incomplete, skip */
-                        fprintf(stderr, "[Epoll] Worker %u payload timeout (fd=%d, len=%u). Skip.\n",
+                        log_warn("[Epoll] Worker %u payload timeout (fd=%d, len=%u). Skip.",
                                 slot_id, ctx->worker_pool->slots[slot_id].fd_out, hdr.payload_len);
                     } else {
-                        fprintf(stderr, "[Epoll] Worker %u payload recv failed (fd=%d). Mark dead.\n",
+                        log_error("[Epoll] Worker %u payload recv failed (fd=%d). Mark dead.",
                                 slot_id, ctx->worker_pool->slots[slot_id].fd_out);
                         cleanup_dead_worker_slot(ctx, (int)slot_id, true);
                     }
@@ -707,7 +708,7 @@ void main_loop_run(AppContext *ctx) {
             if (!atomic_load(&slot->is_alive) && slot->pid == -1) {
                 /* Ensure cleanup has been performed (idempotent if already done) */
                 cleanup_dead_worker_slot(ctx, i, true);
-                fprintf(stderr, "[Replace] Replacing dead worker %d\n", i);
+                log_info("[Replace] Replacing dead worker %d", i);
                 worker_pool_replace(ctx->worker_pool, i);
                 /* Re-add new fd_out to epoll */
                 memset(&ev, 0, sizeof(ev));
@@ -824,7 +825,7 @@ void main_loop_handle_error(AppContext *ctx, int worker_id, const IpcErrorHeader
     (void)worker_id;
     if (err->errno_code == ETIMEDOUT || err->errno_code == EIO) {
         dev_t dev = (dev_t)err->dev;
-        fprintf(stderr, "[Monitor] Worker error on dev %lu: %s (errno=%d)\n",
+        log_error("[Monitor] Worker error on dev %lu: %s (errno=%d)",
                 (unsigned long)dev, path, err->errno_code);
         
         if (dev_mgr_get_state(ctx->dev_mgr, dev) != DEV_STATE_DEAD) {
@@ -868,7 +869,7 @@ void main_loop_handle_error(AppContext *ctx, int worker_id, const IpcErrorHeader
 void main_loop_handle_exit(AppContext *ctx, int worker_id) {
     if (worker_id < 0 || worker_id >= ctx->worker_pool->num_workers) return;
     WorkerSlot *slot = &ctx->worker_pool->slots[worker_id];
-    fprintf(stderr, "[Exit] Worker %d normal exit (pid=%d). active=%d->%d\n",
+    log_info("[Exit] Worker %d normal exit (pid=%d). active=%d->%d",
             worker_id, slot->pid, atomic_load(&ctx->worker_pool->active_count), atomic_load(&ctx->worker_pool->active_count) - 1);
     /* Reap zombie immediately */
     int status;

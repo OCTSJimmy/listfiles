@@ -7,6 +7,7 @@
 #include "lost_tasks.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include "log.h"
 
 void lost_tasks_init(LostTasksQueue *q) {
     if (!q) return;
@@ -58,7 +59,7 @@ void lost_tasks_push_backlog(LostTasksQueue *q, char **backlog_paths, int backlo
             size_t new_cap = q->capacity ? q->capacity * 2 : 64;
             char **new_arr = realloc(q->tasks, new_cap * sizeof(char *));
             if (!new_arr) {
-                fprintf(stderr, "[Warning] LostTasksQueue realloc failed, dropping %s\n", path);
+                log_warn("LostTasksQueue realloc failed, dropping %s", path);
                 free(path);
                 continue;
             }

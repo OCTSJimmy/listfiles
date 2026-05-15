@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <time.h>
+#include "log.h"
 
 /**
  * @brief  分级详细日志输出函数
@@ -33,7 +34,7 @@ void verbose_printf(const Config *cfg, int level, const char *format, ...) {
 
     va_list args;
     va_start(args, format);
-    vfprintf(stderr, format, args);
+    log_raw(format, args);
     va_end(args);
 }
 
@@ -64,7 +65,7 @@ const char *format_time(time_t t) {
 void *safe_malloc(size_t size) {
     void *ptr = malloc(size);
     if (!ptr) {
-        fprintf(stderr, "致命错误: 内存分配失败\n");
+        log_fatal("内存分配失败");
         exit(EXIT_FAILURE);
     }
     return ptr;
@@ -83,7 +84,7 @@ void *safe_malloc(size_t size) {
  */
 void safe_strcpy(char *dest, const char *src, size_t dest_size) {
     if (snprintf(dest, dest_size, "%s", src) >= (int)dest_size) {
-        fprintf(stderr, "路径截断: %s\n", src);
+        log_error("路径截断: %s", src);
         dest[dest_size - 1] = '\0';
     }
 }

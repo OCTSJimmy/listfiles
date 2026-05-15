@@ -15,6 +15,7 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "log.h"
 
 /**
  * @brief  打印程序版本号到标准输出
@@ -179,7 +180,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 7:
                 cfg->output_slice_lines = atol(optarg);
                 if (cfg->output_slice_lines <= 0) {
-                    fprintf(stderr, "错误: 分片大小必须大于零\n");
+                    log_error("分片大小必须大于零");
                     exit(EXIT_FAILURE);
                 }
                 break;
@@ -189,7 +190,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
                 } else if (strcmp(optarg, "versioned") == 0 || strcmp(optarg, "1") == 0) {
                     cfg->verbose_type = VERBOSE_TYPE_VERSIONED;
                 } else {
-                    fprintf(stderr, "无效的verbose类型: %s, 使用默认值\n", optarg);
+                    log_warn("无效的verbose类型: %s, 使用默认值", optarg);
                 }
                 break;
             case 9:
@@ -244,41 +245,41 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 't':
                 cfg->heartbeat_timeout = atol(optarg);
                 if (cfg->heartbeat_timeout <= 0) {
-                    fprintf(stderr, "Error: Timeout must be positive.\n");
+                    log_error("Timeout must be positive.");
                     exit(EXIT_FAILURE);
                 }
                 break;
             case 'h': show_help(); return 2;
             default:
-                fprintf(stderr, "错误: 未知选项\n");
+                log_error("未知选项");
                 show_help();
                 return -1;
         }
     }
 
     if (!cfg->target_path) {
-        fprintf(stderr, "错误: 必须指定目标路径\n");
+        log_error("必须指定目标路径");
         show_help();
         return -1;
     }
 
     struct stat path_stat;
     if (stat(cfg->target_path, &path_stat) != 0) {
-        fprintf(stderr, "错误: 无法访问目标路径: %s\n", cfg->target_path);
+        log_error("无法访问目标路径: %s", cfg->target_path);
         return -1;
     }
     if (!S_ISDIR(path_stat.st_mode) && !S_ISREG(path_stat.st_mode) && !(S_ISLNK(path_stat.st_mode) && cfg->follow_symlinks)) {
-        fprintf(stderr, "错误: 无效的目标路径: %s (必须是目录、普通文件或符号链接)\n", cfg->target_path);
+        log_error("无效的目标路径: %s (必须是目录、普通文件或符号链接)", cfg->target_path);
         return -1;
     }
 
     if (cfg->is_output_file && cfg->is_output_split_dir) {
-        fprintf(stderr, "错误: -o 与 -O 不能同时使用\n");
+        log_error("-o 与 -O 不能同时使用");
         return -1;
     }
 
     if (cfg->archive && cfg->clean) {
-        fprintf(stderr, "错误: -Z 与 -C 不能同时使用\n");
+        log_error("-Z 与 -C 不能同时使用");
         return -1;
     }
 

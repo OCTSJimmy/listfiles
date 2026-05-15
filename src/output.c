@@ -24,6 +24,7 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 #include <sys/stat.h>
+#include "log.h"
 
 /**
  * @brief  将 st_mode 转换为 ls -l 格式的权限字符串
@@ -455,7 +456,7 @@ void precompile_format(Config *cfg) {
 FILE* create_output_file(const char *path) {
     FILE *fp = fopen(path, "w");
     if (!fp) {
-        fprintf(stderr, "创建输出文件%s失败", path);
+        log_error("创建输出文件%s失败", path);
         return NULL;
     }
     return fp;
@@ -464,7 +465,7 @@ FILE* create_output_file(const char *path) {
 FILE* open_output_file_append(const char *path) {
     FILE *fp = fopen(path, "a");
     if (!fp) {
-        fprintf(stderr, "打开输出文件%s失败", path);
+        log_error("打开输出文件%s失败", path);
         return NULL;
     }
     return fp;
@@ -553,7 +554,7 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
             snprintf(dir_log_path, sizeof(dir_log_path), "%s/scan_dirs.log", cfg->output_split_dir);
             state->dir_info_fp = fopen(dir_log_path, "a"); // 追加模式
             if (!state->dir_info_fp) {
-                fprintf(stderr, "[警告] 无法创建目录日志文件 %s，回退到 stderr\n", dir_log_path);
+                log_warn("无法创建目录日志文件 %s，回退到 stderr", dir_log_path);
                 state->dir_info_fp = stderr;
             }
         } else if (cfg->is_output_file) {
@@ -562,7 +563,7 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
             snprintf(dir_log_path, sizeof(dir_log_path), "%s.dir", cfg->output_file);
             state->dir_info_fp = fopen(dir_log_path, "a"); // 追加模式
             if (!state->dir_info_fp) {
-                fprintf(stderr, "[警告] 无法创建目录日志文件 %s，回退到 stderr\n", dir_log_path);
+                log_warn("无法创建目录日志文件 %s，回退到 stderr", dir_log_path);
                 state->dir_info_fp = stderr;
             }
         } else {

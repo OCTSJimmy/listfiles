@@ -9,6 +9,7 @@
  */
 #define _GNU_SOURCE
 #include "worker_proc.h"
+#include "log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -103,12 +104,12 @@ int ipc_recv_header(int fd, IpcMessageHeader *hdr) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
             int saved_errno = errno;
-            fprintf(stderr, "[IPC] recv_header error on fd=%d: errno=%d (%s)\n",
+            log_error("[IPC] recv_header error on fd=%d: errno=%d (%s)",
                     fd, saved_errno, strerror(saved_errno));
             return -1;
         }
         if (n == 0) {
-            fprintf(stderr, "[IPC] recv_header EOF on fd=%d\n", fd);
+            log_error("[IPC] recv_header EOF on fd=%d", fd);
             return -1; /* EOF */
         }
         nread += n;
@@ -273,7 +274,7 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
     }
 
     if (total > UINT32_MAX) {
-        fprintf(stderr, "[Worker] Batch payload too large (%zu), aborting.\n", total);
+        log_error("[Worker] Batch payload too large (%zu), aborting.", total);
         return;
     }
 
@@ -446,7 +447,7 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
     while (1) {
         IpcMessageHeader hdr;
         if (ipc_recv_header(fd_in, &hdr) != 0) {
-            fprintf(stderr, "[Worker] worker_main exiting: ipc_recv_header failed on fd_in=%d\n", fd_in);
+            log_error("[Worker] worker_main exiting: ipc_recv_header failed on fd_in=%d", fd_in);
             break;
         }
 
@@ -615,7 +616,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     if (flags >= 0) {
         fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
     } else {
-        fprintf(stderr, "[worker_pool_spawn] WARNING: fcntl(F_GETFL) on fd_in failed: errno=%d\n", errno);
+        log_warn("[worker_pool_spawn] WARNING: fcntl(F_GETFL) on fd_in failed: errno=%d", errno);
     }
 
     /* out_pipe already has O_NONBLOCK from pipe2; no need for fragile fcntl here */
@@ -632,6 +633,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     slot->backlog_paths = NULL;
     slot->backlog_count = 0;
     slot->backlog_capacity = 0;
+    atomic_flag_clear(&slot->cleanup_done);  /* [FIX] 重置 cleanup_done，确保新 Worker 能被正常清理 */
     atomic_fetch_add(&pool->active_count, 1);
     return true;
 }

@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <sys/eventfd.h>
 #include <stdio.h>
+#include "log.h"
 
 #define TP_QUEUE_CAPACITY 256
 
@@ -88,7 +89,7 @@ static void *worker_thread(void *arg) {
         /* 加入完成队列 */
         CompletedNode *node = malloc(sizeof(CompletedNode));
         if (!node) {
-            fprintf(stderr, "[Fatal] thread_pool: out of memory for completed node\n");
+            log_fatal("thread_pool: out of memory for completed node");
             /* 继续，但会丢失这个 batch 的通知 */
         } else {
             node->batch = batch;

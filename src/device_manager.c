@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include "log.h"
 
 /**
  * @brief  设备管理器内部的安全内存分配函数
@@ -24,7 +25,7 @@
 static void *dm_safe_malloc(size_t size) {
     void *ptr = malloc(size);
     if (!ptr) {
-        fprintf(stderr, "[Fatal] Out of memory in device_manager\n");
+        log_fatal("Out of memory in device_manager");
         exit(1);
     }
     return ptr;
@@ -124,7 +125,7 @@ static void update_state_locked(DeviceManager *self, dev_t dev, DeviceState new_
         } else {
             static bool warned = false;
             if (!warned) {
-                fprintf(stderr, "[Warn] Device Manager full! Cannot track dev %lu\n", (unsigned long)dev);
+                log_warn("Device Manager full! Cannot track dev %lu", (unsigned long)dev);
                 warned = true;
             }
         }

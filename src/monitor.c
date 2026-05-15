@@ -17,6 +17,7 @@
 #include "utils.h"
 #include "worker_proc.h"
 #include "main_loop.h"
+#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -231,8 +232,8 @@ static void check_workers_health(Monitor *mon) {
             char timebuf[32];
             struct tm *tm_info = localtime(&now);
             strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
-            fprintf(stderr, "[%s] [Monitor] Worker %d heartbeat timeout (dev=%lu, path=%s). Replacing.\n",
-                    timebuf, i, (unsigned long)slot->current_dev, slot->current_path);
+            log_error("[Monitor] Worker %d heartbeat timeout (dev=%lu, path=%s). Replacing.",
+                    i, (unsigned long)slot->current_dev, slot->current_path);
 
             kill(slot->pid, SIGKILL);
             int status;

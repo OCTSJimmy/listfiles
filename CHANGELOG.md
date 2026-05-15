@@ -8,6 +8,95 @@
 
 ---
 
+### 紧急修复：v12.2.15 cleanup_done 未重置 + 日志系统 + dispatch 轮询缺陷（P0 阻断性）
+
+**问题背景**：v12.2.14 修复了数据竞争，但运行在生产环境（/public2，300万+文件）时仍然出现 Monitor 秒表冻结、所有 Worker 阻塞在 `pipe_wait`、主进程 throughput 归零的现象。`errlogs.err` 中 `[Epoll] Worker 1 fd error/hup` 重复 54万+次，`active=8->7` 始终不变。
+
+**根因 A：cleanup_done 未重置（核心）**
+- 当 Worker 超时死亡后，`cleanup_dead_worker_slot()` 通过 `atomic_flag_test_and_set()` 设置 `cleanup_done = true`。
+- 随后 `worker_pool_replace()` → `worker_pool_spawn()` 创建新 Worker，但**未重置 `cleanup_done`**。
+- 新 Worker 若再次死亡（或 epoll 报告残留事件），cleanup 因 `cleanup_done = true` 直接 return，不关闭 fd、不从 epoll 移除。
+- fd 持续打开 → epoll 每次 `epoll_wait` 都返回 `EPOLLERR|EPOLLHUP` → 54万+次重复日志，CPU 空转。
+
+**根因 B：dispatch_lost_tasks 轮询缺陷**
+- `dispatch_lost_tasks()` 中 `ipc_send()` 返回 `EAGAIN(-2)` 时直接 `break`，仅尝试了一个 Worker 就放弃。
+- 若轮询恰好选到 fd_in 满的 Worker，所有 `lost_tasks` 都发不出去，其他空闲 Worker 永远收不到任务。
+
+**根因 C：日志无时间戳，无法定位故障时刻**
+- 大量 `fprintf(stderr, ...)` 分散在各文件中，格式不统一，无时间戳，无法从日志推断卡死发生时刻。
+- 调试日志与错误日志混为一谈，verbose 开关无法精细控制。
+
+#### 修复
+
+- **worker_pool_spawn 重置 cleanup_done**：`atomic_flag_clear(&slot->cleanup_done)`，确保新 Worker 可被正常清理。
+- **dispatch_lost_tasks 不 break**：`EAGAIN` 时 `push back + continue`，轮询尝试下一个 Worker，直到所有 Worker 都试过或成功发送。
+- **统一日志模块 `log.c / log.h`**：
+  - 所有 `fprintf(stderr, ...)` 替换为 `log_fatal / log_error / log_warn / log_info / log_debug / log_trace`。
+  - 自动添加 `[YYYY-MM-DD HH:MM:SS] [LEVEL]` 前缀。
+  - 日志固定输出到 stderr，不污染 stdout。
+  - `verbose` 和 `verbose_level` 控制 DEBUG/TRACE 级别日志的显示。
+- **保留 FATAL/ERROR/WARN 始终输出**：不受 verbose 开关影响，确保错误信息始终可见。
+
+#### 新增文件
+
+- `src/log.c`
+- `include/log.h`
+
+#### 修改的文件
+
+- `src/worker_proc.c`（cleanup_done 重置 + 日志替换 + log.h 包含）
+- `src/main_loop.c`（dispatch break 修复 + 全部日志替换 + log.h 包含）
+- `src/monitor.c`（日志替换 + log.h 包含）
+- `src/main.c`（日志替换 + log_init 调用 + log.h 包含）
+- `src/cmdline.c`（日志替换 + log.h 包含）
+- `src/output.c`（日志替换 + log.h 包含）
+- `src/progress.c`（日志替换 + log.h 包含）
+- `src/device_manager.c`（日志替换 + log.h 包含）
+- `src/thread_pool.c`（日志替换 + log.h 包含）
+- `src/lost_tasks.c`（日志替换 + log.h 包含）
+- `src/utils.c`（日志替换 + log.h 包含）
+- `include/config.h`（版本号 12.2.15）
+
+---
+
+### 紧急修复：v12.2.14 LostTasksQueue 封装 + 原子化 is_alive/last_heartbeat
+
+**根因**：v12.2.13 的 scattered `lost_tasks[]/count/capacity/mutex` 方案，锁操作分散在调用方，容易遗漏。
+
+#### 修复
+
+- `lost_tasks` 封装为独立 `LostTasksQueue` 模块，所有锁操作隐藏在 `lost_tasks.c` 内部。
+- `is_alive` → `_Atomic bool`，`last_heartbeat` → `_Atomic time_t`。
+- `cleanup_dead_worker_slot` 新增 `redispatch_current` 参数，Worker 超时死亡时自动将 `current_path` 压入 `lost_tasks`。
+
+#### 修改的文件
+
+- `src/lost_tasks.c` / `include/lost_tasks.h`
+- `src/main_loop.c`
+- `src/worker_proc.c` / `include/worker_proc.h`
+- `include/app_context.h`
+
+---
+
+### 紧急修复：v12.2.13 active_count / lost_tasks 数据竞争（P0 阻断性）
+
+**问题背景**：Monitor 线程与 Main 线程并发访问 `active_count`（plain `int`）和 `lost_tasks[]`（无锁数组），导致数据竞争。在长期运行后可能引发计数器漂移、任务丢失或重复释放。
+
+#### 修复
+
+- `active_count` → `_Atomic int`，所有读写点使用 `atomic_load`/`atomic_fetch_add`/`atomic_fetch_sub`/`atomic_store`。
+- `lost_tasks` 增加 `pthread_mutex_t` 保护，Monitor 写和 Main 读全部被 mutex 包围。
+- `pending_tasks` 幽灵化泄漏：3 处 `atomic_fetch_sub` 修复（ipc_send 返回 -1 时）。
+
+#### 修改的文件
+
+- `src/worker_proc.c` / `include/worker_proc.h`
+- `src/main_loop.c`
+- `include/app_context.h`
+- `src/main.c`
+
+---
+
 ### 紧急修复：poll 超时替代阻塞 read，彻底消除 Master hang 死（P0 阻断性）
 
 **问题背景**：v12.2.9 恢复 `fd_out` 的 `O_NONBLOCK` 后，strace 确认标志已生效，但 Master 仍然阻塞在 `pipe_read`。根本原因是：即使 `O_NONBLOCK` 设置正确，当 Worker 写了一半 header 后死亡（或处于特定竞态），Master 的 `ipc_recv_header()` 循环会在 `read()` 上等待剩余字节，导致 epoll 循环停滞，所有 Worker 的 `pipe_write` 因缓冲区满而阻塞。

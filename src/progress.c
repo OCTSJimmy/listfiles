@@ -33,6 +33,7 @@
 #include <stdint.h>
 #include <dirent.h>
 #include <stdatomic.h>
+#include "log.h"
 
 /* ================================================================
  * Filename helpers
@@ -551,7 +552,7 @@ static void archive_slice_to_file(const Config *cfg, const char *slice_path, uin
     unsigned long dest_len = compressBound((uLong)data_size);
     unsigned char *dest_buf = safe_malloc(dest_len);
     if (compress(dest_buf, &dest_len, src_buf, (uLong)data_size) != Z_OK) {
-        fprintf(stderr, "错误: 压缩分片失败\n");
+        log_error("压缩分片失败");
         free(src_buf); free(dest_buf); return;
     }
     free(src_buf);
@@ -1102,7 +1103,7 @@ static void promote_fpbin_to_pbin(AppContext *ctx) {
         char *src = get_fpbin_slice_filename(ctx->cfg.progress_base, i);
         char *dst = get_slice_filename(ctx->cfg.progress_base, pbin_start_idx + i);
         if (rename(src, dst) != 0) {
-            fprintf(stderr, "[错误] fpbin 转正 rename 失败: %s -> %s\n", src, dst);
+            log_error("fpbin 转正 rename 失败: %s -> %s", src, dst);
         }
         free(src);
         free(dst);
@@ -1114,13 +1115,13 @@ static void promote_fpbin_to_pbin(AppContext *ctx) {
         char *path = get_slice_filename(ctx->cfg.progress_base, pbin_start_idx + i);
         PbinFooter f;
         if (!read_pbin_footer(path, &f)) {
-            fprintf(stderr, "[错误] 转正后 pbin Footer 校验失败: %s\n", path);
+            log_error("转正后 pbin Footer 校验失败: %s", path);
             all_ok = false;
         }
         free(path);
     }
     if (!all_ok) {
-        fprintf(stderr, "[致命错误] fpbin 转正校验未通过，建议手动清理后重试\n");
+        log_fatal("fpbin 转正校验未通过，建议手动清理后重试");
         /* 不删除 fpbin.idx，以便下次恢复时重试转正 */
         ctx->hist_pump_state = HIST_PUMP_DONE;
         return;

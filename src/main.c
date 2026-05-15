@@ -16,6 +16,7 @@
 #include "progress.h"
 #include "utils.h"
 #include "signals.h"
+#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -155,10 +156,10 @@ static void load_session_config(Config *cfg, bool *has_history) {
 
         if (strcmp(key, "path") == 0) {
             if (strcmp(cfg->target_path, val) != 0) {
-                fprintf(stderr, "\n[错误] 检测到进度文件与当前路径不一致！\n");
-                fprintf(stderr, "  历史记录: %s\n", val);
-                fprintf(stderr, "  当前指定: %s\n", cfg->target_path);
-                fprintf(stderr, "建议：使用 --runone 强制重跑，或检查 --progress-file 参数。\n");
+                log_error("检测到进度文件与当前路径不一致！");
+                log_error("  历史记录: %s", val);
+                log_error("  当前指定: %s", cfg->target_path);
+                log_error("建议：使用 --runone 强制重跑，或检查 --progress-file 参数。");
                 exit(1);
             }
         } else if (strcmp(key, "status") == 0) {
@@ -168,7 +169,7 @@ static void load_session_config(Config *cfg, bool *has_history) {
         } else if (strcmp(key, "archive") == 0) {
             bool hist_archive = atoi(val);
             if (hist_archive != cfg->archive) {
-                fprintf(stderr, "[错误] 归档策略与历史记录不一致\n");
+                log_error("归档策略与历史记录不一致");
                 exit(1);
             }
         }
@@ -275,7 +276,7 @@ int main(int argc, char *argv[]) {
     /* Pre-allocate fingerprint set */
     ctx.visited_set = fp_set_create(ctx.cfg.estimated_files);
     if (!ctx.visited_set) {
-        fprintf(stderr, "[Fatal] 无法分配 VisitedSet 内存\n");
+        log_fatal("无法分配 VisitedSet 内存");
         return 1;
     }
 
@@ -296,11 +297,11 @@ int main(int argc, char *argv[]) {
             fclose(fp);
         }
         if (is_success) {
-            fprintf(stderr, "[System] 检测到上次任务已完成，加载历史索引进行半增量扫描...\n");
+            log_info("检测到上次任务已完成，加载历史索引进行半增量扫描...");
             ctx.reference_set = fp_set_create(ctx.cfg.estimated_files);
             ctx.reference_map = ref_map_create(ctx.cfg.estimated_files);
             restore_progress_to_memory(&ctx.cfg, &ctx);
-            fprintf(stderr, "[System] 历史索引加载完成\n");
+            log_info("历史索引加载完成");
         }
     }
 
@@ -320,7 +321,7 @@ int main(int argc, char *argv[]) {
     ctx.monitor = monitor_create(&ctx);
 
     if (!ctx.worker_pool || !ctx.probe_scheduler || !ctx.monitor) {
-        fprintf(stderr, "[Fatal] 无法初始化进程池\n");
+        log_fatal("无法初始化进程池");
         app_context_destroy(&ctx);
         return 1;
     }
@@ -354,7 +355,7 @@ int main(int argc, char *argv[]) {
             safe_strcpy(slot->current_path, ctx.cfg.target_path, sizeof(slot->current_path));
             int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, ctx.cfg.target_path, plen);
             if (rc != 0) {
-                fprintf(stderr, "[Fatal] 根任务发送失败: worker 0 fd=%d rc=%d errno=%d (%s)\n",
+                log_fatal("根任务发送失败: worker 0 fd=%d rc=%d errno=%d (%s)",
                         slot->fd_in, rc, errno, strerror(errno));
                 app_context_destroy(&ctx);
                 return 1;
@@ -365,13 +366,13 @@ int main(int argc, char *argv[]) {
             ctx.state.file_count++;
         }
     } else {
-        fprintf(stderr, "Fatal: Cannot access target path %s\n", ctx.cfg.target_path);
+        log_fatal("Cannot access target path %s", ctx.cfg.target_path);
         app_context_destroy(&ctx);
         return 1;
     }
 
     if (!ctx.cfg.mute) {
-        fprintf(stderr, "[System] 任务开始...\n");
+        log_info("任务开始...");
     }
     main_loop_run(&ctx);
 
@@ -382,7 +383,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (!ctx.cfg.mute) {
-        fprintf(stderr, "[System] 任务完成。耗时: %ld 秒\n", time(NULL) - ctx.state.start_time);
+        log_info("任务完成。耗时: %ld 秒", time(NULL) - ctx.state.start_time);
     }
 
     finalize_progress(&ctx.cfg, &ctx.state);
