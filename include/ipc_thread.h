@@ -22,6 +22,7 @@ typedef struct {
     int             fd_out;         /* Current Worker read end */
     pid_t           pid;            /* Current Worker pid */
     _Atomic bool    waiting_replace;/* Set after DEAD, cleared after REPLACE */
+    int             eagain_retry_count; /* EAGAIN retry counter (reset on REPLACE) */
     pthread_cond_t *master_cond;    /* Signal master thread when message sent */
 } IpcThreadCtx;
 

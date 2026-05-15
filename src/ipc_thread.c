@@ -232,16 +232,15 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
                 }
                 break;
             }
-            static _Thread_local int eagain_retry_count = 0;
             int rc = ipc_send(ctx->fd_in, IPC_MSG_SCAN, scan->path, scan->path_len);
             if (rc == -2) {
                 /* EAGAIN */
-                eagain_retry_count++;
-                if (eagain_retry_count > 10) {
+                ctx->eagain_retry_count++;
+                if (ctx->eagain_retry_count > 10) {
                     log_error("[IPC-%d] ipc_send EAGAIN exhausted (%d retries), marking worker dead",
-                              ctx->slot_id, eagain_retry_count);
+                              ctx->slot_id, ctx->eagain_retry_count);
                     worker_mark_dead(ctx, true);
-                    eagain_retry_count = 0;
+                    ctx->eagain_retry_count = 0;
                     break;
                 }
                 /* push back to queue for retry */
@@ -253,10 +252,10 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
                 }
             } else if (rc == -1) {
                 log_error("[IPC-%d] CMD_SCAN ipc_send failed, marking worker dead", ctx->slot_id);
-                eagain_retry_count = 0;
+                ctx->eagain_retry_count = 0;
                 worker_mark_dead(ctx, true);
             } else {
-                eagain_retry_count = 0;
+                ctx->eagain_retry_count = 0;
             }
             break;
         }
@@ -292,6 +291,7 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
             }
             log_info("[IPC-%d] Worker replaced (pid=%d, fd_out=%d)",
                     ctx->slot_id, (int)ctx->pid, ctx->fd_out);
+            ctx->eagain_retry_count = 0;
             break;
         }
         case CMD_STOP: {
@@ -324,6 +324,7 @@ IpcThreadCtx* ipc_thread_ctx_create(int slot_id, WorkerPool *pool,
     atomic_init(&ctx->running, true);
     atomic_init(&ctx->last_heartbeat, time(NULL));
     atomic_init(&ctx->waiting_replace, false);
+    ctx->eagain_retry_count = 0;
 
     ctx->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (ctx->epfd < 0) {
