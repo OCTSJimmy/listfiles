@@ -110,6 +110,8 @@ static void send_return(IpcThreadCtx *ctx, uint32_t type, void *data, size_t len
     if (!msg_queue_send(ctx->ret_queue, &msg)) {
         log_error("[IPC-%d] ret_queue full, message type=%u dropped", ctx->slot_id, type);
         free(data);
+    } else if (ctx->master_cond) {
+        pthread_cond_signal(ctx->master_cond);
     }
 }
 
@@ -276,7 +278,8 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
  * ================================================================ */
 
 IpcThreadCtx* ipc_thread_ctx_create(int slot_id, WorkerPool *pool,
-                                   MsgQueue *cmd, MsgQueue *ret) {
+                                   MsgQueue *cmd, MsgQueue *ret,
+                                   pthread_cond_t *master_cond) {
     IpcThreadCtx *ctx = calloc(1, sizeof(IpcThreadCtx));
     if (!ctx) return NULL;
 
@@ -284,6 +287,7 @@ IpcThreadCtx* ipc_thread_ctx_create(int slot_id, WorkerPool *pool,
     ctx->pool = pool;
     ctx->cmd_queue = cmd;
     ctx->ret_queue = ret;
+    ctx->master_cond = master_cond;
     ctx->fd_in = -1;
     ctx->fd_out = -1;
     ctx->pid = -1;

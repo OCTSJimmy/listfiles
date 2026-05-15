@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <dirent.h>
+#include <sys/eventfd.h>
 
 /* ================================================================
  * ParsedBatch helpers (unchanged from v12.x)
@@ -128,7 +129,7 @@ static bool send_scan_to_ipc(AppContext *ctx, int wid, const char *path, uint64_
  * IPC helper: send CMD_REPLACE to IPC thread
  * ================================================================ */
 
-static void send_replace_to_ipc(AppContext *ctx, int wid, int fd_in, int fd_out, pid_t pid) {
+void send_replace_to_ipc(AppContext *ctx, int wid, int fd_in, int fd_out, pid_t pid) {
     CmdReplacePayload *rep = malloc(sizeof(CmdReplacePayload));
     if (!rep) {
         log_error("[Replace] malloc failed for worker %d", wid);
@@ -482,7 +483,7 @@ void main_loop_handle_exit(AppContext *ctx, int worker_id) {
  * IPC Thread lifecycle helpers
  * ================================================================ */
 
-static bool init_ipc_threads(AppContext *ctx) {
+bool init_ipc_threads(AppContext *ctx) {
     int n = ctx->worker_pool->num_workers;
 
     ctx->ipc_cmd_queues = calloc(n, sizeof(MsgQueue*));
@@ -524,7 +525,7 @@ static bool init_ipc_threads(AppContext *ctx) {
     return true;
 }
 
-static void destroy_ipc_threads(AppContext *ctx) {
+void destroy_ipc_threads(AppContext *ctx) {
     int n = ctx->worker_pool ? ctx->worker_pool->num_workers : 0;
     for (int i = 0; i < n; i++) {
         if (ctx->ipc_threads && ctx->ipc_threads[i]) {
@@ -551,7 +552,7 @@ static void destroy_ipc_threads(AppContext *ctx) {
     pthread_cond_destroy(&ctx->main_cond);
 }
 
-static void stop_all_ipc_threads(AppContext *ctx) {
+void stop_all_ipc_threads(AppContext *ctx) {
     int n = ctx->worker_pool ? ctx->worker_pool->num_workers : 0;
     for (int i = 0; i < n; i++) {
         send_stop_to_ipc(ctx, i);
