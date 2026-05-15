@@ -7,6 +7,95 @@
 ## [Unreleased]
 
 ---
+---
+
+## [13.0.0] - 2026-05-15
+
+### 架构重构：IPC 线程隔离（v13.0.0）
+
+**问题背景**：v12.x 架构中，Master 主线程通过单线程 epoll 统一监听所有 8 个 Worker 的 fd_out。一个 Worker 的 fd 出问题（heartbeat 超时、D-State 卡死、fd 号重用竞争）会导致 epoll 反复返回 EPOLLERR|EPOLLHUP，污染整个 Master 事件循环，造成 Monitor 秒表冻结、CPU 空转、所有 Worker 假死。v12.2.15 修复了 cleanup_done 和日志问题，但单线程 epoll 的架构瓶颈仍然存在。
+
+**新架构核心**：
+- **8 个 IPC 线程常驻**，生命周期与 Master 进程相同。每个 IPC 线程管理一个 Worker 的非阻塞 epoll + 心跳检测 + SIGKILL。
+- **主线程 = 纯消息总线**，不再直接操作任何 fd、不再 epoll、不再 read/write。只负责：收消息（从 8 个返回队列轮询）、处理消息（BATCH 去重写文件、DEAD 收尾替换、ERROR 记日志）、发消息（SCAN 任务分发给 IPC 线程）。
+- **故障隔离**：一个 Worker 的 fd 出问题 → 只污染它自己的 IPC 线程 → IPC 线程发 DEAD 消息 → 主线程收到后优雅替换 Worker → 其他 7 路完全不受影响。
+
+#### 消息队列
+
+- **eventfd + 无锁环形队列**（64 位原子 CAS head/tail）。
+- 默认容量 1024 条消息/队列，有界设计天然实现背压。
+- 生产者（主线程/IPC 线程）：CAS 写尾指针 → 写入数据 → 写 eventfd 通知。
+- 消费者：读 eventfd → CAS 读头指针 → 读取数据。
+- 零 mutex、零上下文切换开销、支持 64 位原子操作。
+
+#### 消息格式
+
+- **命令（主线程 → IPC 线程）**：
+  - `CMD_SCAN`：发送 SCAN 任务路径给 Worker。
+  - `CMD_REPLACE`：替换 Worker fd/pid（Worker 死亡后主线程 spawn 新 Worker，发此命令让 IPC 线程换新 fd）。
+  - `CMD_STOP`：停止 IPC 线程。
+- **返回（IPC 线程 → 主线程）**：
+  - `RET_BATCH`：Worker 返回的扫描结果批次。
+  - `RET_HEARTBEAT`：Worker 心跳（用于 Monitor 面板显示）。
+  - `RET_ERROR`：Worker 遇到的设备级错误（ETIMEDOUT/EIO）。
+  - `RET_DEAD`：Worker 死亡（heartbeat 超时或 epoll error/hup）。
+  - `RET_EXIT`：Worker 正常退出。
+
+#### IPC 线程内部循环
+
+```
+while (running) {
+    // 1. 从主线程消息队列取命令（非阻塞 drain）
+    // 2. epoll_wait(fd_out + cmd_queue eventfd, 500ms)
+    // 3. 处理 fd_out 事件（非阻塞 read → 解析 BATCH/HEARTBEAT/ERROR/EXIT）
+    // 4. 心跳检测：超时 → SIGKILL Worker → 发 RET_DEAD → 等待 REPLACE
+}
+```
+
+- 每个 IPC 线程有自己的小 epoll（2 个 fd：fd_out + cmd_queue eventfd）。
+- fd 均为 O_NONBLOCK，read 采用 poll(100ms) 超时保护。
+- Worker 死亡后 IPC 线程自己 close fd、epoll DEL，不需要主线程介入 cleanup。
+
+#### 主线程消息总线循环
+
+```
+while (running) {
+    // 1. bus_epoll_wait(500ms) 监听所有 ret_queue eventfd + 线程池 event_fd
+    // 2. 处理返回消息（BATCH → 线程池去重；DEAD → 替换 Worker；ERROR → 设备熔断）
+    // 3. drain_completed_batches（线程池完成通知）
+    // 4. 泵送历史 pbin 目录
+    // 5. 收割僵尸进程
+    // 6. 替换死亡 Worker（spawn → send REPLACE）
+    // 7. dispatch_lost_tasks（通过 cmd_queue 发 CMD_SCAN）
+    // 8. 终止条件检查
+}
+```
+
+#### Monitor 线程精简
+
+- **删除 `check_workers_health`**：Worker 心跳超时检测完全下沉到 IPC 线程。
+- **保留职责**：进度面板输出（秒表、速率、Worker 状态）、敢死队探测调度、探测进程收割。
+- Monitor 不再直接操作 Worker fd 或发送 SIGKILL。
+
+#### 新增文件
+
+- `include/msg_format.h` — 消息格式定义（CMD/RET 类型、Payload 结构体）。
+- `include/msg_queue.h` — 无锁环形队列 API（eventfd 通知、CAS head/tail）。
+- `src/msg_queue.c` — 无锁队列实现（64 位原子操作、select-based recv_wait）。
+- `include/ipc_thread.h` — IPC 线程上下文和生命周期 API。
+- `src/ipc_thread.c` — IPC 线程主循环（独立 epoll、心跳检测、消息处理）。
+
+#### 修改的文件
+
+- `include/app_context.h` — 添加 IPC 线程数组、消息队列指针、主线程 cond/mutex。
+- `include/config.h` — `VERSION "13.0.0"`。
+- `include/main_loop.h` — 暴露 IPC 线程生命周期 API（init_ipc_threads、destroy_ipc_threads、send_replace_to_ipc）。
+- `src/main_loop.c` — **重写**：从单线程 epoll 驱动改为消息总线驱动。保留 BATCH 去重、lost_tasks 派发、Worker 替换、设备熔断、历史 pbin 泵送等所有现有功能。
+- `src/main.c` — 初始化 IPC 线程、发送初始 REPLACE、根任务改为通过 cmd_queue 发送 CMD_SCAN。
+- `src/monitor.c` — 删除 Worker 心跳超时检测，保留进度面板和敢死队探测。
+- `Makefile` — 自动包含新源文件（msg_queue.c、ipc_thread.c）。
+
+---
 
 ### 紧急修复：v12.2.15 cleanup_done 未重置 + 日志系统 + dispatch 轮询缺陷（P0 阻断性）
 

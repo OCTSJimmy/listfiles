@@ -17,6 +17,8 @@
 #include "utils.h"
 #include "signals.h"
 #include "log.h"
+#include "msg_format.h"
+#include "msg_queue.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -334,6 +336,17 @@ int main(int argc, char *argv[]) {
         worker_pool_spawn(ctx.worker_pool, i);
     }
 
+    /* v13.0.0: Initialize IPC threads and send initial REPLACE */
+    if (!init_ipc_threads(&ctx)) {
+        log_fatal("IPC thread initialization failed");
+        app_context_destroy(&ctx);
+        return 1;
+    }
+    for (int i = 0; i < num_workers; i++) {
+        WorkerSlot *slot = &ctx.worker_pool->slots[i];
+        send_replace_to_ipc(&ctx, i, slot->fd_in, slot->fd_out, slot->pid);
+    }
+
     /* Resume mode: restore progress and replay unfinished tasks */
     if (ctx.cfg.continue_mode && !ctx.reference_set) {
         restore_progress(&ctx.cfg, &ctx);
@@ -349,14 +362,29 @@ int main(int argc, char *argv[]) {
     if (lstat(ctx.cfg.target_path, &root_info) == 0) {
         if (S_ISDIR(root_info.st_mode)) {
             atomic_fetch_add(&ctx.pending_tasks, 1);
-            uint32_t plen = (uint32_t)strlen(ctx.cfg.target_path);
             WorkerSlot *slot = ctx.worker_pool->slots;
             slot->current_dev = root_info.st_dev;
             safe_strcpy(slot->current_path, ctx.cfg.target_path, sizeof(slot->current_path));
-            int rc = ipc_send(slot->fd_in, IPC_MSG_SCAN, ctx.cfg.target_path, plen);
-            if (rc != 0) {
-                log_fatal("根任务发送失败: worker 0 fd=%d rc=%d errno=%d (%s)",
-                        slot->fd_in, rc, errno, strerror(errno));
+
+            CmdScanPayload *scan = malloc(sizeof(CmdScanPayload));
+            if (!scan) {
+                log_fatal("根任务内存分配失败");
+                app_context_destroy(&ctx);
+                return 1;
+            }
+            scan->path_len = (uint32_t)strlen(ctx.cfg.target_path);
+            scan->dev = root_info.st_dev;
+            safe_strcpy(scan->path, ctx.cfg.target_path, sizeof(scan->path));
+
+            IpcThreadMsg msg = {
+                .type = CMD_SCAN,
+                .slot_id = 0,
+                .data = scan,
+                .data_len = sizeof(*scan)
+            };
+            if (!msg_queue_send(ctx.ipc_cmd_queues[0], &msg)) {
+                log_fatal("根任务发送失败: cmd_queue full");
+                free(scan);
                 app_context_destroy(&ctx);
                 return 1;
             }

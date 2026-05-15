@@ -4,10 +4,10 @@
  *
  * 独立的监控线程负责：
  * 1. 每 500ms 刷新一次统计面板（输出到 stdout），显示运行时间、Worker 状态、吞吐量、进度、设备状态等
- * 2. 每 1s 检查一次 Worker 心跳超时，对超时的 Worker 发送 SIGKILL 并标记为死亡
- * 3. 调度敢死队探测进程：对熔断设备 fork 子进程执行 lstat 探测
- * 4. 收割已完成的探测进程，根据退出状态决定设备恢复或重新调度探测
+ * 2. 调度敢死队探测进程：对熔断设备 fork 子进程执行 lstat 探测
+ * 3. 收割已完成的探测进程，根据退出状态决定设备恢复或重新调度探测
  *
+ * v13.0.0: Worker 心跳检测已下沉到 IPC 线程，Monitor 不再直接管理 Worker 死活。
  * 监控面板输出到 stdout，便于用户在终端实时查看进度；其他诊断信息（日志、错误等）统一输出到 stderr。
  */
 #define _GNU_SOURCE
@@ -204,47 +204,6 @@ void print_progress(Monitor *mon) {
 }
 
 /* ================================================================
- * Worker health check (directly inspect WorkerPool slots)
- * ================================================================ */
-
-/**
- * @brief  检查所有 Worker 的心跳超时并替换卡死 Worker
- * @param  mon  Monitor*  监控器指针，不能为空
- * @return void
- *
- * @note   遍历 WorkerPool 中所有 is_alive 的 slot，
- *         若当前时间与 last_heartbeat 的差值超过 cfg->heartbeat_timeout（默认 30s），
- *         则发送 SIGKILL，以 WNOHANG 方式 waitpid，标记 slot 为死亡并减少 active_count。
- *         不阻塞等待，因为 Worker 可能处于 D-State 不可杀死。
- */
-static void check_workers_health(Monitor *mon) {
-    AppContext *ctx = mon->ctx;
-    if (!ctx || !ctx->worker_pool) return;
-
-    time_t now = time(NULL);
-    int timeout = ctx->cfg.heartbeat_timeout;
-
-    for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
-        WorkerSlot *slot = &ctx->worker_pool->slots[i];
-        if (!atomic_load(&slot->is_alive)) continue;
-
-        if (now - atomic_load(&slot->last_heartbeat) > timeout) {
-            char timebuf[32];
-            struct tm *tm_info = localtime(&now);
-            strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
-            log_error("[Monitor] Worker %d heartbeat timeout (dev=%lu, path=%s). Replacing.",
-                    i, (unsigned long)slot->current_dev, slot->current_path);
-
-            kill(slot->pid, SIGKILL);
-            int status;
-            waitpid(slot->pid, &status, WNOHANG);
-            cleanup_dead_worker_slot(ctx, i, true);
-            ctx->state.has_error = true;
-        }
-    }
-}
-
-/* ================================================================
  * Daredevil probe (fork-based, same logic as old main_loop.c)
  * ================================================================ */
 
@@ -357,7 +316,6 @@ void* monitor_thread_entry(void *arg) {
 
         time_t now = time(NULL);
         if (now - last_check_time >= CHECK_INTERVAL_SEC) {
-            check_workers_health(mon);
             dispatch_probes(mon);
             last_check_time = now;
         }
