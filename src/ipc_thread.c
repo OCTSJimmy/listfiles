@@ -3,6 +3,7 @@
 #include "msg_format.h"
 #include "ipc_protocol.h"
 #include "log.h"
+#include "utils.h"
 #include "worker_proc.h"
 #include <stdlib.h>
 #include <string.h>
@@ -212,21 +213,49 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
             CmdScanPayload *scan = (CmdScanPayload*)cmd->data;
             if (!scan) break;
             if (ctx->fd_in < 0) {
-                log_warn("[IPC-%d] CMD_SCAN but fd_in closed, dropping %s",
-                        ctx->slot_id, scan->path);
+                /* Replacement 窗口期：fd_in 尚未就绪，通知 Master 重入队 */
+                DropPayload *drop = malloc(sizeof(DropPayload));
+                if (drop) {
+                    safe_strcpy(drop->path, scan->path, sizeof(drop->path));
+                    IpcThreadMsg drop_msg = {
+                        .type = MSG_DROP,
+                        .slot_id = ctx->slot_id,
+                        .data = drop,
+                        .data_len = sizeof(*drop)
+                    };
+                    if (!msg_queue_send(ctx->ret_queue, &drop_msg)) {
+                        log_warn("[IPC-%d] MSG_DROP send failed, leaking path", ctx->slot_id);
+                        free(drop);
+                    } else if (ctx->master_cond) {
+                        pthread_cond_signal(ctx->master_cond);
+                    }
+                }
                 break;
             }
+            static _Thread_local int eagain_retry_count = 0;
             int rc = ipc_send(ctx->fd_in, IPC_MSG_SCAN, scan->path, scan->path_len);
             if (rc == -2) {
-                /* EAGAIN: push back to queue for retry */
+                /* EAGAIN */
+                eagain_retry_count++;
+                if (eagain_retry_count > 10) {
+                    log_error("[IPC-%d] ipc_send EAGAIN exhausted (%d retries), marking worker dead",
+                              ctx->slot_id, eagain_retry_count);
+                    worker_mark_dead(ctx, true);
+                    eagain_retry_count = 0;
+                    break;
+                }
+                /* push back to queue for retry */
                 if (!msg_queue_send(ctx->cmd_queue, cmd)) {
                     log_warn("[IPC-%d] CMD_SCAN EAGAIN, cmd_queue full, dropping %s",
                             ctx->slot_id, scan->path);
+                } else {
+                    cmd->data = NULL; /* prevent double free */
                 }
-                cmd->data = NULL; /* prevent double free */
             } else if (rc == -1) {
                 log_error("[IPC-%d] CMD_SCAN ipc_send failed, marking worker dead", ctx->slot_id);
                 worker_mark_dead(ctx, true);
+            } else {
+                eagain_retry_count = 0;
             }
             break;
         }

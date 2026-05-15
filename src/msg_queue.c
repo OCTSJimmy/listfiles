@@ -73,7 +73,7 @@ bool msg_queue_send(MsgQueue *q, const IpcThreadMsg *msg) {
         /* Try to reserve slot */
         if (atomic_compare_exchange_weak_explicit(
                 &q->tail, &tail, tail + 1,
-                memory_order_relaxed, memory_order_relaxed)) {
+                memory_order_release, memory_order_relaxed)) {
             /* Write data */
             q->buffer[tail & mask] = *msg;
             /* Publish write */

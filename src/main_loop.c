@@ -268,6 +268,16 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
  * ================================================================ */
 
 static void dispatch_lost_tasks(AppContext *ctx) {
+    /* 短路：如果所有 Worker 都死了，直接返回 */
+    bool any_alive = false;
+    for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
+        if (atomic_load(&ctx->worker_pool->slots[i].is_alive)) {
+            any_alive = true;
+            break;
+        }
+    }
+    if (!any_alive) return;
+
     char *path;
     while (lost_tasks_pop(&ctx->lost_tasks, &path)) {
         if (!path) continue;
@@ -385,8 +395,13 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             cleanup_dead_worker_slot(ctx, msg->slot_id, true);
             break;
         }
-        case RET_EXIT: {
-            main_loop_handle_exit(ctx, msg->slot_id);
+        case MSG_DROP: {
+            if (msg->data_len >= sizeof(DropPayload)) {
+                DropPayload *drop = (DropPayload*)msg->data;
+                if (lost_tasks_push(&ctx->lost_tasks, strdup(drop->path))) {
+                    atomic_fetch_sub(&ctx->pending_tasks, 1);
+                }
+            }
             break;
         }
     }

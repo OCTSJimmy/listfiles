@@ -22,6 +22,7 @@
 #define RET_ERROR      12  /* Worker error (device-level) */
 #define RET_DEAD       13  /* Worker died (timeout/epoll error) */
 #define RET_EXIT       14  /* Worker normal exit */
+#define MSG_DROP       15  /* CMD_SCAN dropped during replacement window */
 
 /**
  * @brief  Unified message structure for Master <-> IPC Thread queues
@@ -70,5 +71,10 @@ typedef struct {
 } RetErrorPayload;
 
 /* RET_DEAD / RET_EXIT: no payload needed (data = NULL) */
+
+/* MSG_DROP payload */
+typedef struct {
+    char path[4096];
+} DropPayload;
 
 #endif
