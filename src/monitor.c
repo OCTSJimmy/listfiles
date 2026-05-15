@@ -142,9 +142,7 @@ void print_progress(Monitor *mon) {
     int total_workers = 0;
     if (ctx->worker_pool) {
         total_workers = ctx->worker_pool->num_workers;
-        for (int i = 0; i < total_workers; i++) {
-            if (atomic_load(&ctx->worker_pool->slots[i].is_alive)) alive_workers++;
-        }
+        alive_workers = atomic_load(&ctx->worker_pool->active_count);
     }
 
     long pending = atomic_load(&ctx->pending_tasks);
