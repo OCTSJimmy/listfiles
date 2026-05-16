@@ -577,9 +577,7 @@ static void enlarge_pipe(int fd) {
 bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     int in_pipe[2], out_pipe[2];
     if (pipe2(in_pipe, O_CLOEXEC) != 0) return false;
-    /* O_NONBLOCK on out_pipe: prevents master read hang on stale fd reuse,
-     * and prevents worker write hang when pipe buffer is full. */
-    if (pipe2(out_pipe, O_CLOEXEC | O_NONBLOCK) != 0) {
+    if (pipe2(out_pipe, O_CLOEXEC) != 0) {
         close(in_pipe[0]); close(in_pipe[1]);
         return false;
     }
@@ -587,6 +585,14 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     /* Enlarge pipe buffers to reduce deadlock probability */
     enlarge_pipe(in_pipe[0]); enlarge_pipe(in_pipe[1]);
     enlarge_pipe(out_pipe[0]); enlarge_pipe(out_pipe[1]);
+
+    /* Master read end must be non-blocking for IPC thread epoll responsiveness */
+    int out_flags = fcntl(out_pipe[0], F_GETFL);
+    if (out_flags >= 0) {
+        fcntl(out_pipe[0], F_SETFL, out_flags | O_NONBLOCK);
+    } else {
+        log_warn("[worker_pool_spawn] WARNING: fcntl(F_GETFL) on fd_out failed: errno=%d", errno);
+    }
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -623,8 +629,6 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     } else {
         log_warn("[worker_pool_spawn] WARNING: fcntl(F_GETFL) on fd_in failed: errno=%d", errno);
     }
-
-    /* out_pipe already has O_NONBLOCK from pipe2; no need for fragile fcntl here */
 
     WorkerSlot *slot = &pool->slots[slot_id];
     slot->pid = pid;

@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "13.0.2" // 版本号升级：修复 fd_in double close + 重复 RET_DEAD + ipc_send 部分写入协议不同步
+#define VERSION "13.0.3" // 版本号升级：修复 Worker 写端非阻塞导致的 payload timeout 竞态
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000

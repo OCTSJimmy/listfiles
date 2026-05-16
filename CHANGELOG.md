@@ -9,6 +9,26 @@
 ---
 ---
 
+## [13.0.3] - 2026-05-16
+
+### Bugfix：修复 Worker 写端非阻塞导致的 payload timeout 竞态
+
+**问题背景**：v13.0.2 运行时启动即出现 `[IPC-0] payload timeout (len=1197)`，IPC 线程读到 Header 后 100ms 内等不齐 payload。
+
+**根因**：`worker_pool_spawn()` 中 `out_pipe`（Worker → Master）被 `pipe2(O_NONBLOCK)` 设为非阻塞。Worker 写 BATCH 时，`write()` 可能部分写入后遇 `EAGAIN`；v13.0.2 的 `ipc_send()` retry 逻辑（`usleep(1ms)`）让 Worker 反复尝试。但 IPC 线程通过 epoll 已检测到 `fd_out` 可读，读取 Header 后 `poll_payload(100ms)` 等待剩余 payload，形成竞态——Worker 还没写完，IPC 线程已超时。
+
+**修复**：
+- `worker_pool_spawn()`：`out_pipe` 创建时不再带 `O_NONBLOCK`。
+- Worker 写端 `out_pipe[1]` 恢复阻塞模式，`ipc_send()` 的 `write()` 会一次性写完或阻塞到写完，不会出现 Header 到了 payload 没到的情况。
+- Master 读端 `out_pipe[0]` 显式加 `O_NONBLOCK`，保持 IPC 线程 epoll 响应性。
+
+#### 修改的文件
+
+- `src/worker_proc.c`（`worker_pool_spawn` out_pipe 阻塞化 + 读端单独加 O_NONBLOCK）
+- `include/config.h`（版本号 13.0.3）
+
+---
+
 ## [13.0.2] - 2026-05-16
 
 ### Bugfix：修复 double free / fd 生命周期混乱 + 重复 RET_DEAD + ipc_send 部分写入协议不同步
