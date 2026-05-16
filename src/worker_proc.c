@@ -574,6 +574,10 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
     int rc_ready = ipc_send(fd_ctrl, IPC_MSG_READY, NULL, 0);
     log_debug("[Worker-%d] READY sent (rc=%d)", worker_id, rc_ready);
 
+    log_info("[Worker-%d] Started, g_worker_cfg=%p, hb_timeout=%d",
+             worker_id, (void*)g_worker_cfg,
+             g_worker_cfg ? g_worker_cfg->heartbeat_timeout : -1);
+
     struct pollfd pfd = { fd_cmd, POLLIN, 0 };
     time_t last_heartbeat = time(NULL);
     int heartbeat_count = 0;
@@ -592,6 +596,9 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
 
         if (rc == 0 || elapsed >= 5) {
             heartbeat_count++;
+            if (ctx.scanner_active) {
+                log_info("[Worker-%d] Scanner active (heartbeat %d)", worker_id, heartbeat_count);
+            }
             IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
             int rc_hb = ipc_send(fd_ctrl, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
             if (heartbeat_count <= 3 || rc_hb != 0) {
@@ -814,6 +821,20 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
         fcntl(ctrl_pipe[0], F_SETFL, ctrl_flags | O_NONBLOCK);
     } else {
         log_warn("[worker_pool_spawn] fcntl(F_GETFL) on fd_ctrl failed: errno=%d", errno);
+    }
+
+    /* Worker write ends must be non-blocking to prevent bidirectional pipe deadlock */
+    int wdata_flags = fcntl(data_pipe[1], F_GETFL);
+    if (wdata_flags >= 0) {
+        fcntl(data_pipe[1], F_SETFL, wdata_flags | O_NONBLOCK);
+    } else {
+        log_warn("[worker_pool_spawn] fcntl(F_GETFL) on fd_data_wr failed: errno=%d", errno);
+    }
+    int wctrl_flags = fcntl(ctrl_pipe[1], F_GETFL);
+    if (wctrl_flags >= 0) {
+        fcntl(ctrl_pipe[1], F_SETFL, wctrl_flags | O_NONBLOCK);
+    } else {
+        log_warn("[worker_pool_spawn] fcntl(F_GETFL) on fd_ctrl_wr failed: errno=%d", errno);
     }
 
     pid_t pid = fork();

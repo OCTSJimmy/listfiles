@@ -9,6 +9,24 @@
 ---
 ---
 
+## [15.0.3] - 2026-05-17
+
+### Bugfix：修复 Worker 侧 `fd_data`/`fd_ctrl` 阻塞写导致的卡死
+
+**问题背景**：v15.0.2 修复计数器后，扫描 `/public2` 时 `pending_tasks=143` 仍卡住 3 分钟不下降，Worker 全部空闲（poll），无 FINISH 到达主循环。
+
+**根因：阻塞写死锁**
+- `worker_pool_spawn()` 中仅设置了 Master 读端（`data_pipe[0]` / `ctrl_pipe[0]`）和 Master 写端（`cmd_pipe[1]`）的 `O_NONBLOCK`。
+- 但 Worker 写端 `data_pipe[1]`（fd_data）和 `ctrl_pipe[1]`（fd_ctrl）仍为**阻塞写**。
+- 当 IPC 线程因 cmd_queue drain + `ipc_send` EAGAIN 重试而延迟 epoll_wait 时，fd_data / fd_ctrl 管道积满。
+- Worker Scanner 线程写 fd_data 阻塞，无法发 FINISH；Worker 主线程 poll fd_cmd 等 SCAN，形成死锁。
+
+**修复**
+- `fork` 前将 `data_pipe[1]` 和 `ctrl_pipe[1]` 设为 `O_NONBLOCK`。
+- Worker 侧 `ipc_send` 在 EAGAIN 时 `usleep(1000)` 重试，不再永久阻塞。
+
+---
+
 ## [15.0.2] - 2026-05-16
 
 ### Bugfix：修复 `pending_tasks` 计数器逻辑混乱 + `fd_cmd_rd` 保存无效 fd
