@@ -76,6 +76,7 @@ static void worker_mark_dead(IpcThreadCtx *ctx, bool send_notify) {
         close(ctx->fd_out);
         ctx->fd_out = -1;
     }
+    ctx->pid = -1; /* prevent duplicate timeout kill and delayed RET_DEAD */
     atomic_store(&ctx->waiting_replace, true);
 
     if (send_notify) {

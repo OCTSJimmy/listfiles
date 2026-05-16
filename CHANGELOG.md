@@ -9,6 +9,46 @@
 ---
 ---
 
+## [13.0.2] - 2026-05-16
+
+### Bugfix：修复 double free / fd 生命周期混乱 + 重复 RET_DEAD + ipc_send 部分写入协议不同步
+
+**问题背景**：v13.0.1 运行时出现 `double free or corruption (fasttop)` 崩溃，发生在所有 8 个 Worker 同时 heartbeat timeout 被 SIGKILL 之后、主线程继续输出切片切换阶段。
+
+**根因 A：fd_in double close**
+- `worker_mark_dead()`（IPC 线程）与 `cleanup_dead_worker_slot()`（主线程）各自 `close(slot->fd_in)`。
+- `send_replace_to_ipc()` 将 `slot->fd_in` 直接赋值给 `ctx->fd_in`，二者**共享同一个内核 fd 号**，没有 `dup`。
+- IPC 线程先 close → fd 号释放 → async_writer 打开新切片文件时复用该 fd 号 → 主线程再次 close → 意外关闭 async_writer 的合法文件描述符 → `FILE*` 内部缓冲区指针被 double free。
+
+**根因 B：延迟/重复 RET_DEAD 清理新 Worker**
+- `worker_mark_dead()` 未将 `ctx->pid` 设为 `-1`，导致 heartbeat timeout check 可能再次触发，发送第二个 RET_DEAD。
+- 主线程收到第一个 RET_DEAD 后 spawn 新 Worker、重置 `cleanup_done`、发送 REPLACE。
+- 第二个延迟的 RET_DEAD 到达时，`cleanup_dead_worker_slot()` 因 `cleanup_done` 已重置，错误地再次清理新 Worker，关闭其 fd、释放其 backlog、扣减 pending_tasks。
+
+**根因 C：ipc_send 部分写入后 EAGAIN 导致协议不同步**
+- v13.0.1 将 `ipc_send()` 改为单次 `write()`，但对大于 `PIPE_BUF` 的 BATCH 消息，`write()` 可能部分写入后下一次返回 `EAGAIN`。
+- 此时函数返回 `-2`，但 pipe 中已残留不完整数据，再次调用时追加新消息，IPC 线程解析错乱。
+
+#### 修复
+
+- **`ipc_thread.c: worker_mark_dead()`**：
+  - 增加 `ctx->pid = -1;`，彻底阻止重复 heartbeat timeout 和重复 RET_DEAD。
+- **`main_loop.c: cleanup_dead_worker_slot()`**：
+  - 不再 `close(slot->fd_in)`，只设为 `-1`（IPC 线程已负责关闭）。
+- **`main_loop.c: handle_return_message()` (RET_DEAD)**：
+  - 增加 guard：`if (is_alive && pid != -1) break;`，忽略 REPLACE 之后才到达的延迟 RET_DEAD。
+- **`worker_proc.c: ipc_send()`**：
+  - 如果 `written > 0` 时遇到 `EAGAIN`，不再返回 `-2`，而是 `usleep(1ms)` 后继续重试，避免 pipe 中残留不完整数据。
+
+#### 修改的文件
+
+- `src/ipc_thread.c`（`worker_mark_dead` 设 pid=-1）
+- `src/main_loop.c`（`cleanup_dead_worker_slot` 不再 close fd_in + RET_DEAD guard）
+- `src/worker_proc.c`（`ipc_send` 部分写入 retry）
+- `include/config.h`（版本号 13.0.2）
+
+---
+
 ## [13.0.1] - 2026-05-15
 
 ### Bugfix：IPC 协议失步 + 栈值污染/历史块数异常 + archive 无限循环防呆

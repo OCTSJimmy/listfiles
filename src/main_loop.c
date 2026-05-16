@@ -339,9 +339,8 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
     slot->backlog_count = 0;
     slot->backlog_capacity = 0;
 
-    /* Close write-end fd_in (IPC thread already closed its copy, but Master still holds one) */
+    /* Close write-end fd_in (IPC thread already closed its copy, Master just notes it) */
     if (slot->fd_in >= 0) {
-        close(slot->fd_in);
         slot->fd_in = -1;
     }
 
@@ -391,6 +390,11 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             break;
         }
         case RET_DEAD: {
+            WorkerSlot *slot = &ctx->worker_pool->slots[msg->slot_id];
+            if (atomic_load(&slot->is_alive) && slot->pid != -1) {
+                /* Stale RET_DEAD after replacement; ignore */
+                break;
+            }
             log_error("[Bus] Worker %d DEAD reported by IPC thread", msg->slot_id);
             cleanup_dead_worker_slot(ctx, msg->slot_id, true);
             break;

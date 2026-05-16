@@ -77,7 +77,12 @@ int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_le
         ssize_t n = write(fd, buf + written, total_len - written);
         if (n < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) { free(buf); return -2; }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (written == 0) { free(buf); return -2; }
+                /* Partial write occurred; must retry to avoid protocol desync */
+                usleep(1000); /* 1ms back-off */
+                continue;
+            }
             free(buf);
             return -1;
         }
