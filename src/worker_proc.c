@@ -892,7 +892,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     slot->fd_data = data_pipe[0];
     slot->fd_ctrl = ctrl_pipe[0];
     atomic_store(&slot->is_alive, true);
-    atomic_store(&slot->state, WORKER_STATE_IDLE);  /* v15.1.0: spawn 初始为 IDLE */
+    atomic_store(&slot->state, WORKER_STATE_INITIALIZING);  /* v15.1.1: spawn 初始为 INITIALIZING */
     atomic_store(&slot->last_heartbeat, time(NULL));
     slot->current_dev = 0;
     slot->current_path[0] = '\0';

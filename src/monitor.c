@@ -160,6 +160,33 @@ void print_progress(Monitor *mon) {
     fprintf(fp, "  Pending tasks: %ld\n", pending);
     fprintf(fp, "  Pending batches: %ld\n", pending_batches);
 
+    /* v15.1.1: 显示每个 Worker 的独立状态 */
+    if (ctx->worker_pool) {
+        fprintf(fp, "\n[Worker States]\n");
+        for (int i = 0; i < total_workers; i++) {
+            WorkerSlot *slot = &ctx->worker_pool->slots[i];
+            int state = atomic_load(&slot->state);
+            const char *state_str = "???";
+            switch (state) {
+                case WORKER_STATE_IDLE:         state_str = "IDLE"; break;
+                case WORKER_STATE_BUSY:         state_str = "BUSY"; break;
+                case WORKER_STATE_DEAD:         state_str = "DEAD"; break;
+                case WORKER_STATE_INITIALIZING: state_str = "INIT"; break;
+            }
+            char path_display[32] = "-";
+            if (slot->current_path[0] != '\0') {
+                /* 截断显示：仅保留最后 20 个字符 */
+                size_t plen = strlen(slot->current_path);
+                const char *p = slot->current_path;
+                if (plen > 20) p += plen - 20;
+                snprintf(path_display, sizeof(path_display), "...%.*s",
+                         (int)(sizeof(path_display)-4), p);
+            }
+            fprintf(fp, "  W%d: %-4s pid=%d path=%s\n", i, state_str,
+                    (int)slot->pid, path_display);
+        }
+    }
+
     fprintf(fp, "\n[Throughput]\n");
     fprintf(fp, "  Dir rate:  %8.2f/s (max: %.2f)\n", state->stats.current_dir_rate, state->stats.max_dir_rate);
     fprintf(fp, "  File rate: %8.2f/s (max: %.2f)\n", state->stats.current_file_rate, state->stats.max_file_rate);

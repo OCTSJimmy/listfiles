@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.0.4**（基于 v15.0.0 三通道分离架构，修复重复初始化、计数器缺陷、阻塞写，并增加 IPC 链路追踪日志定位 FINISH 丢失点）
+当前设计版本：**v15.1.1**（基于 v15.1.0 状态机，补全 INITIALIZING + startup_timeout + RET_ERROR 恢复 + Monitor 状态显示）
 
 ---
 
@@ -333,7 +333,7 @@ v14.0.x 中 Worker 拆分为 Scanner 线程 + IPC 线程后，两条线程并发
 ### Master 侧 Worker 状态机
 
 ```
-[UNSPAWNED]
+[DEAD/UNSPAWNED]
    │
    │ spawn()
    ▼
@@ -343,12 +343,11 @@ v14.0.x 中 Worker 拆分为 Scanner 线程 + IPC 线程后，两条线程并发
    ▼
 [IDLE] ──heartbeat_timeout=30s──► [DEAD] → replace
    │
-   │ send CMD_SCAN
+   │ send CMD_SCAN (only if STATE_IDLE)
    ▼
 [BUSY] ──heartbeat_timeout=30s──► [DEAD] → replace（IPC线程挂了）
-   │      ──task_timeout=-t参数──► [DEAD] → replace（任务太久）
-   │      ◄── IPC_MSG_DEV_TIMEOUT
-   │      ◄── RET_DEV_TIMEOUT
+   │      ──task_timeout: Worker自检测DEV_TIMEOUT上报──► [DEAD] → replace
+   │      ◄── IPC_MSG_DEV_TIMEOUT → RET_DEV_TIMEOUT
    │
    │ ◄── RET_BATCH（可能有多个）
    │ ◄── RET_FINISH
@@ -356,29 +355,27 @@ v14.0.x 中 Worker 拆分为 Scanner 线程 + IPC 线程后，两条线程并发
 [IDLE]
 ```
 
+**状态常量**（实现命名）：
+- `WORKER_STATE_INITIALIZING (3)`：刚 spawn，等 READY
+- `WORKER_STATE_IDLE (0)`：可接收任务
+- `WORKER_STATE_BUSY (1)`：已分配任务，等 FINISH
+- `WORKER_STATE_DEAD (2)`：Worker 已死或正在替换
+
 **状态转换表**：
 
 | 当前状态 | 触发条件 | 下一状态 | 动作 |
 |---|---|---|---|
-| INITIALIZING | startup_timeout | DEAD | SIGKILL + replace |
+| INITIALIZING | startup_timeout (60s) | DEAD | SIGKILL + replace |
 | INITIALIZING | RET_READY | IDLE | 开始心跳计时 |
-| IDLE | CMD_SCAN | BUSY | 发送任务，开始 task_timeout |
-| IDLE | heartbeat_timeout | DEAD | SIGKILL + replace |
-| BUSY | RET_FINISH | IDLE | 停止 task_timeout，分发下一任务 |
-| BUSY | heartbeat_timeout | DEAD | SIGKILL + replace |
-| BUSY | task_timeout | DEAD | SIGKILL + replace |
-| BUSY | RET_DEV_TIMEOUT | DEAD | SIGKILL + replace |
+| IDLE | CMD_SCAN (选中且发送成功) | BUSY | 发送任务 |
+| IDLE | heartbeat_timeout (30s) | DEAD | SIGKILL + replace |
+| BUSY | RET_FINISH | IDLE | 停止 task_timeout |
 | BUSY | RET_ERROR | IDLE | 设备熔断，不替换 Worker |
-| ANY | RET_EXIT | UNSPAWNED | 正常退出 |
+| BUSY | heartbeat_timeout (30s) | DEAD | SIGKILL + replace |
+| BUSY | RET_DEV_TIMEOUT | DEAD | SIGKILL + replace（Worker自检测超时） |
 | DEAD | cleanup + replace | INITIALIZING | spawn 新 Worker |
 
-### Monitor 显示状态
-
-每个 Worker 显示真实状态：
-- `INIT`：INITIALIZING（刚 spawn，等 READY）
-- `IDLE`：空闲，等待任务
-- `BUSY`：正在扫描（显示 current_path 截断）
-- `DEAD`：已判定死亡，等待替换
+**任务超时说明**：Master 侧不独立维护 task_timeout 计时器。Worker Scanner 线程通过 `last_progress` 自检测停滞，超时发送 `IPC_MSG_DEV_TIMEOUT` → IPC 线程转发 `RET_DEV_TIMEOUT` → Master 按 DEAD 处理。
 
 ### 修改的文件
 

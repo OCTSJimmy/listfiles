@@ -11,9 +11,10 @@
 #include "ipc_protocol.h"
 
 /* Worker 显式状态机 (v15.1.0) */
-#define WORKER_STATE_IDLE  0
-#define WORKER_STATE_BUSY  1
-#define WORKER_STATE_DEAD  2
+#define WORKER_STATE_IDLE         0
+#define WORKER_STATE_BUSY         1
+#define WORKER_STATE_DEAD         2
+#define WORKER_STATE_INITIALIZING 3
 
 typedef struct {
     int      slot_id;

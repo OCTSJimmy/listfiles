@@ -8,6 +8,22 @@
 
 ---
 
+## [15.1.1] - 2026-05-17
+
+### Fixed：补全 Worker 状态机实现（INITIALIZING + startup_timeout + RET_ERROR 恢复 + Monitor 状态显示）
+
+**背景**：v15.1.0 引入 IDLE/BUSY/DEAD 三状态后，与设计文档对比发现 4 项缺失：INITIALIZING 状态、startup_timeout、RET_ERROR 后状态恢复、Monitor 独立 Worker 显示。
+
+**补全内容**：
+1. `WorkerSlot` 增加 `WORKER_STATE_INITIALIZING`（spawn 后未 READY 前）。IPC 线程通过 `spawn_time` 区分 startup_timeout（60s）与常规心跳超时（30s）。
+2. `RET_ERROR`（设备超时/EIO）处理后置 `STATE_IDLE`，避免 Worker 永久冻结。
+3. `RET_READY` 无条件置 `STATE_IDLE`，覆盖 INITIALIZING → IDLE 转换。
+4. Monitor 面板增加 `[Worker States]` 区块，逐 slot 显示 INIT/IDLE/BUSY/DEAD + pid + current_path 截断。
+
+**编译验证**：`make clean && make` 通过，零警告。
+
+---
+
 ## [15.1.0] - 2026-05-17
 
 ### Fixed：Master 侧 Worker 显式状态机（IDLE/BUSY/DEAD），修复多线程 Worker 任务覆盖导致的全局停摆

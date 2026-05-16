@@ -381,6 +381,7 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
             ctx->fd_ctrl = rep->fd_ctrl;
             ctx->pid = rep->pid;
             atomic_store(&ctx->last_heartbeat, time(NULL));
+            ctx->spawn_time = time(NULL);  /* v15.1.1: record spawn time for startup_timeout */
             atomic_store(&ctx->waiting_replace, false);
 
             /* Add new fd_data to epoll */
@@ -530,7 +531,11 @@ void* ipc_thread_loop(void *arg) {
         if (!atomic_load(&ctx->waiting_replace) && ctx->pid > 0) {
             time_t now = time(NULL);
             time_t last = atomic_load(&ctx->last_heartbeat);
-            if (difftime(now, last) > HEARTBEAT_TIMEOUT_SEC) {
+            /* v15.1.1: startup_timeout=60s for INITIALIZING workers, normal 30s after READY/HEARTBEAT */
+            int timeout_sec = (last == ctx->spawn_time) ? 60 : HEARTBEAT_TIMEOUT_SEC;
+            if (difftime(now, last) > timeout_sec) {
+                log_warn("[IPC-%d] heartbeat timeout (last=%ld, spawn=%ld, timeout=%ds), killing worker",
+                        ctx->slot_id, (long)last, (long)ctx->spawn_time, timeout_sec);
                 worker_timeout_kill(ctx);
             }
         }

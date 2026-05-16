@@ -18,6 +18,7 @@ typedef struct {
     int             epfd;           /* IPC thread's own epoll */
     _Atomic bool    running;
     _Atomic time_t  last_heartbeat;
+    time_t          spawn_time;     /* v15.1.1: Worker spawn time for startup_timeout */
     int             fd_cmd;         /* Current Worker cmd read end (M→W) */
     int             fd_data;        /* Current Worker data read end (W→M BATCH) */
     int             fd_ctrl;        /* Current Worker ctrl read end (W→M signals) */

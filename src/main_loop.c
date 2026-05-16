@@ -424,13 +424,16 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
                 RetErrorPayload *err = (RetErrorPayload*)msg->data;
                 IpcErrorHeader hdr = { err->errno_code, err->dev };
                 main_loop_handle_error(ctx, msg->slot_id, &hdr, err->path);
+                /* v15.1.1: 设备级错误不替换 Worker，Worker 回到 IDLE */
+                atomic_store(&ctx->worker_pool->slots[msg->slot_id].state, WORKER_STATE_IDLE);
             }
             break;
         }
         case RET_READY: {
             log_info("[Bus] Worker %d READY", msg->slot_id);
             atomic_store(&ctx->worker_pool->slots[msg->slot_id].last_heartbeat, time(NULL));
-            atomic_store(&ctx->worker_pool->slots[msg->slot_id].state, WORKER_STATE_IDLE); /* v15.1.0 */
+            /* v15.1.1: 无论之前是 INITIALIZING 还是其他状态，收到 READY 后置 IDLE */
+            atomic_store(&ctx->worker_pool->slots[msg->slot_id].state, WORKER_STATE_IDLE);
             break;
         }
         case RET_FINISH: {
