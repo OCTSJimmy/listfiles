@@ -9,6 +9,39 @@
 ---
 ---
 
+## [14.0.1] - 2026-05-16
+
+### Bugfix：修复 v14.0.0 Worker 多线程 fd_out 竞争写入导致的 payload timeout 回归
+
+**问题背景**：v14.0.0 重构 Worker 为多线程（Scanner 线程 + IPC 线程）后，启动即出现大面积 `[IPC-X] payload timeout`，且 4-5 秒后所有 Worker 同时 timeout，循环往复。主进程卡在 `futex_wait`。
+
+**根因**：Scanner 线程与 IPC 线程**同时往 `fd_out` 写数据，没有互斥**。
+- Scanner 线程：`send_batch()` → `ipc_send(fd_out, IPC_MSG_BATCH, ...)`
+- IPC 线程：心跳 `ipc_send(fd_out, IPC_MSG_HEARTBEAT, ...)`
+- 两条线程并发 `write(fd_out)`，内核调度下消息字节交错：
+  - IPC 线程的 HEARTBEAT header（8 bytes）插入到 Scanner 线程的 BATCH header 和 BATCH payload 之间
+  - Master IPC 线程读到一个 BATCH header（payload_len=1197），但 pipe 里接下来只有 16 字节的 HEARTBEAT 数据，不够 1197
+  - `safe_ipc_recv_payload(100ms)` 超时 → `payload timeout`
+- 残留的 BATCH payload 字节留在 pipe 中，下一轮被当成新的 Header 解析 → garbage header → 连续 timeout
+- 8 个 Worker 同时触发，形成级联 payload timeout 风暴
+
+**修复**：
+- 新增 `static pthread_mutex_t g_fd_out_mutex = PTHREAD_MUTEX_INITIALIZER`
+- 所有往 `fd_out` 的 `ipc_send` 调用加锁保护：
+  - `send_batch()`
+  - `send_error_and_empty_batch()`
+  - IPC 线程的心跳发送
+  - `IPC_MSG_DEV_TIMEOUT` 上报
+  - `IPC_MSG_EXIT` 发送
+- 确保同一时刻只有一个线程向 `fd_out` 写数据，协议不再错乱。
+
+#### 修改的文件
+
+- `src/worker_proc.c`（g_fd_out_mutex + 所有 fd_out 写入点加锁）
+- `include/config.h`（版本号 14.0.1）
+
+---
+
 ## [14.0.0] - 2026-05-16
 
 ### 架构重构：Worker 多线程化（IPC 线程 + Scanner 线程分离）

@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v13.0.1**（基于 v13.0.0 IPC 线程隔离架构，叠加 v13.0.1 bugfix）
+当前设计版本：**v14.0.1**（基于 v13.0.1 IPC 线程隔离架构，叠加 v14.0.0 Worker 多线程化 + v14.0.1 fd_out 互斥修复）
 
 ---
 
@@ -32,6 +32,8 @@
 | v12.2.15 | **cleanup_done 重置** + **统一日志** + **dispatch 轮询修复** | cleanup_done 未重置导致 epoll 污染、无时间戳日志 | 重置标志、log.c 模块 |
 | **v13.0.0** | **IPC 线程隔离** | 单线程 epoll 的架构瓶颈：一个 Worker 出问题导致整个 Master hang 死 | 8 个 IPC 线程常驻，主线程 = 消息总线 |
 | **v13.0.1** | **IPC 协议原子写入** + **栈值污染防御** | `ipc_send` 两次 write 导致 Header 孤悬；`va_list` 异常导致历史块数打印错误 | 合并写入、noinline、sanity check |
+| **v14.0.0** | **Worker 多线程化**（Scanner 线程 + IPC 线程分离） | Worker 单线程阻塞扫描期间不响应 STOP、不发心跳、NFS 卡死只能等 SIGKILL | Worker 内部分线程：Scanner 阻塞 IO + IPC 线程 poll 循环维持心跳与通信 |
+| **v14.0.1** | **fd_out 互斥锁** | v14.0.0 拆分线程后 Scanner 与 IPC 线程并发写 fd_out 导致协议错乱、级联 payload timeout | `g_fd_out_mutex` 保护所有 fd_out 写入点 |
 
 ---
 
@@ -190,6 +192,8 @@ typedef struct __attribute__((packed)) {
 | 4 | `IPC_MSG_ERROR` | W → M | 设备错误，payload = 错误信息 |
 | 5 | `IPC_MSG_EXIT` | W → M | 正常退出，payload = 空 |
 | 6 | `IPC_MSG_STOP` | M → W | 停止 Worker，payload = 空 |
+| 7 | `IPC_MSG_DEV_TIMEOUT` | W → M | Scanner 自检测超时，payload = 错误信息 |
+| 7 | `IPC_MSG_DEV_TIMEOUT` | W → M | Scanner 自检测超时，payload = 错误信息 |
 
 ### IPC 线程 ↔ 主线程 消息类型
 
@@ -203,6 +207,7 @@ typedef struct __attribute__((packed)) {
 | 13 | `RET_ERROR` | IPC → Main | Worker 错误 |
 | 14 | `RET_DEAD` | IPC → Main | Worker 死亡 |
 | 15 | `RET_EXIT` | IPC → Main | Worker 正常退出 |
+| 16 | `RET_DEV_TIMEOUT` | IPC → Main | Worker Scanner 自检测超时 |
 
 ---
 
@@ -233,6 +238,63 @@ IPC Thread N 收到 CMD_REPLACE
 
 其他 7 个 IPC 线程全程不受影响。
 ```
+
+---
+
+## v14.0.0：Worker 多线程化（Scanner 线程 + IPC 线程分离）
+
+### 问题背景
+
+v13.x 中 Worker 是单线程线性设计：阻塞读 fd_in → 阻塞扫描（readdir/lstat 可能卡住很久）→ 发 BATCH → 循环。扫描期间既不响应 STOP、也不发心跳，NFS 卡死时只能等 IPC 线程心跳超时后 SIGKILL。Worker 的 lstat 可能卡在 NFS soft timeout 上数分钟甚至数小时，期间既不响应 STOP、也不发心跳。
+
+### 新架构核心
+
+Worker 进程内部拆分为两条线程：
+- **Scanner 线程**：专职执行 readdir/lstat 等阻塞 IO，调用 `scan_and_send()` 直接写 fd_out（阻塞）。
+- **IPC 线程（主线程）**：专职维护与 Master 的通信。fd_in 设为非阻塞，通过 `poll(5s)` 循环同时处理读任务、发心跳、响应 STOP。Scanner 卡住不影响心跳节拍。
+
+### Scanner 超时检测（双层超时）
+
+Worker IPC 线程监控 Scanner 的 `last_progress` 时间戳：
+- 若超过 `heartbeat_timeout`（默认 30s，`-t` 参数可调）无进展，发送 **`IPC_MSG_DEV_TIMEOUT`** 上报 Master
+- Master 收到 **`RET_DEV_TIMEOUT`** 后直接按超时逻辑处置：`cleanup_dead_worker_slot(..., true)`（SIGKILL + 路径重发）
+- Master 侧心跳超时检测仍然保留，作为最终兜底
+
+### 新增/修改的文件
+
+- `src/worker_proc.c`（WorkerThreadCtx + worker_scanner_thread + worker_main 多线程重写）
+- `include/config.h`（版本号 14.0.0）
+
+---
+
+## v14.0.1：fd_out 互斥锁修复
+
+### 问题背景
+
+v14.0.0 拆分线程后，Scanner 线程与 IPC 线程并发往 `fd_out` 写数据，没有互斥保护。导致：
+- IPC 线程的 HEARTBEAT header 插入到 Scanner 线程的 BATCH header 和 payload 之间
+- Master IPC 线程读到 BATCH header（payload_len=1197）后，pipe 中只有 16 字节 HEARTBEAT 数据 → `safe_ipc_recv_payload(100ms)` 超时
+- 8 个 Worker 同时触发，形成级联 payload timeout 风暴
+- 主进程卡在 `futex_wait`（ret_queue 消息风暴导致某种阻塞）
+
+### 修复
+
+- 新增 `static pthread_mutex_t g_fd_out_mutex = PTHREAD_MUTEX_INITIALIZER`
+- 所有往 `fd_out` 的 `ipc_send` 调用加锁保护：
+  - `send_batch()`、`send_error_and_empty_batch()`
+  - IPC 线程的心跳发送
+  - `IPC_MSG_DEV_TIMEOUT` 上报
+  - `IPC_MSG_EXIT` 发送
+
+### 协议更新
+
+- `ipc_protocol.h` 新增 `IPC_MSG_DEV_TIMEOUT`（7）
+- `msg_format.h` 新增 `RET_DEV_TIMEOUT`（16）
+
+### 修改的文件
+
+- `src/worker_proc.c`（g_fd_out_mutex + 所有 fd_out 写入点加锁）
+- `include/config.h`（版本号 14.0.1）
 
 ---
 
