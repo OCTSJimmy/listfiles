@@ -30,9 +30,6 @@ static const Config *g_worker_cfg = NULL;
 static const FingerprintSet *g_worker_ref_set = NULL;
 static const ReferenceMap *g_worker_ref_map = NULL;
 
-/* v14.0.0: thread-safe fd_out mutex (Scanner thread + IPC thread both write to fd_out) */
-static pthread_mutex_t g_fd_out_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 /**
  * @brief  设置 Worker 进程只读上下文（fork 前由主进程调用）
  * @param  cfg      const Config*        全局配置指针，允许为 NULL
@@ -309,11 +306,9 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
 
     /* Worker side: retry on EAGAIN until success (pipe buffer should be large enough) */
     int rc;
-    pthread_mutex_lock(&g_fd_out_mutex);
     while ((rc = ipc_send(fd_out, IPC_MSG_BATCH, buf, (uint32_t)total)) == -2) {
         usleep(1000); /* 1ms */
     }
-    pthread_mutex_unlock(&g_fd_out_mutex);
     free(buf);
 }
 
@@ -336,9 +331,7 @@ static void send_error_and_empty_batch(int fd_out, int err_code, const char *pat
             memcpy(buf, &eh, sizeof(eh));
             memcpy(buf + sizeof(eh), &plen, sizeof(plen));
             memcpy(buf + sizeof(eh) + sizeof(plen), path, plen);
-            pthread_mutex_lock(&g_fd_out_mutex);
             ipc_send(fd_out, IPC_MSG_ERROR, buf, (uint32_t)(sizeof(eh) + sizeof(plen) + plen));
-            pthread_mutex_unlock(&g_fd_out_mutex);
             free(buf);
         }
     }
@@ -381,7 +374,6 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
     }
 
     struct dirent *entry;
-    int entries_since_hb = 0;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.' &&
             (entry->d_name[1] == '\0' || (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) {
@@ -412,13 +404,6 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
             count++;
         }
 
-        /* Send intermediate heartbeat every 256 entries to prevent monitor timeout on huge dirs */
-        if (++entries_since_hb >= 256) {
-            IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
-            ipc_send(fd_out, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
-            entries_since_hb = 0;
-        }
-
         if (count >= batch_size) {
             send_batch(fd_out, paths, stats, count);
             for (int i = 0; i < count; i++) free(paths[i]);
@@ -445,8 +430,9 @@ cleanup:
  * ================================================================ */
 
 typedef struct {
-    int fd_in;
-    int fd_out;
+    int fd_cmd;
+    int fd_data;
+    int fd_ctrl;
     int worker_id;
 
     /* 任务同步 */
@@ -487,8 +473,22 @@ static void *worker_scanner_thread(void *arg) {
         ctx->scanner_active = true;
         pthread_mutex_unlock(&ctx->progress_mutex);
 
-        /* 扫描 */
-        scan_and_send(ctx->fd_out, path, ctx->worker_id);
+        /* 扫描 — 结果通过 fd_data 发送 */
+        scan_and_send(ctx->fd_data, path, ctx->worker_id);
+
+        /* 发送 FINISH 信号，通知 Master 当前任务完成 */
+        IpcFinishPayload fin = { 0, 0 };
+        uint32_t plen = (uint32_t)strlen(path);
+        fin.status = 0; /* OK */
+        fin.path_len = plen;
+        size_t fin_total = sizeof(fin) + plen;
+        uint8_t *fin_buf = malloc(fin_total);
+        if (fin_buf) {
+            memcpy(fin_buf, &fin, sizeof(fin));
+            memcpy(fin_buf + sizeof(fin), path, plen);
+            ipc_send(ctx->fd_ctrl, IPC_MSG_FINISH, fin_buf, (uint32_t)fin_total);
+            free(fin_buf);
+        }
 
         /* 记录扫描完成 */
         pthread_mutex_lock(&ctx->progress_mutex);
@@ -517,16 +517,17 @@ static void *worker_scanner_thread(void *arg) {
  *         fd_in 设为非阻塞，主线程通过 poll(5s) 循环同时处理：
  *         读任务、发心跳、响应 STOP。Scanner 卡住不影响心跳。
  */
-void worker_main(int fd_in, int fd_out, int worker_id) {
-    /* 设置 fd_in 为非阻塞，使 IPC 线程可用 poll 循环 */
-    int flags = fcntl(fd_in, F_GETFL);
+void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
+    /* 设置 fd_cmd 为非阻塞，使 IPC 线程可用 poll 循环 */
+    int flags = fcntl(fd_cmd, F_GETFL);
     if (flags >= 0) {
-        fcntl(fd_in, F_SETFL, flags | O_NONBLOCK);
+        fcntl(fd_cmd, F_SETFL, flags | O_NONBLOCK);
     }
 
     WorkerThreadCtx ctx = {
-        .fd_in = fd_in,
-        .fd_out = fd_out,
+        .fd_cmd = fd_cmd,
+        .fd_data = fd_data,
+        .fd_ctrl = fd_ctrl,
         .worker_id = worker_id,
         .task_ready = false,
         .stop_flag = false,
@@ -540,13 +541,14 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
     pthread_t scanner_tid;
     if (pthread_create(&scanner_tid, NULL, worker_scanner_thread, &ctx) != 0) {
         log_error("[Worker-%d] Failed to create scanner thread", worker_id);
-        pthread_mutex_lock(&g_fd_out_mutex);
-        ipc_send(fd_out, IPC_MSG_EXIT, NULL, 0);
-        pthread_mutex_unlock(&g_fd_out_mutex);
+        ipc_send(fd_ctrl, IPC_MSG_EXIT, NULL, 0);
         return;
     }
 
-    struct pollfd pfd = { fd_in, POLLIN, 0 };
+    /* 发送 READY 信号，通知 Master 初始化完成 */
+    ipc_send(fd_ctrl, IPC_MSG_READY, NULL, 0);
+
+    struct pollfd pfd = { fd_cmd, POLLIN, 0 };
     time_t last_heartbeat = time(NULL);
 
     while (!ctx.stop_flag) {
@@ -562,15 +564,13 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
 
         if (rc == 0 || elapsed >= 5) {
             IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
-            pthread_mutex_lock(&g_fd_out_mutex);
-            ipc_send(fd_out, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
-            pthread_mutex_unlock(&g_fd_out_mutex);
+            ipc_send(fd_ctrl, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
             last_heartbeat = time(NULL);
         }
 
         if (pfd.revents & POLLIN) {
             IpcMessageHeader hdr;
-            rc = ipc_recv_header(fd_in, &hdr);
+            rc = ipc_recv_header(fd_cmd, &hdr);
             if (rc == -2) {
                 usleep(1000);
                 continue;
@@ -580,7 +580,7 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
             if (hdr.msg_type == IPC_MSG_STOP) {
                 if (hdr.payload_len > 0) {
                     void *tmp = malloc(hdr.payload_len);
-                    if (tmp) { ipc_recv_payload(fd_in, tmp, hdr.payload_len); free(tmp); }
+                    if (tmp) { ipc_recv_payload(fd_cmd, tmp, hdr.payload_len); free(tmp); }
                 }
                 ctx.stop_flag = true;
                 pthread_mutex_lock(&ctx.task_mutex);
@@ -592,14 +592,14 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
             if (hdr.msg_type != IPC_MSG_SCAN) {
                 if (hdr.payload_len > 0) {
                     void *tmp = malloc(hdr.payload_len);
-                    if (tmp) { ipc_recv_payload(fd_in, tmp, hdr.payload_len); free(tmp); }
+                    if (tmp) { ipc_recv_payload(fd_cmd, tmp, hdr.payload_len); free(tmp); }
                 }
                 continue;
             }
 
             char *dir_path = malloc(hdr.payload_len + 1);
             if (!dir_path) break;
-            if (ipc_recv_payload(fd_in, dir_path, hdr.payload_len) != 0) {
+            if (ipc_recv_payload(fd_cmd, dir_path, hdr.payload_len) != 0) {
                 free(dir_path);
                 break;
             }
@@ -618,7 +618,7 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
         if (pfd.revents & (POLLERR | POLLHUP)) {
             break;
         }
-        /* 4. Scanner progress timeout check (v14.0.0) */
+        /* Scanner progress timeout check */
         if (g_worker_cfg && ctx.scanner_active) {
             pthread_mutex_lock(&ctx.progress_mutex);
             time_t scanner_last = ctx.last_progress;
@@ -629,7 +629,6 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
             if (difftime(now, scanner_last) > timeout_sec) {
                 log_error("[Worker-%d] Scanner stuck for %ds on %s, reporting to master",
                           worker_id, timeout_sec, ctx.task_path);
-                /* Report stuck scanner to master via IPC_MSG_DEV_TIMEOUT */
                 IpcErrorHeader eh = { ETIMEDOUT, 0 };
                 char stuck_path[4096];
                 pthread_mutex_lock(&ctx.task_mutex);
@@ -643,12 +642,9 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
                     memcpy(err_buf, &eh, sizeof(eh));
                     memcpy(err_buf + sizeof(eh), &plen, sizeof(plen));
                     memcpy(err_buf + sizeof(eh) + sizeof(plen), stuck_path, plen);
-                    pthread_mutex_lock(&g_fd_out_mutex);
-                    ipc_send(fd_out, IPC_MSG_DEV_TIMEOUT, err_buf, (uint32_t)err_total);
-                    pthread_mutex_unlock(&g_fd_out_mutex);
+                    ipc_send(fd_ctrl, IPC_MSG_DEV_TIMEOUT, err_buf, (uint32_t)err_total);
                     free(err_buf);
                 }
-                /* Master will receive RET_DEV_TIMEOUT and replace this worker */
             }
         }
     }
@@ -660,9 +656,7 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
     pthread_mutex_unlock(&ctx.task_mutex);
     pthread_join(scanner_tid, NULL);
 
-    pthread_mutex_lock(&g_fd_out_mutex);
-    ipc_send(fd_out, IPC_MSG_EXIT, NULL, 0);
-    pthread_mutex_unlock(&g_fd_out_mutex);
+    ipc_send(fd_ctrl, IPC_MSG_EXIT, NULL, 0);
 
     pthread_mutex_destroy(&ctx.task_mutex);
     pthread_cond_destroy(&ctx.task_cond);
@@ -706,9 +700,10 @@ void worker_pool_destroy(WorkerPool *pool) {
         WorkerSlot *slot = &pool->slots[i];
         if (atomic_load(&slot->is_alive)) {
             kill(slot->pid, SIGKILL);
-            close(slot->fd_in);
-            if (slot->fd_in_rd >= 0) close(slot->fd_in_rd);
-            close(slot->fd_out);
+            close(slot->fd_cmd);
+            if (slot->fd_cmd_rd >= 0) close(slot->fd_cmd_rd);
+            close(slot->fd_data);
+            close(slot->fd_ctrl);
         }
         /* Free backlog paths */
         for (int j = 0; j < slot->backlog_count; j++) {
@@ -751,66 +746,83 @@ static void enlarge_pipe(int fd) {
  *         成功后会初始化 slot 的心跳时间和积压队列。
  */
 bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
-    int in_pipe[2], out_pipe[2];
-    if (pipe2(in_pipe, O_CLOEXEC) != 0) return false;
-    if (pipe2(out_pipe, O_CLOEXEC) != 0) {
-        close(in_pipe[0]); close(in_pipe[1]);
+    int cmd_pipe[2], data_pipe[2], ctrl_pipe[2];
+    if (pipe2(cmd_pipe, O_CLOEXEC) != 0) return false;
+    if (pipe2(data_pipe, O_CLOEXEC) != 0) {
+        close(cmd_pipe[0]); close(cmd_pipe[1]);
+        return false;
+    }
+    if (pipe2(ctrl_pipe, O_CLOEXEC) != 0) {
+        close(cmd_pipe[0]); close(cmd_pipe[1]);
+        close(data_pipe[0]); close(data_pipe[1]);
         return false;
     }
 
     /* Enlarge pipe buffers to reduce deadlock probability */
-    enlarge_pipe(in_pipe[0]); enlarge_pipe(in_pipe[1]);
-    enlarge_pipe(out_pipe[0]); enlarge_pipe(out_pipe[1]);
+    enlarge_pipe(cmd_pipe[0]);  enlarge_pipe(cmd_pipe[1]);
+    enlarge_pipe(data_pipe[0]); enlarge_pipe(data_pipe[1]);
+    enlarge_pipe(ctrl_pipe[0]); enlarge_pipe(ctrl_pipe[1]);
 
-    /* Master read end must be non-blocking for IPC thread epoll responsiveness */
-    int out_flags = fcntl(out_pipe[0], F_GETFL);
-    if (out_flags >= 0) {
-        fcntl(out_pipe[0], F_SETFL, out_flags | O_NONBLOCK);
+    /* Master read ends must be non-blocking for IPC thread epoll responsiveness */
+    int data_flags = fcntl(data_pipe[0], F_GETFL);
+    if (data_flags >= 0) {
+        fcntl(data_pipe[0], F_SETFL, data_flags | O_NONBLOCK);
     } else {
-        log_warn("[worker_pool_spawn] WARNING: fcntl(F_GETFL) on fd_out failed: errno=%d", errno);
+        log_warn("[worker_pool_spawn] fcntl(F_GETFL) on fd_data failed: errno=%d", errno);
+    }
+    int ctrl_flags = fcntl(ctrl_pipe[0], F_GETFL);
+    if (ctrl_flags >= 0) {
+        fcntl(ctrl_pipe[0], F_SETFL, ctrl_flags | O_NONBLOCK);
+    } else {
+        log_warn("[worker_pool_spawn] fcntl(F_GETFL) on fd_ctrl failed: errno=%d", errno);
     }
 
     pid_t pid = fork();
     if (pid < 0) {
-        close(in_pipe[0]); close(in_pipe[1]);
-        close(out_pipe[0]); close(out_pipe[1]);
+        close(cmd_pipe[0]); close(cmd_pipe[1]);
+        close(data_pipe[0]); close(data_pipe[1]);
+        close(ctrl_pipe[0]); close(ctrl_pipe[1]);
         return false;
     }
 
     if (pid == 0) {
         /* Child */
-        close(in_pipe[1]);
-        close(out_pipe[0]);
+        close(cmd_pipe[1]);
+        close(data_pipe[0]);
+        close(ctrl_pipe[0]);
 
         /* Close all inherited fds except our pipes */
         int max_fd = (int)sysconf(_SC_OPEN_MAX);
         if (max_fd < 0) max_fd = 65536;
         for (int fd = 3; fd < max_fd; fd++) {
-            if (fd != in_pipe[0] && fd != out_pipe[1]) {
+            if (fd != cmd_pipe[0] && fd != data_pipe[1] && fd != ctrl_pipe[1]) {
                 close(fd);
             }
         }
 
-        worker_main(in_pipe[0], out_pipe[1], slot_id);
+        worker_main(cmd_pipe[0], data_pipe[1], ctrl_pipe[1], slot_id);
         _exit(0);
     }
 
-    /* Parent: keep in_pipe[0] for draining orphaned tasks after worker death */
-    close(out_pipe[1]);
+    /* Parent */
+    close(cmd_pipe[0]);
+    close(data_pipe[1]);
+    close(ctrl_pipe[1]);
 
     /* Master write end must be non-blocking to prevent bidirectional pipe deadlock */
-    int flags = fcntl(in_pipe[1], F_GETFL);
+    int flags = fcntl(cmd_pipe[1], F_GETFL);
     if (flags >= 0) {
-        fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
+        fcntl(cmd_pipe[1], F_SETFL, flags | O_NONBLOCK);
     } else {
-        log_warn("[worker_pool_spawn] WARNING: fcntl(F_GETFL) on fd_in failed: errno=%d", errno);
+        log_warn("[worker_pool_spawn] fcntl(F_GETFL) on fd_cmd failed: errno=%d", errno);
     }
 
     WorkerSlot *slot = &pool->slots[slot_id];
     slot->pid = pid;
-    slot->fd_in = in_pipe[1];
-    slot->fd_in_rd = in_pipe[0];
-    slot->fd_out = out_pipe[0];
+    slot->fd_cmd = cmd_pipe[1];
+    slot->fd_cmd_rd = cmd_pipe[0];
+    slot->fd_data = data_pipe[0];
+    slot->fd_ctrl = ctrl_pipe[0];
     atomic_store(&slot->is_alive, true);
     atomic_store(&slot->last_heartbeat, time(NULL));
     slot->current_dev = 0;
@@ -818,7 +830,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     slot->backlog_paths = NULL;
     slot->backlog_count = 0;
     slot->backlog_capacity = 0;
-    atomic_flag_clear(&slot->cleanup_done);  /* [FIX] 重置 cleanup_done，确保新 Worker 能被正常清理 */
+    atomic_flag_clear(&slot->cleanup_done);
     atomic_fetch_add(&pool->active_count, 1);
     return true;
 }
@@ -837,14 +849,13 @@ bool worker_pool_replace(WorkerPool *pool, int slot_id) {
     WorkerSlot *slot = &pool->slots[slot_id];
     if (atomic_load(&slot->is_alive)) {
         kill(slot->pid, SIGKILL);
-        /* Do NOT block on waitpid: process may be stuck in D-state.
-         * Zombie will be reaped later by main loop's periodic waitpid(-1, WNOHANG). */
-        close(slot->fd_in);
-        if (slot->fd_in_rd >= 0) {
-            close(slot->fd_in_rd);
-            slot->fd_in_rd = -1;
+        close(slot->fd_cmd);
+        if (slot->fd_cmd_rd >= 0) {
+            close(slot->fd_cmd_rd);
+            slot->fd_cmd_rd = -1;
         }
-        close(slot->fd_out);
+        close(slot->fd_data);
+        close(slot->fd_ctrl);
         atomic_store(&slot->is_alive, false);
         atomic_fetch_sub(&pool->active_count, 1);
     }
@@ -863,8 +874,8 @@ bool worker_pool_replace(WorkerPool *pool, int slot_id) {
 void worker_pool_stop_all(WorkerPool *pool) {
     for (int i = 0; i < pool->num_workers; i++) {
         if (pool->slots[i].is_alive) {
-            int rc = ipc_send(pool->slots[i].fd_in, IPC_MSG_STOP, NULL, 0);
-            (void)rc; /* STOP is best-effort; fd_in may be non-blocking */
+            int rc = ipc_send(pool->slots[i].fd_cmd, IPC_MSG_STOP, NULL, 0);
+            (void)rc; /* STOP is best-effort; fd_cmd may be non-blocking */
         }
     }
 }

@@ -9,6 +9,46 @@
 ---
 ---
 
+## [15.0.0] - 2026-05-16
+
+### 架构重构：三通道分离 + IPC 状态机
+
+**问题背景**：v14.0.x 中 Worker 拆分为 Scanner 线程 + IPC 线程后，两条线程并发写 `fd_out`，引入 `g_fd_out_mutex` 保护。但 mutex 持有者阻塞时（Scanner `write()` 被 pipe 满卡住），IPC 线程卡在 `pthread_mutex_lock` 上，心跳停止。同时多种语义消息（BATCH / HEARTBEAT / ERROR / EXIT / DEV_TIMEOUT）共享同一个 fd，字节交错导致 payload timeout 级联风暴。
+
+**新架构**：每个 Worker 配置三个独立 fd，语义分离：
+- `fd_cmd`：M→W 命令通道（SCAN / STOP）
+- `fd_data`：W→M 数据通道（BATCH 大 payload），Scanner 线程独占
+- `fd_ctrl`：W→M 控制通道（HEARTBEAT / ERROR / EXIT / DEV_TIMEOUT / READY / FINISH），IPC 线程独占
+
+**关键约束**：
+- `fd_data` 只有 Scanner 线程写，`fd_ctrl` 只有 IPC 线程写，永不竞争
+- IPC 线程 epoll 监听 `fd_data + fd_ctrl + cmd_queue eventfd`
+- `fd_ctrl` 消息长度均 < PIPE_BUF（4096），内核保证原子写入
+
+**新增 IPC 消息**：
+- `IPC_MSG_READY`（8）：Worker 初始化完成，进入主循环
+- `IPC_MSG_FINISH`（9）：Scanner 任务完成
+
+**Master 侧 Worker 状态机**：
+- `INITIALIZING` → `IDLE` → `BUSY` → `IDLE` / `DEAD`
+- 启动超时（60s）、心跳超时（30s）、任务超时（-t 参数）分离
+- `RET_READY` 收到前不检测心跳超时
+- `RET_FINISH` 收到后 Worker 回到 IDLE
+
+**修改的文件**：
+- `include/config.h` — 版本号 15.0.0
+- `include/ipc_protocol.h` — IPC_MSG_READY / IPC_MSG_FINISH
+- `include/msg_format.h` — RET_READY / RET_FINISH / CmdReplacePayload 三通道
+- `include/worker_proc.h` — WorkerSlot 三通道结构
+- `include/ipc_thread.h` — IpcThreadCtx 三通道
+- `include/main_loop.h` — send_replace_to_ipc 签名
+- `src/worker_proc.c` — spawn/replace/destroy/stop_all + worker_main 三通道化
+- `src/ipc_thread.c` — epoll 三通道监听 + read_data_message + read_ctrl_message
+- `src/main_loop.c` — handle_return_message READY/FINISH 处理 + 所有 fd 引用更新
+- `src/main.c` — send_replace_to_ipc 调用更新
+
+---
+
 ## [14.0.1] - 2026-05-16
 
 ### Bugfix：修复 v14.0.0 Worker 多线程 fd_out 竞争写入导致的 payload timeout 回归

@@ -13,9 +13,10 @@
 typedef struct {
     int      slot_id;
     pid_t    pid;
-    int      fd_in;            /* master write end */
-    int      fd_in_rd;         /* master read end of fd_in pipe (for draining orphaned tasks) */
-    int      fd_out;           /* master read end */
+    int      fd_cmd;           /* master write end (M→W commands) */
+    int      fd_cmd_rd;        /* master read end of fd_cmd pipe (draining) */
+    int      fd_data;          /* master read end (W→M BATCH data) */
+    int      fd_ctrl;          /* master read end (W→M control signals) */
     _Atomic time_t last_heartbeat;
     _Atomic bool   is_alive;
     uint64_t current_dev;
@@ -47,7 +48,7 @@ int ipc_drain_and_count_tasks(int fd_in);
 
 /* Worker-side */
 void worker_set_context(const Config *cfg, const FingerprintSet *ref_set, const ReferenceMap *ref_map);
-void worker_main(int fd_in, int fd_out, int worker_id);
+void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id);
 
 /* Forward declaration to break circular dependency with app_context.h */
 struct AppContext;

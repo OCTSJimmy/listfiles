@@ -65,18 +65,25 @@ static int safe_ipc_recv_payload(int fd, void *buf, uint32_t len) {
 
 /* ---- Worker death handling inside IPC thread ---- */
 static void worker_mark_dead(IpcThreadCtx *ctx, bool send_notify) {
-    if (ctx->fd_in >= 0) {
-        close(ctx->fd_in);
-        ctx->fd_in = -1;
+    if (ctx->fd_cmd >= 0) {
+        close(ctx->fd_cmd);
+        ctx->fd_cmd = -1;
     }
-    if (ctx->fd_out >= 0) {
+    if (ctx->fd_data >= 0) {
         if (ctx->epfd >= 0) {
-            epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->fd_out, NULL);
+            epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->fd_data, NULL);
         }
-        close(ctx->fd_out);
-        ctx->fd_out = -1;
+        close(ctx->fd_data);
+        ctx->fd_data = -1;
     }
-    ctx->pid = -1; /* prevent duplicate timeout kill and delayed RET_DEAD */
+    if (ctx->fd_ctrl >= 0) {
+        if (ctx->epfd >= 0) {
+            epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->fd_ctrl, NULL);
+        }
+        close(ctx->fd_ctrl);
+        ctx->fd_ctrl = -1;
+    }
+    ctx->pid = -1;
     atomic_store(&ctx->waiting_replace, true);
 
     if (send_notify) {
@@ -117,35 +124,35 @@ static void send_return(IpcThreadCtx *ctx, uint32_t type, void *data, size_t len
     }
 }
 
-/* ---- Read a complete IPC message from Worker fd_out ---- */
-static void read_worker_message(IpcThreadCtx *ctx) {
+/* ---- Read a complete IPC message from Worker fd_ctrl ---- */
+static void read_ctrl_message(IpcThreadCtx *ctx) {
     IpcMessageHeader hdr;
-    int rc_hdr = safe_ipc_recv_header(ctx->fd_out, &hdr);
+    int rc_hdr = safe_ipc_recv_header(ctx->fd_ctrl, &hdr);
     if (rc_hdr == -2) {
         return; /* timeout, try next loop */
     }
     if (rc_hdr != 0) {
-        log_error("[IPC-%d] recv_header failed, marking worker dead", ctx->slot_id);
+        log_error("[IPC-%d] recv_header failed on fd_ctrl, marking worker dead", ctx->slot_id);
         worker_mark_dead(ctx, true);
         return;
     }
 
     if (hdr.payload_len > 16 * 1024 * 1024) {
         void *tmp = malloc(hdr.payload_len);
-        if (tmp) { safe_ipc_recv_payload(ctx->fd_out, tmp, hdr.payload_len); free(tmp); }
+        if (tmp) { safe_ipc_recv_payload(ctx->fd_ctrl, tmp, hdr.payload_len); free(tmp); }
         return;
     }
 
     void *payload = NULL;
     if (hdr.payload_len > 0) {
         payload = malloc(hdr.payload_len);
-        int rc_payload = safe_ipc_recv_payload(ctx->fd_out, payload, hdr.payload_len);
+        int rc_payload = safe_ipc_recv_payload(ctx->fd_ctrl, payload, hdr.payload_len);
         if (rc_payload != 0) {
             free(payload);
             if (rc_payload == -2) {
-                log_warn("[IPC-%d] payload timeout (len=%u)", ctx->slot_id, hdr.payload_len);
+                log_warn("[IPC-%d] ctrl payload timeout (len=%u)", ctx->slot_id, hdr.payload_len);
             } else {
-                log_error("[IPC-%d] payload recv failed, marking worker dead", ctx->slot_id);
+                log_error("[IPC-%d] ctrl payload recv failed, marking worker dead", ctx->slot_id);
                 worker_mark_dead(ctx, true);
             }
             return;
@@ -153,17 +160,11 @@ static void read_worker_message(IpcThreadCtx *ctx) {
     }
 
     switch (hdr.msg_type) {
-        case IPC_MSG_BATCH: {
-            send_return(ctx, RET_BATCH, payload, hdr.payload_len);
-            payload = NULL; /* ownership transferred */
-            break;
-        }
         case IPC_MSG_HEARTBEAT: {
             if (hdr.payload_len >= sizeof(IpcHeartbeatPayload)) {
                 IpcHeartbeatPayload *hb = (IpcHeartbeatPayload*)payload;
                 atomic_store(&ctx->last_heartbeat, (time_t)hb->timestamp);
 
-                /* Forward heartbeat to master for Monitor display */
                 RetHeartbeatPayload *ret = malloc(sizeof(RetHeartbeatPayload));
                 if (ret) {
                     ret->timestamp = hb->timestamp;
@@ -180,7 +181,6 @@ static void read_worker_message(IpcThreadCtx *ctx) {
                 if (ret) {
                     ret->errno_code = eh->errno_code;
                     ret->dev = eh->dev;
-                    /* path follows IpcErrorHeader + uint32_t path_len */
                     if (hdr.payload_len > sizeof(IpcErrorHeader) + sizeof(uint32_t)) {
                         const char *src = (const char*)payload + sizeof(IpcErrorHeader) + sizeof(uint32_t);
                         size_t plen = hdr.payload_len - sizeof(IpcErrorHeader) - sizeof(uint32_t);
@@ -218,9 +218,32 @@ static void read_worker_message(IpcThreadCtx *ctx) {
             free(payload);
             break;
         }
+        case IPC_MSG_READY: {
+            send_return(ctx, RET_READY, NULL, 0);
+            free(payload);
+            break;
+        }
+        case IPC_MSG_FINISH: {
+            if (hdr.payload_len >= sizeof(IpcFinishPayload)) {
+                IpcFinishPayload *fin = (IpcFinishPayload*)payload;
+                /* Payload: IpcFinishPayload + path bytes */
+                size_t path_len = fin->path_len;
+                if (path_len > 4095) path_len = 4095;
+                char *path_buf = malloc(path_len + 1);
+                if (path_buf) {
+                    if (hdr.payload_len >= sizeof(IpcFinishPayload) + path_len) {
+                        memcpy(path_buf, (char*)payload + sizeof(IpcFinishPayload), path_len);
+                    }
+                    path_buf[path_len] = '\0';
+                    send_return(ctx, RET_FINISH, path_buf, path_len + 1);
+                }
+            }
+            free(payload);
+            break;
+        }
         case IPC_MSG_EXIT: {
             send_return(ctx, RET_EXIT, NULL, 0);
-            worker_mark_dead(ctx, false); /* fd already closed by worker */
+            worker_mark_dead(ctx, false);
             break;
         }
         default:
@@ -229,14 +252,60 @@ static void read_worker_message(IpcThreadCtx *ctx) {
     }
 }
 
+/* ---- Read a complete BATCH message from Worker fd_data ---- */
+static void read_data_message(IpcThreadCtx *ctx) {
+    IpcMessageHeader hdr;
+    int rc_hdr = safe_ipc_recv_header(ctx->fd_data, &hdr);
+    if (rc_hdr == -2) {
+        return; /* timeout, try next loop */
+    }
+    if (rc_hdr != 0) {
+        log_error("[IPC-%d] recv_header failed on fd_data, marking worker dead", ctx->slot_id);
+        worker_mark_dead(ctx, true);
+        return;
+    }
+
+    if (hdr.msg_type != IPC_MSG_BATCH) {
+        /* Unexpected message type on fd_data - discard */
+        void *tmp = malloc(hdr.payload_len);
+        if (tmp) { safe_ipc_recv_payload(ctx->fd_data, tmp, hdr.payload_len); free(tmp); }
+        return;
+    }
+
+    if (hdr.payload_len > 16 * 1024 * 1024) {
+        void *tmp = malloc(hdr.payload_len);
+        if (tmp) { safe_ipc_recv_payload(ctx->fd_data, tmp, hdr.payload_len); free(tmp); }
+        return;
+    }
+
+    void *payload = NULL;
+    if (hdr.payload_len > 0) {
+        payload = malloc(hdr.payload_len);
+        int rc_payload = safe_ipc_recv_payload(ctx->fd_data, payload, hdr.payload_len);
+        if (rc_payload != 0) {
+            free(payload);
+            if (rc_payload == -2) {
+                log_warn("[IPC-%d] data payload timeout (len=%u)", ctx->slot_id, hdr.payload_len);
+            } else {
+                log_error("[IPC-%d] data payload recv failed, marking worker dead", ctx->slot_id);
+                worker_mark_dead(ctx, true);
+            }
+            return;
+        }
+    }
+
+    send_return(ctx, RET_BATCH, payload, hdr.payload_len);
+    /* ownership transferred */
+}
+
 /* ---- Handle commands from master thread ---- */
 static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
     switch (cmd->type) {
         case CMD_SCAN: {
             CmdScanPayload *scan = (CmdScanPayload*)cmd->data;
             if (!scan) break;
-            if (ctx->fd_in < 0) {
-                /* Replacement 窗口期：fd_in 尚未就绪，通知 Master 重入队 */
+            if (ctx->fd_cmd < 0) {
+                /* Replacement 窗口期：fd_cmd 尚未就绪，通知 Master 重入队 */
                 DropPayload *drop = malloc(sizeof(DropPayload));
                 if (drop) {
                     safe_strcpy(drop->path, scan->path, sizeof(drop->path));
@@ -255,7 +324,7 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
                 }
                 break;
             }
-            int rc = ipc_send(ctx->fd_in, IPC_MSG_SCAN, scan->path, scan->path_len);
+            int rc = ipc_send(ctx->fd_cmd, IPC_MSG_SCAN, scan->path, scan->path_len);
             if (rc == -2) {
                 /* EAGAIN */
                 ctx->eagain_retry_count++;
@@ -287,33 +356,50 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
             if (!rep) break;
 
             /* Close old fds */
-            if (ctx->fd_in >= 0) { close(ctx->fd_in); ctx->fd_in = -1; }
-            if (ctx->fd_out >= 0) {
-                if (ctx->epfd >= 0) epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->fd_out, NULL);
-                close(ctx->fd_out);
-                ctx->fd_out = -1;
+            if (ctx->fd_cmd >= 0) { close(ctx->fd_cmd); ctx->fd_cmd = -1; }
+            if (ctx->fd_data >= 0) {
+                if (ctx->epfd >= 0) epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->fd_data, NULL);
+                close(ctx->fd_data);
+                ctx->fd_data = -1;
+            }
+            if (ctx->fd_ctrl >= 0) {
+                if (ctx->epfd >= 0) epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->fd_ctrl, NULL);
+                close(ctx->fd_ctrl);
+                ctx->fd_ctrl = -1;
             }
 
             /* Set new fds */
-            ctx->fd_in = rep->fd_in;
-            ctx->fd_out = rep->fd_out;
+            ctx->fd_cmd = rep->fd_cmd;
+            ctx->fd_data = rep->fd_data;
+            ctx->fd_ctrl = rep->fd_ctrl;
             ctx->pid = rep->pid;
             atomic_store(&ctx->last_heartbeat, time(NULL));
             atomic_store(&ctx->waiting_replace, false);
 
-            /* Add new fd_out to epoll */
-            if (ctx->epfd >= 0 && ctx->fd_out >= 0) {
+            /* Add new fd_data to epoll */
+            if (ctx->epfd >= 0 && ctx->fd_data >= 0) {
                 struct epoll_event ev = {0};
                 ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-                ev.data.u32 = 0; /* slot 0 = fd_out */
-                if (epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, ctx->fd_out, &ev) != 0) {
-                    log_error("[IPC-%d] epoll_ctl ADD fd_out=%d failed: %s",
-                            ctx->slot_id, ctx->fd_out, strerror(errno));
+                ev.data.u32 = 2; /* slot 2 = fd_data */
+                if (epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, ctx->fd_data, &ev) != 0) {
+                    log_error("[IPC-%d] epoll_ctl ADD fd_data=%d failed: %s",
+                            ctx->slot_id, ctx->fd_data, strerror(errno));
                     worker_mark_dead(ctx, true);
                 }
             }
-            log_info("[IPC-%d] Worker replaced (pid=%d, fd_out=%d)",
-                    ctx->slot_id, (int)ctx->pid, ctx->fd_out);
+            /* Add new fd_ctrl to epoll */
+            if (ctx->epfd >= 0 && ctx->fd_ctrl >= 0) {
+                struct epoll_event ev = {0};
+                ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+                ev.data.u32 = 3; /* slot 3 = fd_ctrl */
+                if (epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, ctx->fd_ctrl, &ev) != 0) {
+                    log_error("[IPC-%d] epoll_ctl ADD fd_ctrl=%d failed: %s",
+                            ctx->slot_id, ctx->fd_ctrl, strerror(errno));
+                    worker_mark_dead(ctx, true);
+                }
+            }
+            log_info("[IPC-%d] Worker replaced (pid=%d, fd_data=%d, fd_ctrl=%d)",
+                    ctx->slot_id, (int)ctx->pid, ctx->fd_data, ctx->fd_ctrl);
             ctx->eagain_retry_count = 0;
             break;
         }
@@ -341,8 +427,9 @@ IpcThreadCtx* ipc_thread_ctx_create(int slot_id, WorkerPool *pool,
     ctx->cmd_queue = cmd;
     ctx->ret_queue = ret;
     ctx->master_cond = master_cond;
-    ctx->fd_in = -1;
-    ctx->fd_out = -1;
+    ctx->fd_cmd = -1;
+    ctx->fd_data = -1;
+    ctx->fd_ctrl = -1;
     ctx->pid = -1;
     atomic_init(&ctx->running, true);
     atomic_init(&ctx->last_heartbeat, time(NULL));
@@ -372,8 +459,9 @@ IpcThreadCtx* ipc_thread_ctx_create(int slot_id, WorkerPool *pool,
 
 void ipc_thread_ctx_destroy(IpcThreadCtx *ctx) {
     if (!ctx) return;
-    if (ctx->fd_in >= 0) close(ctx->fd_in);
-    if (ctx->fd_out >= 0) close(ctx->fd_out);
+    if (ctx->fd_cmd >= 0) close(ctx->fd_cmd);
+    if (ctx->fd_data >= 0) close(ctx->fd_data);
+    if (ctx->fd_ctrl >= 0) close(ctx->fd_ctrl);
     if (ctx->epfd >= 0) close(ctx->epfd);
     free(ctx);
 }
@@ -382,7 +470,7 @@ void* ipc_thread_loop(void *arg) {
     IpcThreadCtx *ctx = (IpcThreadCtx*)arg;
     if (!ctx) return NULL;
 
-    struct epoll_event events[4];
+    struct epoll_event events[8];
 
     while (atomic_load(&ctx->running)) {
         /* 1. Handle commands (non-blocking drain) */
@@ -391,8 +479,8 @@ void* ipc_thread_loop(void *arg) {
             handle_cmd(ctx, &cmd);
         }
 
-        /* 2. epoll_wait: fd_out + cmd_queue eventfd */
-        int nfds = epoll_wait(ctx->epfd, events, 4, 500);
+        /* 2. epoll_wait: fd_data + fd_ctrl + cmd_queue eventfd */
+        int nfds = epoll_wait(ctx->epfd, events, 8, 500);
 
         for (int i = 0; i < nfds; i++) {
             uint32_t slot = events[i].data.u32;
@@ -406,15 +494,28 @@ void* ipc_thread_loop(void *arg) {
                 continue;
             }
 
-            if (slot == 0) {
-                /* fd_out event */
+            if (slot == 2) {
+                /* fd_data event: BATCH data */
                 if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                    log_error("[IPC-%d] fd_out error/hup (events=0x%x)",
+                    log_error("[IPC-%d] fd_data error/hup (events=0x%x)",
                             ctx->slot_id, events[i].events);
                     worker_mark_dead(ctx, true);
                     continue;
                 }
-                read_worker_message(ctx);
+                read_data_message(ctx);
+                continue;
+            }
+
+            if (slot == 3) {
+                /* fd_ctrl event: control signals */
+                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+                    log_error("[IPC-%d] fd_ctrl error/hup (events=0x%x)",
+                            ctx->slot_id, events[i].events);
+                    worker_mark_dead(ctx, true);
+                    continue;
+                }
+                read_ctrl_message(ctx);
+                continue;
             }
         }
 

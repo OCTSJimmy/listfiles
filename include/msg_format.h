@@ -24,6 +24,8 @@
 #define RET_EXIT       14  /* Worker normal exit */
 #define MSG_DROP       15  /* CMD_SCAN dropped during replacement window */
 #define RET_DEV_TIMEOUT 16  /* Worker scanner self-detected timeout */
+#define RET_READY      17  /* Worker initialization complete */
+#define RET_FINISH     18  /* Worker task complete */
 
 /**
  * @brief  Unified message structure for Master <-> IPC Thread queues
@@ -51,8 +53,9 @@ typedef struct {
 
 /* CMD_REPLACE payload */
 typedef struct {
-    int    fd_in;       /* new Worker write end (master writes) */
-    int    fd_out;      /* new Worker read end (master reads) */
+    int    fd_cmd;      /* new Worker cmd read end (master writes) */
+    int    fd_data;     /* new Worker data read end (master reads BATCH) */
+    int    fd_ctrl;     /* new Worker ctrl read end (master reads signals) */
     pid_t  pid;         /* new Worker process id */
 } CmdReplacePayload;
 

@@ -344,7 +344,7 @@ int main(int argc, char *argv[]) {
     }
     for (int i = 0; i < num_workers; i++) {
         WorkerSlot *slot = &ctx.worker_pool->slots[i];
-        send_replace_to_ipc(&ctx, i, slot->fd_in, slot->fd_out, slot->pid);
+        send_replace_to_ipc(&ctx, i, slot->fd_cmd, slot->fd_data, slot->fd_ctrl, slot->pid);
     }
 
     /* Resume mode: restore progress and replay unfinished tasks */

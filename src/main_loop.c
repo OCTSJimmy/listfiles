@@ -129,14 +129,15 @@ static bool send_scan_to_ipc(AppContext *ctx, int wid, const char *path, uint64_
  * IPC helper: send CMD_REPLACE to IPC thread
  * ================================================================ */
 
-void send_replace_to_ipc(AppContext *ctx, int wid, int fd_in, int fd_out, pid_t pid) {
+void send_replace_to_ipc(AppContext *ctx, int wid, int fd_cmd, int fd_data, int fd_ctrl, pid_t pid) {
     CmdReplacePayload *rep = malloc(sizeof(CmdReplacePayload));
     if (!rep) {
         log_error("[Replace] malloc failed for worker %d", wid);
         return;
     }
-    rep->fd_in = fd_in;
-    rep->fd_out = fd_out;
+    rep->fd_cmd = fd_cmd;
+    rep->fd_data = fd_data;
+    rep->fd_ctrl = fd_ctrl;
     rep->pid = pid;
 
     IpcThreadMsg msg = {
@@ -321,15 +322,15 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
     if (!atomic_load(&slot->is_alive) && slot->pid == -1) return;
     if (atomic_flag_test_and_set(&slot->cleanup_done)) return;
 
-    /* Drain fd_in_rd to count orphaned SCAN tasks */
+    /* Drain fd_cmd_rd to count orphaned SCAN tasks */
     int orphaned = 0;
-    if (slot->fd_in_rd >= 0) {
-        orphaned = ipc_drain_and_count_tasks(slot->fd_in_rd);
+    if (slot->fd_cmd_rd >= 0) {
+        orphaned = ipc_drain_and_count_tasks(slot->fd_cmd_rd);
         if (orphaned > 0) {
-            log_debug("[Cleanup] Worker %d drained %d orphaned tasks from fd_in_rd", worker_id, orphaned);
+            log_debug("[Cleanup] Worker %d drained %d orphaned tasks from fd_cmd_rd", worker_id, orphaned);
         }
-        close(slot->fd_in_rd);
-        slot->fd_in_rd = -1;
+        close(slot->fd_cmd_rd);
+        slot->fd_cmd_rd = -1;
     }
 
     /* Migrate backlog to lost_tasks */
@@ -339,14 +340,17 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
     slot->backlog_count = 0;
     slot->backlog_capacity = 0;
 
-    /* Close write-end fd_in (IPC thread already closed its copy, Master just notes it) */
-    if (slot->fd_in >= 0) {
-        slot->fd_in = -1;
+    /* Close write-end fd_cmd (IPC thread already closed its copy, Master just notes it) */
+    if (slot->fd_cmd >= 0) {
+        slot->fd_cmd = -1;
     }
 
-    /* fd_out is closed by IPC thread; Master just notes it */
-    if (slot->fd_out >= 0) {
-        slot->fd_out = -1;
+    /* fd_data and fd_ctrl are closed by IPC thread; Master just notes them */
+    if (slot->fd_data >= 0) {
+        slot->fd_data = -1;
+    }
+    if (slot->fd_ctrl >= 0) {
+        slot->fd_ctrl = -1;
     }
 
     atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
@@ -387,6 +391,16 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
                 IpcErrorHeader hdr = { err->errno_code, err->dev };
                 main_loop_handle_error(ctx, msg->slot_id, &hdr, err->path);
             }
+            break;
+        }
+        case RET_READY: {
+            log_info("[Bus] Worker %d READY", msg->slot_id);
+            atomic_store(&ctx->worker_pool->slots[msg->slot_id].last_heartbeat, time(NULL));
+            break;
+        }
+        case RET_FINISH: {
+            log_debug("[Bus] Worker %d FINISH", msg->slot_id);
+            /* Task completed, Worker is now IDLE */
             break;
         }
         case RET_DEAD: {
@@ -620,7 +634,7 @@ void main_loop_run(AppContext *ctx) {
     /* Send initial REPLACE to all IPC threads */
     for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
         WorkerSlot *slot = &ctx->worker_pool->slots[i];
-        send_replace_to_ipc(ctx, i, slot->fd_in, slot->fd_out, slot->pid);
+        send_replace_to_ipc(ctx, i, slot->fd_cmd, slot->fd_data, slot->fd_ctrl, slot->pid);
     }
 
     /* Create thread pool completion eventfd */
@@ -682,7 +696,7 @@ void main_loop_run(AppContext *ctx) {
                 cleanup_dead_worker_slot(ctx, i, true);
                 log_info("[Replace] Replacing dead worker %d", i);
                 worker_pool_replace(ctx->worker_pool, i);
-                send_replace_to_ipc(ctx, i, slot->fd_in, slot->fd_out, slot->pid);
+                send_replace_to_ipc(ctx, i, slot->fd_cmd, slot->fd_data, slot->fd_ctrl, slot->pid);
             }
         }
 

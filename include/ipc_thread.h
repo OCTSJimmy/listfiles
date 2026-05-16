@@ -18,8 +18,9 @@ typedef struct {
     int             epfd;           /* IPC thread's own epoll */
     _Atomic bool    running;
     _Atomic time_t  last_heartbeat;
-    int             fd_in;          /* Current Worker write end */
-    int             fd_out;         /* Current Worker read end */
+    int             fd_cmd;         /* Current Worker cmd read end (M→W) */
+    int             fd_data;        /* Current Worker data read end (W→M BATCH) */
+    int             fd_ctrl;        /* Current Worker ctrl read end (W→M signals) */
     pid_t           pid;            /* Current Worker pid */
     _Atomic bool    waiting_replace;/* Set after DEAD, cleared after REPLACE */
     int             eagain_retry_count; /* EAGAIN retry counter (reset on REPLACE) */

@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "14.0.1" // 版本号升级：修复 Worker 多线程 fd_out 竞争写入导致的 payload timeout 回归
+#define VERSION "15.0.0" // 版本号升级：三通道分离 + IPC 状态机 + Worker 状态显示
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
