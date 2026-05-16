@@ -9,6 +9,38 @@
 ---
 ---
 
+## [15.0.2] - 2026-05-16
+
+### Bugfix：修复 `pending_tasks` 计数器逻辑混乱 + `fd_cmd_rd` 保存无效 fd
+
+**问题背景**：v15.0.1 小目录测试正常，但 `/public2` 大目录测试 8 分钟后卡死，`pending_tasks=139` 永远不归零，Worker 全部空闲 poll。
+
+**根因 A：`process_completed_batch` 对每个 BATCH 都减 `pending_tasks`**
+- 单个目录扫描任务可能产生多个 BATCH，导致 `pending_tasks` 被多减。
+- `dispatch_lost_tasks` 重发 SCAN 时**不增加** `pending_tasks`，这些路径完成后 `process_completed_batch` 又减一次，净效果 `pending_tasks` 失真。
+- `RET_FINISH` 处理时**不减** `pending_tasks`，全靠 `cleanup_dead_worker_slot` 减。但正常 FINISH 后 Worker 不退出，cleanup 不调用，`pending_tasks` 永远无法归零。
+
+**根因 B：`worker_pool_spawn` 中 `cmd_pipe[0]` 被提前关闭**
+- `close(cmd_pipe[0])` 在 `slot->fd_cmd_rd = cmd_pipe[0]` 之前执行，保存的是已关闭的 fd 号。
+- `cleanup_dead_worker_slot` 调用 `ipc_drain_and_count_tasks(slot->fd_cmd_rd)` 时，读的是无效 fd，`orphaned` 计数永远是错的。
+
+#### 修复
+- **`src/main_loop.c`**：
+  - `process_completed_batch` 中移除 `atomic_fetch_sub(&ctx->pending_tasks, 1)`，只负责 `pending_batches`。
+  - `dispatch_lost_tasks` 中 `send_scan_to_ipc` 成功后增加 `atomic_fetch_add(&ctx->pending_tasks, 1)`。
+  - `handle_return_message` 的 `RET_FINISH` 分支增加 `atomic_fetch_sub(&ctx->pending_tasks, 1)`。
+  - 主循环每 10s 打印 `pending_tasks` / `pending_batches` / `lost_tasks` 调试点。
+- **`src/worker_proc.c`**：删除 `worker_pool_spawn` 中的 `close(cmd_pipe[0])`，保留读端给 `cleanup_dead_worker_slot` drain 用。
+- **`src/progress.c`**：`pump_pbin_batch` 开头/末尾增加 DEBUG 日志。
+
+#### 修改的文件
+- `src/main_loop.c`（计数器修复 + 调试点）
+- `src/worker_proc.c`（保留 `cmd_pipe[0]`）
+- `src/progress.c`（调试点）
+- `include/config.h`（版本号 15.0.2）
+
+---
+
 ## [15.0.1] - 2026-05-16
 
 ### Bugfix：修复 `main_loop_run()` 重复调用 `init_ipc_threads()` 导致的卡死 + 配置初始化补全 + 线程安全日志

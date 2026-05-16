@@ -1256,6 +1256,8 @@ static bool read_next_pbin_record(FILE *fp, char **out_path, struct stat *out_st
 void pump_pbin_batch(AppContext *ctx, int batch_size) {
     if (!ctx->hist_pump_fp) return;
 
+    log_debug("[Pump] pump_pbin_batch start (hist_state=%d, line=%zu)", ctx->hist_pump_state, ctx->hist_pump_line_no);
+
     int sent = 0;
     while (sent < batch_size) {
         char *path = NULL;
@@ -1311,6 +1313,7 @@ void pump_pbin_batch(AppContext *ctx, int batch_size) {
         }
         free(path);
     }
+    log_debug("[Pump] pump_pbin_batch done, sent=%d, pending_tasks=%ld", sent, atomic_load(&ctx->pending_tasks));
 }
 
 /**

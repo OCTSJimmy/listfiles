@@ -172,6 +172,8 @@ static void send_stop_to_ipc(AppContext *ctx, int wid) {
  * ================================================================ */
 
 static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
+    log_debug("[Batch] process_completed_batch start worker=%d count=%d pending_batches=%ld",
+              batch->worker_id, batch->count, atomic_load(&ctx->pending_batches));
     OutputBatch out_batch = {0};
 
     for (int i = 0; i < batch->count; i++) {
@@ -253,9 +255,8 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
         async_writer_submit_batch(ctx->async_writer, &out_batch);
     }
 
-    atomic_fetch_sub(&ctx->pending_tasks, 1);
     atomic_fetch_sub(&ctx->pending_batches, 1);
-    log_debug("[Batch] pending_tasks after sub: %ld, pending_batches after sub: %ld", atomic_load(&ctx->pending_tasks), atomic_load(&ctx->pending_batches));
+    log_debug("[Batch] pending_batches after sub: %ld", atomic_load(&ctx->pending_batches));
     ctx->state.total_dequeued_count++;
 
     for (int i = 0; i < batch->count; i++) free(batch->paths[i]);
@@ -297,6 +298,8 @@ static void dispatch_lost_tasks(AppContext *ctx) {
             lost_tasks_push(&ctx->lost_tasks, path);
             continue;
         }
+        atomic_fetch_add(&ctx->pending_tasks, 1);
+        log_debug("[LostTasks] dispatched %s to worker %d, pending_tasks=%ld", path, wid, atomic_load(&ctx->pending_tasks));
 
         slot->current_dev = 0;
         safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
@@ -402,7 +405,8 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             break;
         }
         case RET_FINISH: {
-            log_info("[Bus] Worker %d FINISH", msg->slot_id);
+            log_info("[Bus] Worker %d FINISH (pending_tasks=%ld)", msg->slot_id, atomic_load(&ctx->pending_tasks));
+            atomic_fetch_sub(&ctx->pending_tasks, 1);
             /* Task completed, Worker is now IDLE */
             break;
         }
@@ -663,6 +667,15 @@ void main_loop_run(AppContext *ctx) {
     while (ctx->running) {
         /* 1. Block on cond_wait for IPC messages (100ms timeout) */
         wait_for_ipc_messages(ctx, 100);
+
+        /* v15.0.2 debug: 每 ~10s 打印一次主循环状态 */
+        static int loop_counter = 0;
+        if (++loop_counter >= 100) {
+            loop_counter = 0;
+            log_info("[MainLoop] pending_tasks=%ld pending_batches=%ld hist_state=%d lost_tasks=%zu",
+                     atomic_load(&ctx->pending_tasks), atomic_load(&ctx->pending_batches),
+                     ctx->hist_pump_state, ctx->lost_tasks.count);
+        }
 
         /* 2. Drain all IPC return queues */
         for (int i = 0; i < ctx->worker_pool->num_workers; i++) {

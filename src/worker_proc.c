@@ -844,7 +844,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     }
 
     /* Parent */
-    close(cmd_pipe[0]);
+    /* 注意：保留 cmd_pipe[0] 给 cleanup_dead_worker_slot drain 用，不要在这里关闭 */
     close(data_pipe[1]);
     close(ctrl_pipe[1]);
 
