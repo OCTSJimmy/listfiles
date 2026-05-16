@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "13.0.3" // 版本号升级：修复 Worker 写端非阻塞导致的 payload timeout 竞态
+#define VERSION "14.0.0" // 版本号升级：Worker 多线程化 — IPC 线程与 Scanner 线程分离
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000

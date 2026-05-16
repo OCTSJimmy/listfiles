@@ -9,6 +9,28 @@
 ---
 ---
 
+## [14.0.0] - 2026-05-16
+
+### 架构重构：Worker 多线程化（IPC 线程 + Scanner 线程分离）
+
+**问题背景**：v13.x 中 Worker 是单线程线性设计：阻塞读 fd_in → 阻塞扫描（readdir/lstat 可能卡住很久）→ 发 BATCH → 循环。扫描期间既不响应 STOP、也不发心跳，NFS 卡死时只能等 IPC 线程心跳超时后 SIGKILL。
+
+**新架构**：Worker 进程内部拆分为两条线程：
+- **Scanner 线程**：专职执行 readdir/lstat 等阻塞 IO，调用 `scan_and_send()` 直接写 fd_out（阻塞）。
+- **IPC 线程（主线程）**：专职维护与 Master 的通信。fd_in 设为非阻塞，通过 `poll(5s)` 循环同时处理读任务、发心跳、响应 STOP。Scanner 卡住不影响心跳节拍。
+
+**好处**：
+1. 心跳连续性：即使 Scanner 卡在某个 lstat 上 30 分钟，IPC 线程每 5s 仍发心跳，IPC 线程不会误判 Worker 死亡。
+2. 可响应 STOP：IPC 线程收到 IPC_MSG_STOP 后立即设置 stop_flag、唤醒 Scanner、等待其退出后发送 EXIT。
+3. 为后续"扫描产出超时"检测打下基础：IPC 线程可独立监控 Scanner 的 `last_progress` 时间戳。
+
+#### 修改的文件
+
+- `src/worker_proc.c`（WorkerThreadCtx + worker_scanner_thread + worker_main 多线程重写）
+- `include/config.h`（版本号 14.0.0）
+
+---
+
 ## [13.0.3] - 2026-05-16
 
 ### Bugfix：修复 Worker 写端非阻塞导致的 payload timeout 竞态

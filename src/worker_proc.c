@@ -22,6 +22,9 @@
 #include <time.h>
 #include <sys/wait.h>
 
+#include <pthread.h>
+#include <poll.h>
+
 /* Read-only context inherited via fork (COW, never modified by parent after fork) */
 static const Config *g_worker_cfg = NULL;
 static const FingerprintSet *g_worker_ref_set = NULL;
@@ -431,66 +434,193 @@ cleanup:
 }
 
 /* ================================================================
- * Worker process entry
+ * Worker 内部多线程上下文 (v14.0.0)
+ * ================================================================ */
+
+typedef struct {
+    int fd_in;
+    int fd_out;
+    int worker_id;
+
+    /* 任务同步 */
+    pthread_mutex_t task_mutex;
+    pthread_cond_t  task_cond;
+    char   task_path[4096];
+    bool   task_ready;
+    bool   stop_flag;
+
+    /* Scanner 进度监控 */
+    pthread_mutex_t progress_mutex;
+    time_t last_progress;
+    bool   scanner_active;
+} WorkerThreadCtx;
+
+static void *worker_scanner_thread(void *arg) {
+    WorkerThreadCtx *ctx = (WorkerThreadCtx *)arg;
+
+    while (1) {
+        pthread_mutex_lock(&ctx->task_mutex);
+        while (!ctx->task_ready && !ctx->stop_flag) {
+            pthread_cond_wait(&ctx->task_cond, &ctx->task_mutex);
+        }
+        if (ctx->stop_flag) {
+            pthread_mutex_unlock(&ctx->task_mutex);
+            break;
+        }
+
+        char path[4096];
+        strncpy(path, ctx->task_path, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+        ctx->task_ready = false;
+        pthread_mutex_unlock(&ctx->task_mutex);
+
+        /* 记录扫描开始 */
+        pthread_mutex_lock(&ctx->progress_mutex);
+        ctx->last_progress = time(NULL);
+        ctx->scanner_active = true;
+        pthread_mutex_unlock(&ctx->progress_mutex);
+
+        /* 扫描 */
+        scan_and_send(ctx->fd_out, path, ctx->worker_id);
+
+        /* 记录扫描完成 */
+        pthread_mutex_lock(&ctx->progress_mutex);
+        ctx->last_progress = time(NULL);
+        ctx->scanner_active = false;
+        pthread_mutex_unlock(&ctx->progress_mutex);
+    }
+
+    return NULL;
+}
+
+/* ================================================================
+ * Worker process entry  (v14.0.0: IPC thread + Scanner thread)
  * ================================================================ */
 
 /**
- * @brief  Worker 子进程主入口函数
- * @param  fd_in      int  读取 Master 任务的输入管道 fd，取值范围: >= 0 的可读 fd
- * @param  fd_out     int  向 Master 发送结果的输出管道 fd，取值范围: >= 0 的可写 fd
- * @param  worker_id  int  Worker 编号（用于日志和调试），取值范围: >= 0
+ * @brief  Worker 子进程主入口函数 (v14.0.0 多线程版)
+ * @param  fd_in      int  读取 Master 任务的输入管道 fd
+ * @param  fd_out     int  向 Master 发送结果的输出管道 fd
+ * @param  worker_id  int  Worker 编号
  * @return void
  *
- * @note   阻塞循环：接收 IPC 消息头部 → 根据 msg_type 处理：
- *         - IPC_MSG_SCAN：接收路径 → 发送扫描前心跳 → scan_and_send → 发送扫描后心跳
- *         - IPC_MSG_STOP：发送 IPC_MSG_EXIT 后退出循环
- *         - 其他类型：排空未知负载后继续循环
- *         遇到管道 EOF 或内存分配失败时直接 break 退出。
+ * @note   内部拆分为两条线程：
+ *         - Scanner 线程：专职执行 readdir/lstat 等阻塞 IO
+ *         - IPC 线程（本函数，即主线程）：专职维护 fd_in/fd_out 通信与心跳
+ *         fd_in 设为非阻塞，主线程通过 poll(5s) 循环同时处理：
+ *         读任务、发心跳、响应 STOP。Scanner 卡住不影响心跳。
  */
 void worker_main(int fd_in, int fd_out, int worker_id) {
-    (void)worker_id;
-    while (1) {
-        IpcMessageHeader hdr;
-        if (ipc_recv_header(fd_in, &hdr) != 0) {
-            log_error("[Worker] worker_main exiting: ipc_recv_header failed on fd_in=%d", fd_in);
-            break;
-        }
-
-        if (hdr.msg_type == IPC_MSG_STOP) {
-            ipc_send(fd_out, IPC_MSG_EXIT, NULL, 0);
-            break;
-        }
-
-        if (hdr.msg_type != IPC_MSG_SCAN) {
-            /* drain unknown payload */
-            if (hdr.payload_len > 0) {
-                void *tmp = malloc(hdr.payload_len);
-                ipc_recv_payload(fd_in, tmp, hdr.payload_len);
-                free(tmp);
-            }
-            continue;
-        }
-
-        char *dir_path = malloc(hdr.payload_len + 1);
-        if (!dir_path) break;
-        if (ipc_recv_payload(fd_in, dir_path, hdr.payload_len) != 0) {
-            free(dir_path);
-            break;
-        }
-        dir_path[hdr.payload_len] = '\0';
-
-        /* heartbeat before scan */
-        IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
-        ipc_send(fd_out, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
-
-        scan_and_send(fd_out, dir_path, worker_id);
-
-        /* heartbeat after scan */
-        hb.timestamp = (uint64_t)time(NULL);
-        ipc_send(fd_out, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
-
-        free(dir_path);
+    /* 设置 fd_in 为非阻塞，使 IPC 线程可用 poll 循环 */
+    int flags = fcntl(fd_in, F_GETFL);
+    if (flags >= 0) {
+        fcntl(fd_in, F_SETFL, flags | O_NONBLOCK);
     }
+
+    WorkerThreadCtx ctx = {
+        .fd_in = fd_in,
+        .fd_out = fd_out,
+        .worker_id = worker_id,
+        .task_ready = false,
+        .stop_flag = false,
+        .last_progress = time(NULL),
+        .scanner_active = false,
+    };
+    pthread_mutex_init(&ctx.task_mutex, NULL);
+    pthread_cond_init(&ctx.task_cond, NULL);
+    pthread_mutex_init(&ctx.progress_mutex, NULL);
+
+    pthread_t scanner_tid;
+    if (pthread_create(&scanner_tid, NULL, worker_scanner_thread, &ctx) != 0) {
+        log_error("[Worker-%d] Failed to create scanner thread", worker_id);
+        ipc_send(fd_out, IPC_MSG_EXIT, NULL, 0);
+        return;
+    }
+
+    struct pollfd pfd = { fd_in, POLLIN, 0 };
+    time_t last_heartbeat = time(NULL);
+
+    while (!ctx.stop_flag) {
+        time_t now = time(NULL);
+        int elapsed = (int)difftime(now, last_heartbeat);
+        int timeout_ms = (elapsed >= 5) ? 0 : (5 - elapsed) * 1000;
+
+        int rc = poll(&pfd, 1, timeout_ms);
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        if (rc == 0 || elapsed >= 5) {
+            IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
+            ipc_send(fd_out, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
+            last_heartbeat = time(NULL);
+        }
+
+        if (pfd.revents & POLLIN) {
+            IpcMessageHeader hdr;
+            rc = ipc_recv_header(fd_in, &hdr);
+            if (rc == -2) {
+                usleep(1000);
+                continue;
+            }
+            if (rc != 0) break;
+
+            if (hdr.msg_type == IPC_MSG_STOP) {
+                if (hdr.payload_len > 0) {
+                    void *tmp = malloc(hdr.payload_len);
+                    if (tmp) { ipc_recv_payload(fd_in, tmp, hdr.payload_len); free(tmp); }
+                }
+                ctx.stop_flag = true;
+                pthread_mutex_lock(&ctx.task_mutex);
+                pthread_cond_signal(&ctx.task_cond);
+                pthread_mutex_unlock(&ctx.task_mutex);
+                break;
+            }
+
+            if (hdr.msg_type != IPC_MSG_SCAN) {
+                if (hdr.payload_len > 0) {
+                    void *tmp = malloc(hdr.payload_len);
+                    if (tmp) { ipc_recv_payload(fd_in, tmp, hdr.payload_len); free(tmp); }
+                }
+                continue;
+            }
+
+            char *dir_path = malloc(hdr.payload_len + 1);
+            if (!dir_path) break;
+            if (ipc_recv_payload(fd_in, dir_path, hdr.payload_len) != 0) {
+                free(dir_path);
+                break;
+            }
+            dir_path[hdr.payload_len] = '\0';
+
+            pthread_mutex_lock(&ctx.task_mutex);
+            strncpy(ctx.task_path, dir_path, sizeof(ctx.task_path) - 1);
+            ctx.task_path[sizeof(ctx.task_path) - 1] = '\0';
+            ctx.task_ready = true;
+            pthread_cond_signal(&ctx.task_cond);
+            pthread_mutex_unlock(&ctx.task_mutex);
+
+            free(dir_path);
+        }
+
+        if (pfd.revents & (POLLERR | POLLHUP)) {
+            break;
+        }
+    }
+
+    /* 通知 Scanner 停止并等待其结束 */
+    pthread_mutex_lock(&ctx.task_mutex);
+    ctx.stop_flag = true;
+    pthread_cond_signal(&ctx.task_cond);
+    pthread_mutex_unlock(&ctx.task_mutex);
+    pthread_join(scanner_tid, NULL);
+
+    ipc_send(fd_out, IPC_MSG_EXIT, NULL, 0);
+
+    pthread_mutex_destroy(&ctx.task_mutex);
+    pthread_cond_destroy(&ctx.task_cond);
+    pthread_mutex_destroy(&ctx.progress_mutex);
 }
 
 /* ================================================================
