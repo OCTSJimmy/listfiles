@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.0.1**（基于 v15.0.0 三通道分离架构，修复重复初始化导致的卡死）
+当前设计版本：**v15.0.2**（基于 v15.0.0 三通道分离架构，修复重复初始化与计数器缺陷导致的卡死）
 
 ---
 
@@ -36,6 +36,7 @@
 | **v14.0.1** | **fd_out 互斥锁** | v14.0.0 拆分线程后 Scanner 与 IPC 线程并发写 fd_out 导致协议错乱、级联 payload timeout | `g_fd_out_mutex` 保护所有 fd_out 写入点 |
 | **v15.0.0** | **三通道分离 + IPC 状态机** | v14.0.1 单 fd 多语义竞争：Scanner 与 IPC 线程共享 fd_out，mutex 持有者阻塞时心跳停止；多种消息字节交错导致 payload timeout | `fd_cmd` / `fd_data` / `fd_ctrl` 三通道语义分离，IPC 线程独立 epoll，Worker READY/FINISH 状态机 |
 | **v15.0.1** | **重复初始化修复** | `main_loop_run()` 重复调用 `init_ipc_threads()` 导致两套消息队列，BATCH 消息发到第一套但主循环 drain 第二套，`pending_tasks` 永远不归零 | 删除 `main_loop_run()` 中的重复初始化，统一由 `main.c` 负责；补全 `skip_interval` 初始化；日志加 `flockfile` |
+| **v15.0.2** | **计数器修复 + fd_cmd_rd 保留** | `process_completed_batch` 对每个 BATCH 都减 `pending_tasks`（单个 SCAN 可产生多个 BATCH），`dispatch_lost_tasks` 重发时不增，`RET_FINISH` 不减，`fd_cmd_rd` 被提前关闭 → `pending_tasks` 永久滞留，程序无法终止 | `process_completed_batch` 只负责 `pending_batches`；`dispatch_lost_tasks` 发 SCAN 时 +1；`RET_FINISH` 时 -1；保留 `cmd_pipe[0]` 给 cleanup drain 用 |
 ---
 
 ## v13.0.0：IPC 线程隔离
