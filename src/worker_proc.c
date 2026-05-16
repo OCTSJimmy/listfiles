@@ -30,6 +30,9 @@ static const Config *g_worker_cfg = NULL;
 static const FingerprintSet *g_worker_ref_set = NULL;
 static const ReferenceMap *g_worker_ref_map = NULL;
 
+/* v14.0.0: thread-safe fd_out mutex (Scanner thread + IPC thread both write to fd_out) */
+static pthread_mutex_t g_fd_out_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /**
  * @brief  设置 Worker 进程只读上下文（fork 前由主进程调用）
  * @param  cfg      const Config*        全局配置指针，允许为 NULL
@@ -306,9 +309,11 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
 
     /* Worker side: retry on EAGAIN until success (pipe buffer should be large enough) */
     int rc;
+    pthread_mutex_lock(&g_fd_out_mutex);
     while ((rc = ipc_send(fd_out, IPC_MSG_BATCH, buf, (uint32_t)total)) == -2) {
         usleep(1000); /* 1ms */
     }
+    pthread_mutex_unlock(&g_fd_out_mutex);
     free(buf);
 }
 
@@ -331,7 +336,9 @@ static void send_error_and_empty_batch(int fd_out, int err_code, const char *pat
             memcpy(buf, &eh, sizeof(eh));
             memcpy(buf + sizeof(eh), &plen, sizeof(plen));
             memcpy(buf + sizeof(eh) + sizeof(plen), path, plen);
+            pthread_mutex_lock(&g_fd_out_mutex);
             ipc_send(fd_out, IPC_MSG_ERROR, buf, (uint32_t)(sizeof(eh) + sizeof(plen) + plen));
+            pthread_mutex_unlock(&g_fd_out_mutex);
             free(buf);
         }
     }
@@ -533,7 +540,9 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
     pthread_t scanner_tid;
     if (pthread_create(&scanner_tid, NULL, worker_scanner_thread, &ctx) != 0) {
         log_error("[Worker-%d] Failed to create scanner thread", worker_id);
+        pthread_mutex_lock(&g_fd_out_mutex);
         ipc_send(fd_out, IPC_MSG_EXIT, NULL, 0);
+        pthread_mutex_unlock(&g_fd_out_mutex);
         return;
     }
 
@@ -553,7 +562,9 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
 
         if (rc == 0 || elapsed >= 5) {
             IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
+            pthread_mutex_lock(&g_fd_out_mutex);
             ipc_send(fd_out, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
+            pthread_mutex_unlock(&g_fd_out_mutex);
             last_heartbeat = time(NULL);
         }
 
@@ -632,7 +643,9 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
                     memcpy(err_buf, &eh, sizeof(eh));
                     memcpy(err_buf + sizeof(eh), &plen, sizeof(plen));
                     memcpy(err_buf + sizeof(eh) + sizeof(plen), stuck_path, plen);
+                    pthread_mutex_lock(&g_fd_out_mutex);
                     ipc_send(fd_out, IPC_MSG_DEV_TIMEOUT, err_buf, (uint32_t)err_total);
+                    pthread_mutex_unlock(&g_fd_out_mutex);
                     free(err_buf);
                 }
                 /* Master will receive RET_DEV_TIMEOUT and replace this worker */
@@ -647,7 +660,9 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
     pthread_mutex_unlock(&ctx.task_mutex);
     pthread_join(scanner_tid, NULL);
 
+    pthread_mutex_lock(&g_fd_out_mutex);
     ipc_send(fd_out, IPC_MSG_EXIT, NULL, 0);
+    pthread_mutex_unlock(&g_fd_out_mutex);
 
     pthread_mutex_destroy(&ctx.task_mutex);
     pthread_cond_destroy(&ctx.task_cond);
