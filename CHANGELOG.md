@@ -9,6 +9,37 @@
 ---
 ---
 
+## [15.0.1] - 2026-05-16
+
+### Bugfix：修复 `main_loop_run()` 重复调用 `init_ipc_threads()` 导致的卡死 + 配置初始化补全 + 线程安全日志
+
+**问题背景**：v15.0.0 小目录测试时程序仍卡死，`timeout 5` 后 exit code = 124，`pending_tasks` 永远不归零。
+
+**根因 A：`init_ipc_threads()` 被调用了两次**
+- `main.c` 在 `main_loop_run()` 之前已调用 `init_ipc_threads()` 并发送初始 REPLACE。
+- 但 `main_loop_run()` 内部又重复调用 `init_ipc_threads()`，生成第二套完全独立的 IPC 线程和消息队列。
+- Worker 的 BATCH/FINISH 消息发到第一套 `ret_queue`，主循环 drain 的是第二套 `ret_queue`，消息永久丢失，`pending_tasks` 永远不减。
+- 重复发送的 REPLACE 还导致 IPC 线程 `epoll_ctl ADD` 已关闭 fd，触发 `Bad file descriptor`，进而将所有 Worker 标记为 DEAD。
+
+**根因 B：`skip_interval` 未显式初始化**
+- `cmdline.c` 中 `init_config()` 遗漏 `skip_interval = 0`，依赖 `app_context_init()` 的 `memset` 间接置 0，存在未来重构风险。
+
+**根因 C：多线程日志交错**
+- `log.c` 中 `fprintf(stderr)` 无锁保护，IPC 线程与主循环并发写时日志行错乱，干扰排查。
+
+#### 修复
+- **`src/main_loop.c`**：删除 `main_loop_run()` 中的 `init_ipc_threads()` 调用和初始 REPLACE 循环（`main.c` 已负责）。
+- **`src/cmdline.c`**：`init_config()` 中显式设置 `skip_interval = 0`。
+- **`src/log.c`**：所有 `fprintf(stderr)` 调用包裹 `flockfile(stderr)` / `funlockfile(stderr)`，确保多线程日志原子输出。
+
+#### 修改的文件
+- `src/main_loop.c`（删除重复初始化）
+- `src/cmdline.c`（补全 `skip_interval` 初始化）
+- `src/log.c`（线程安全日志锁）
+- `include/config.h`（版本号 15.0.1）
+
+---
+
 ## [15.0.0] - 2026-05-16
 
 ### 架构重构：三通道分离 + IPC 状态机

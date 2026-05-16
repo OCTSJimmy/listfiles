@@ -4,7 +4,7 @@ obj/
 bin/
 compile_commands.json
 test_output/
-
+test/
 
 # Test progress files
 progress*.config

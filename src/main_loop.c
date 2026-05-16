@@ -255,6 +255,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
 
     atomic_fetch_sub(&ctx->pending_tasks, 1);
     atomic_fetch_sub(&ctx->pending_batches, 1);
+    log_debug("[Batch] pending_tasks after sub: %ld, pending_batches after sub: %ld", atomic_load(&ctx->pending_tasks), atomic_load(&ctx->pending_batches));
     ctx->state.total_dequeued_count++;
 
     for (int i = 0; i < batch->count; i++) free(batch->paths[i]);
@@ -373,8 +374,10 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
  * ================================================================ */
 
 static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
+    log_debug("[Bus] received type=%u slot=%d len=%zu", msg->type, msg->slot_id, msg->data_len);
     switch (msg->type) {
         case RET_BATCH: {
+            log_debug("[Bus] Worker %d BATCH (len=%zu)", msg->slot_id, msg->data_len);
             main_loop_handle_batch(ctx, msg->slot_id, msg->data, msg->data_len);
             break;
         }
@@ -399,7 +402,7 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             break;
         }
         case RET_FINISH: {
-            log_debug("[Bus] Worker %d FINISH", msg->slot_id);
+            log_info("[Bus] Worker %d FINISH", msg->slot_id);
             /* Task completed, Worker is now IDLE */
             break;
         }
@@ -432,6 +435,11 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             }
             break;
         }
+        default: {
+            log_error("[Bus] Worker %d UNKNOWN message type=%u (len=%zu)",
+                     msg->slot_id, msg->type, msg->data_len);
+            break;
+        }
     }
     free(msg->data);
     msg->data = NULL;
@@ -443,7 +451,11 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
 
 void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload, uint32_t len) {
     ParsedBatch parsed;
-    if (!parse_batch(payload, len, &parsed)) return;
+    if (!parse_batch(payload, len, &parsed)) {
+        log_error("[Batch] Worker %d parse_batch FAILED (len=%u)", worker_id, len);
+        return;
+    }
+    log_debug("[Batch] Worker %d parse_batch OK (count=%d)", worker_id, parsed.count);
 
     uint8_t *results = calloc((size_t)parsed.count, 1);
     if (!results) {
@@ -463,11 +475,15 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
     batch->results = results;
     batch->worker_id = worker_id;
 
+    log_debug("[Batch] pending_batches before add: %ld", atomic_load(&ctx->pending_batches));
     atomic_fetch_add(&ctx->pending_batches, 1);
+    log_debug("[Batch] pending_batches after add: %ld", atomic_load(&ctx->pending_batches));
     if (thread_pool_submit(ctx->thread_pool, batch)) {
+        log_debug("[Batch] Worker %d submitted to thread pool", worker_id);
         return;
     }
 
+    log_debug("[Batch] Worker %d thread pool full, inline processing", worker_id);
     batch_dedup_worker(batch, ctx);
     process_completed_batch(ctx, batch);
 }
@@ -626,22 +642,10 @@ static void wait_for_ipc_messages(AppContext *ctx, int timeout_ms) {
  * ================================================================ */
 
 void main_loop_run(AppContext *ctx) {
-    if (!init_ipc_threads(ctx)) {
-        log_fatal("IPC thread initialization failed");
-        return;
-    }
-
-    /* Send initial REPLACE to all IPC threads */
-    for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
-        WorkerSlot *slot = &ctx->worker_pool->slots[i];
-        send_replace_to_ipc(ctx, i, slot->fd_cmd, slot->fd_data, slot->fd_ctrl, slot->pid);
-    }
-
     /* Create thread pool completion eventfd */
     ctx->event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (ctx->event_fd < 0) {
         log_fatal("eventfd creation failed");
-        destroy_ipc_threads(ctx);
         return;
     }
 
@@ -651,7 +655,6 @@ void main_loop_run(AppContext *ctx) {
         log_fatal("Thread pool creation failed");
         close(ctx->event_fd);
         ctx->event_fd = -1;
-        destroy_ipc_threads(ctx);
         return;
     }
 
@@ -663,9 +666,19 @@ void main_loop_run(AppContext *ctx) {
 
         /* 2. Drain all IPC return queues */
         for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
+            pthread_mutex_lock(&ctx->ipc_ret_queues[i]->mutex);
+            size_t head = ctx->ipc_ret_queues[i]->head;
+            size_t tail = ctx->ipc_ret_queues[i]->tail;
+            pthread_mutex_unlock(&ctx->ipc_ret_queues[i]->mutex);
+            log_debug("[Main] ret_queue[%d] head=%zu tail=%zu queue=%p", i, head, tail, (void*)ctx->ipc_ret_queues[i]);
             IpcThreadMsg msg;
+            int drained = 0;
             while (msg_queue_recv(ctx->ipc_ret_queues[i], &msg)) {
                 handle_return_message(ctx, &msg);
+                drained++;
+            }
+            if (drained > 0) {
+                log_debug("[Main] Drained %d messages from ret_queue[%d]", drained, i);
             }
         }
 

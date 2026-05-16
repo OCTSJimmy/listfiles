@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.0.0" // 版本号升级：三通道分离 + IPC 状态机 + Worker 状态显示
+#define VERSION "15.0.1" // Bugfix: 修复 main_loop_run 重复 init_ipc_threads 导致的卡死 + skip_interval 初始化 + 线程安全日志
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000

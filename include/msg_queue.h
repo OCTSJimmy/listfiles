@@ -2,9 +2,9 @@
 #define MSG_QUEUE_H
 
 #include "msg_format.h"
-#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <pthread.h>
 
 /* ================================================================
  * Lock-free ring buffer message queue (v13.0.0)
@@ -16,9 +16,10 @@
 typedef struct {
     IpcThreadMsg  *buffer;      /* ring buffer storage */
     size_t         capacity;    /* must be power of 2 */
-    _Atomic size_t head;        /* consumer read index */
-    _Atomic size_t tail;        /* producer write index */
+    size_t         head;        /* consumer read index */
+    size_t         tail;        /* producer write index */
     int            eventfd;     /* notification fd (EFD_SEMAPHORE) */
+    pthread_mutex_t mutex;      /* protects head/tail and buffer access */
 } MsgQueue;
 
 /**

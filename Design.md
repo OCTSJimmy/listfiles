@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v14.0.1**（基于 v13.0.1 IPC 线程隔离架构，叠加 v14.0.0 Worker 多线程化 + v14.0.1 fd_out 互斥修复）
+当前设计版本：**v15.0.1**（基于 v15.0.0 三通道分离架构，修复重复初始化导致的卡死）
 
 ---
 
@@ -34,7 +34,8 @@
 | **v13.0.1** | **IPC 协议原子写入** + **栈值污染防御** | `ipc_send` 两次 write 导致 Header 孤悬；`va_list` 异常导致历史块数打印错误 | 合并写入、noinline、sanity check |
 | **v14.0.0** | **Worker 多线程化**（Scanner 线程 + IPC 线程分离） | Worker 单线程阻塞扫描期间不响应 STOP、不发心跳、NFS 卡死只能等 SIGKILL | Worker 内部分线程：Scanner 阻塞 IO + IPC 线程 poll 循环维持心跳与通信 |
 | **v14.0.1** | **fd_out 互斥锁** | v14.0.0 拆分线程后 Scanner 与 IPC 线程并发写 fd_out 导致协议错乱、级联 payload timeout | `g_fd_out_mutex` 保护所有 fd_out 写入点 |
-
+| **v15.0.0** | **三通道分离 + IPC 状态机** | v14.0.1 单 fd 多语义竞争：Scanner 与 IPC 线程共享 fd_out，mutex 持有者阻塞时心跳停止；多种消息字节交错导致 payload timeout | `fd_cmd` / `fd_data` / `fd_ctrl` 三通道语义分离，IPC 线程独立 epoll，Worker READY/FINISH 状态机 |
+| **v15.0.1** | **重复初始化修复** | `main_loop_run()` 重复调用 `init_ipc_threads()` 导致两套消息队列，BATCH 消息发到第一套但主循环 drain 第二套，`pending_tasks` 永远不归零 | 删除 `main_loop_run()` 中的重复初始化，统一由 `main.c` 负责；补全 `skip_interval` 初始化；日志加 `flockfile` |
 ---
 
 ## v13.0.0：IPC 线程隔离

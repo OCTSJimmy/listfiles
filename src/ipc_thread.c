@@ -119,8 +119,11 @@ static void send_return(IpcThreadCtx *ctx, uint32_t type, void *data, size_t len
     if (!msg_queue_send(ctx->ret_queue, &msg)) {
         log_error("[IPC-%d] ret_queue full, message type=%u dropped", ctx->slot_id, type);
         free(data);
-    } else if (ctx->master_cond) {
-        pthread_cond_signal(ctx->master_cond);
+    } else {
+        log_debug("[IPC-%d] ret_queue send OK (type=%u, len=%zu, queue=%p)", ctx->slot_id, type, len, (void*)ctx->ret_queue);
+        if (ctx->master_cond) {
+            pthread_cond_signal(ctx->master_cond);
+        }
     }
 }
 
@@ -219,6 +222,7 @@ static void read_ctrl_message(IpcThreadCtx *ctx) {
             break;
         }
         case IPC_MSG_READY: {
+            log_debug("[IPC-%d] received READY, forwarding RET_READY", ctx->slot_id);
             send_return(ctx, RET_READY, NULL, 0);
             free(payload);
             break;
@@ -226,6 +230,7 @@ static void read_ctrl_message(IpcThreadCtx *ctx) {
         case IPC_MSG_FINISH: {
             if (hdr.payload_len >= sizeof(IpcFinishPayload)) {
                 IpcFinishPayload *fin = (IpcFinishPayload*)payload;
+                log_debug("[IPC-%d] received FINISH (path_len=%u), forwarding RET_FINISH", ctx->slot_id, fin->path_len);
                 /* Payload: IpcFinishPayload + path bytes */
                 size_t path_len = fin->path_len;
                 if (path_len > 4095) path_len = 4095;
@@ -294,6 +299,7 @@ static void read_data_message(IpcThreadCtx *ctx) {
         }
     }
 
+    log_debug("[IPC-%d] received BATCH (payload=%u), forwarding RET_BATCH", ctx->slot_id, hdr.payload_len);
     send_return(ctx, RET_BATCH, payload, hdr.payload_len);
     /* ownership transferred */
 }

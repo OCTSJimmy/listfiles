@@ -76,11 +76,15 @@ int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_le
     }
 
     size_t written = 0;
+    log_debug("[ipc_send] fd=%d total=%zu msg_type=%u", fd, total_len, msg_type);
     while (written < total_len) {
         ssize_t n = write(fd, buf + written, total_len - written);
         if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            int saved_errno = errno;
+            log_debug("[ipc_send] write error fd=%d written=%zu n=%zd errno=%d (%s)",
+                      fd, written, n, saved_errno, strerror(saved_errno));
+            if (saved_errno == EINTR) continue;
+            if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
                 if (written == 0) { free(buf); return -2; }
                 /* Partial write occurred; must retry to avoid protocol desync */
                 usleep(1000); /* 1ms back-off */
@@ -90,7 +94,9 @@ int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_le
             return -1;
         }
         written += n;
+        log_debug("[ipc_send] write ok fd=%d written=%zu n=%zd", fd, written, n);
     }
+    log_debug("[ipc_send] fd=%d total=%zu complete", fd, total_len);
     free(buf);
     return 0;
 }
@@ -309,6 +315,11 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
     while ((rc = ipc_send(fd_out, IPC_MSG_BATCH, buf, (uint32_t)total)) == -2) {
         usleep(1000); /* 1ms */
     }
+    if (rc != 0) {
+        log_error("[Worker] send_batch FAILED (rc=%d, total=%zu)", rc, total);
+    } else {
+        log_debug("[Worker] send_batch OK (total=%zu)", total);
+    }
     free(buf);
 }
 
@@ -352,8 +363,10 @@ static void send_error_and_empty_batch(int fd_out, int err_code, const char *pat
  */
 static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
     (void)worker_id;
+    log_debug("[W%d-Scanner] scan_and_send entered: %s", worker_id, dir_path);
     struct stat dir_st;
     if (lstat(dir_path, &dir_st) != 0) {
+        log_warn("[W%d-Scanner] lstat failed on %s: %s", worker_id, dir_path, strerror(errno));
         send_error_and_empty_batch(fd_out, errno, dir_path);
         return;
     }
@@ -369,12 +382,16 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
 
     DIR *dir = opendir(dir_path);
     if (!dir) {
+        log_warn("[W%d-Scanner] opendir failed on %s: %s", worker_id, dir_path, strerror(errno));
         send_error_and_empty_batch(fd_out, errno, dir_path);
         goto cleanup;
     }
+    log_debug("[W%d-Scanner] opendir success: %s", worker_id, dir_path);
 
     struct dirent *entry;
+    int entry_count = 0;
     while ((entry = readdir(dir)) != NULL) {
+        entry_count++;
         if (entry->d_name[0] == '.' &&
             (entry->d_name[1] == '\0' || (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) {
             continue;
@@ -412,13 +429,16 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
     }
 
     if (count > 0) {
+        log_debug("[W%d-Scanner] sending final batch (count=%d)", worker_id, count);
         send_batch(fd_out, paths, stats, count);
         for (int i = 0; i < count; i++) free(paths[i]);
     } else {
         /* Empty directory: send empty batch so Master decrements pending_tasks */
+        log_debug("[W%d-Scanner] empty dir, sending empty batch", worker_id);
         send_batch(fd_out, NULL, NULL, 0);
     }
 
+    log_debug("[W%d-Scanner] readdir loop done (entries=%d)", worker_id, entry_count);
     closedir(dir);
 cleanup:
     free(paths);
@@ -473,8 +493,12 @@ static void *worker_scanner_thread(void *arg) {
         ctx->scanner_active = true;
         pthread_mutex_unlock(&ctx->progress_mutex);
 
+        log_debug("[W%d-Scanner] start scanning: %s", ctx->worker_id, path);
+
         /* 扫描 — 结果通过 fd_data 发送 */
         scan_and_send(ctx->fd_data, path, ctx->worker_id);
+
+        log_debug("[W%d-Scanner] scan_and_send returned: %s", ctx->worker_id, path);
 
         /* 发送 FINISH 信号，通知 Master 当前任务完成 */
         IpcFinishPayload fin = { 0, 0 };
@@ -486,7 +510,8 @@ static void *worker_scanner_thread(void *arg) {
         if (fin_buf) {
             memcpy(fin_buf, &fin, sizeof(fin));
             memcpy(fin_buf + sizeof(fin), path, plen);
-            ipc_send(ctx->fd_ctrl, IPC_MSG_FINISH, fin_buf, (uint32_t)fin_total);
+            int rc = ipc_send(ctx->fd_ctrl, IPC_MSG_FINISH, fin_buf, (uint32_t)fin_total);
+            log_debug("[W%d-Scanner] IPC_MSG_FINISH sent (rc=%d, path=%s)", ctx->worker_id, rc, path);
             free(fin_buf);
         }
 
@@ -546,10 +571,12 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
     }
 
     /* 发送 READY 信号，通知 Master 初始化完成 */
-    ipc_send(fd_ctrl, IPC_MSG_READY, NULL, 0);
+    int rc_ready = ipc_send(fd_ctrl, IPC_MSG_READY, NULL, 0);
+    log_debug("[Worker-%d] READY sent (rc=%d)", worker_id, rc_ready);
 
     struct pollfd pfd = { fd_cmd, POLLIN, 0 };
     time_t last_heartbeat = time(NULL);
+    int heartbeat_count = 0;
 
     while (!ctx.stop_flag) {
         time_t now = time(NULL);
@@ -559,12 +586,17 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
         int rc = poll(&pfd, 1, timeout_ms);
         if (rc < 0) {
             if (errno == EINTR) continue;
+            log_warn("[Worker-%d] poll error: %s", worker_id, strerror(errno));
             break;
         }
 
         if (rc == 0 || elapsed >= 5) {
+            heartbeat_count++;
             IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
-            ipc_send(fd_ctrl, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
+            int rc_hb = ipc_send(fd_ctrl, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
+            if (heartbeat_count <= 3 || rc_hb != 0) {
+                log_debug("[Worker-%d] heartbeat sent (rc=%d, count=%d)", worker_id, rc_hb, heartbeat_count);
+            }
             last_heartbeat = time(NULL);
         }
 
@@ -575,9 +607,13 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
                 usleep(1000);
                 continue;
             }
-            if (rc != 0) break;
+            if (rc != 0) {
+                log_warn("[Worker-%d] recv_header failed: %d", worker_id, rc);
+                break;
+            }
 
             if (hdr.msg_type == IPC_MSG_STOP) {
+                log_debug("[Worker-%d] received STOP", worker_id);
                 if (hdr.payload_len > 0) {
                     void *tmp = malloc(hdr.payload_len);
                     if (tmp) { ipc_recv_payload(fd_cmd, tmp, hdr.payload_len); free(tmp); }
@@ -590,12 +626,15 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
             }
 
             if (hdr.msg_type != IPC_MSG_SCAN) {
+                log_debug("[Worker-%d] unexpected msg_type=%d, dropping", worker_id, hdr.msg_type);
                 if (hdr.payload_len > 0) {
                     void *tmp = malloc(hdr.payload_len);
                     if (tmp) { ipc_recv_payload(fd_cmd, tmp, hdr.payload_len); free(tmp); }
                 }
                 continue;
             }
+
+            log_debug("[Worker-%d] received SCAN (payload_len=%u)", worker_id, hdr.payload_len);
 
             char *dir_path = malloc(hdr.payload_len + 1);
             if (!dir_path) break;

@@ -267,6 +267,9 @@ int main(int argc, char *argv[]) {
     }
     interactive_confirm(&ctx.cfg, has_history);
 
+    /* Initialize logging with verbose settings */
+    log_init(ctx.cfg.verbose, ctx.cfg.verbose_level);
+
     ctx.state.start_time = time(NULL);
     ctx.state.has_error = false;
     ctx.dev_mgr = dev_mgr_create();

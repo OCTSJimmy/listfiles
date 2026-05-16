@@ -6,9 +6,10 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/eventfd.h>
+#include <pthread.h>
 
 /* ================================================================
- * Lock-free ring buffer using 64-bit atomic head/tail
+ * Simple mutex-protected ring buffer message queue
  * Capacity must be power of 2 for mask-based indexing.
  * ================================================================ */
 
@@ -27,12 +28,20 @@ MsgQueue* msg_queue_create(size_t cap) {
     }
 
     q->capacity = cap;
-    atomic_init(&q->head, 0);
-    atomic_init(&q->tail, 0);
+    q->head = 0;
+    q->tail = 0;
+
+    if (pthread_mutex_init(&q->mutex, NULL) != 0) {
+        log_error("msg_queue_create: mutex init failed");
+        free(q->buffer);
+        free(q);
+        return NULL;
+    }
 
     q->eventfd = eventfd(0, EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC);
     if (q->eventfd < 0) {
         log_error("msg_queue_create: eventfd failed: %s", strerror(errno));
+        pthread_mutex_destroy(&q->mutex);
         free(q->buffer);
         free(q);
         return NULL;
@@ -51,6 +60,7 @@ void msg_queue_destroy(MsgQueue *q) {
     }
 
     if (q->eventfd >= 0) close(q->eventfd);
+    pthread_mutex_destroy(&q->mutex);
     free(q->buffer);
     free(q);
 }
@@ -61,31 +71,29 @@ bool msg_queue_send(MsgQueue *q, const IpcThreadMsg *msg) {
     size_t cap = q->capacity;
     size_t mask = cap - 1;
 
-    while (1) {
-        size_t tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
-        size_t head = atomic_load_explicit(&q->head, memory_order_acquire);
+    pthread_mutex_lock(&q->mutex);
 
-        if (tail - head >= cap) {
-            /* Queue full */
-            return false;
-        }
+    size_t tail = q->tail;
+    size_t head = q->head;
 
-        /* Try to reserve slot */
-        if (atomic_compare_exchange_weak_explicit(
-                &q->tail, &tail, tail + 1,
-                memory_order_release, memory_order_relaxed)) {
-            /* Write data */
-            q->buffer[tail & mask] = *msg;
-            /* Publish write */
-            atomic_thread_fence(memory_order_release);
-
-            /* Notify consumer via eventfd */
-            uint64_t inc = 1;
-            (void)write(q->eventfd, &inc, sizeof(inc));
-            return true;
-        }
-        /* CAS failed, retry */
+    if (tail - head >= cap) {
+        /* Queue full */
+        pthread_mutex_unlock(&q->mutex);
+        return false;
     }
+
+    /* Write data */
+    q->buffer[tail & mask] = *msg;
+    q->tail = tail + 1;
+
+    log_debug("[Queue] SEND head=%zu tail=%zu type=%u slot=%d", head, q->tail, msg->type, msg->slot_id);
+
+    pthread_mutex_unlock(&q->mutex);
+
+    /* Notify consumer via eventfd */
+    uint64_t inc = 1;
+    (void)write(q->eventfd, &inc, sizeof(inc));
+    return true;
 }
 
 bool msg_queue_recv(MsgQueue *q, IpcThreadMsg *out) {
@@ -94,26 +102,24 @@ bool msg_queue_recv(MsgQueue *q, IpcThreadMsg *out) {
     size_t cap = q->capacity;
     size_t mask = cap - 1;
 
-    while (1) {
-        size_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
-        size_t tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+    pthread_mutex_lock(&q->mutex);
 
-        if (head >= tail) {
-            /* Queue empty */
-            return false;
-        }
+    size_t head = q->head;
+    size_t tail = q->tail;
 
-        /* Try to reserve read */
-        if (atomic_compare_exchange_weak_explicit(
-                &q->head, &head, head + 1,
-                memory_order_relaxed, memory_order_relaxed)) {
-            /* Acquire fence to ensure we see the write */
-            atomic_thread_fence(memory_order_acquire);
-            *out = q->buffer[head & mask];
-            return true;
-        }
-        /* CAS failed, retry */
+    if (head >= tail) {
+        /* Queue empty */
+        pthread_mutex_unlock(&q->mutex);
+        return false;
     }
+
+    *out = q->buffer[head & mask];
+    q->head = head + 1;
+
+    log_debug("[Queue] RECV head=%zu tail=%zu type=%u slot=%d", q->head, tail, out->type, out->slot_id);
+
+    pthread_mutex_unlock(&q->mutex);
+    return true;
 }
 
 bool msg_queue_recv_wait(MsgQueue *q, IpcThreadMsg *out, int timeout_ms) {

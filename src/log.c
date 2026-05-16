@@ -46,6 +46,8 @@ void log_msg(LogLevel level, const char *fmt, ...) {
     char ts[32];
     log_timestamp(ts, sizeof(ts));
 
+    flockfile(stderr);
+
     fprintf(stderr, "[%s] [%s] ", ts, level_names[level]);
 
     va_list args;
@@ -59,6 +61,8 @@ void log_msg(LogLevel level, const char *fmt, ...) {
         fprintf(stderr, "\n");
     }
     fflush(stderr);
+
+    funlockfile(stderr);
 }
 
 void log_raw(const char *fmt, ...) {
@@ -71,6 +75,9 @@ void log_raw(const char *fmt, ...) {
 void __attribute__((noinline)) log_vraw(const char *fmt, va_list args) {
     char ts[32];
     log_timestamp(ts, sizeof(ts));
+
+    flockfile(stderr);
+
     fprintf(stderr, "[%s] ", ts);
 
     va_list args_copy;
@@ -83,4 +90,6 @@ void __attribute__((noinline)) log_vraw(const char *fmt, va_list args) {
         fprintf(stderr, "\n");
     }
     fflush(stderr);
+
+    funlockfile(stderr);
 }

@@ -105,6 +105,7 @@ void init_config(Config *cfg) {
     cfg->estimated_files = DEFAULT_ESTIMATED_FILES;
     cfg->master_threads = DEFAULT_MASTER_THREADS;
     cfg->worker_count = 0;
+    cfg->skip_interval = 0;
 }
 
 /**
