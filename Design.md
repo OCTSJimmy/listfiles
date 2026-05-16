@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.1.1**（基于 v15.1.0 状态机，补全 INITIALIZING + startup_timeout + RET_ERROR 恢复 + Monitor 状态显示）
+当前设计版本：**v15.1.2**（基于 v15.1.1 状态机 + batch_dedup_worker 硬超时 + 路径日志脱敏）
 
 ---
 

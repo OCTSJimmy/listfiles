@@ -16,4 +16,8 @@ void verbose_printf(const Config *cfg, int level, const char *format, ...);
 // 声明时间格式化函数
 const char *format_time(time_t t);
 
+// 声明路径日志脱敏函数：每级保留最后一个字符，其余用 *** 替代
+// 返回 thread-local 静态缓冲区，无需 free
+const char *path_log_mask(const char *path);
+
 #endif // UTILS_H

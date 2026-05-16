@@ -8,6 +8,13 @@
 
 ---
 
+## [15.1.2] - 2026-05-17
+
+### 修复
+- `batch_dedup_worker` 硬超时检测：外层循环超过 10 万次迭代强制中断，防止 thread_pool 工作线程 CPU 死循环
+- `fp_shard_insert_internal` 开放寻址探测耗尽 capacity 时输出 `log_fatal`（理论上不应到达）
+- 新增 `path_log_mask()`：每级目录保留最后一个字符，其余 `***` 替代，应用于 IPC 线程、主循环、Monitor 的所有路径日志输出
+
 ## [15.1.1] - 2026-05-17
 
 ### Fixed：补全 Worker 状态机实现（INITIALIZING + startup_timeout + RET_ERROR 恢复 + Monitor 状态显示）

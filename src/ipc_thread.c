@@ -354,7 +354,7 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
                 worker_mark_dead(ctx, true);
             } else {
                 ctx->eagain_retry_count = 0;
-                log_info("[IPC-%d] CMD_SCAN sent to worker (path=%s, len=%u)", ctx->slot_id, scan->path, scan->path_len);
+                log_info("[IPC-%d] CMD_SCAN sent to worker (path=%s, len=%u)", ctx->slot_id, path_log_mask(scan->path), scan->path_len);
             }
             break;
         }

@@ -83,7 +83,17 @@ fail:
 
 static void batch_dedup_worker(TPBatch *batch, void *user_data) {
     AppContext *ctx = user_data;
+    const int ITERATION_LIMIT = 100000; /* v15.1.2: hard timeout for single batch */
     for (int i = 0; i < batch->count; i++) {
+        if (i >= ITERATION_LIMIT) {
+            log_fatal("[DedupWorker] batch iteration exceeded limit %d (count=%d). Aborting to prevent CPU spin.",
+                      ITERATION_LIMIT, batch->count);
+            /* abort() removed for production safety; mark all remaining as duplicate */
+            for (int j = i; j < batch->count; j++) {
+                batch->results[j] = 1; /* duplicate (skip) */
+            }
+            return;
+        }
         const char *path = batch->paths[i];
         struct stat *st = &batch->stats[i];
         uint8_t fp[FP_SIZE];
@@ -118,7 +128,7 @@ static bool send_scan_to_ipc(AppContext *ctx, int wid, const char *path, uint64_
     };
 
     if (!msg_queue_send(ctx->ipc_cmd_queues[wid], &msg)) {
-        log_warn("[Dispatch] cmd_queue[%d] full, dropping %s", wid, path);
+        log_warn("[Dispatch] cmd_queue[%d] full, dropping %s", wid, path_log_mask(path));
         free(scan);
         return false;
     }
@@ -206,7 +216,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                     break;
                 }
                 if (wid < 0) {
-                    log_warn("[Dispatch] no IDLE worker available (path=%s), requeue to lost_tasks", path);
+                    log_warn("[Dispatch] no IDLE worker available (path=%s), requeue to lost_tasks", path_log_mask(path));
                     atomic_fetch_sub(&ctx->pending_tasks, 1);
                     lost_tasks_push(&ctx->lost_tasks, strdup(path));
                     continue;
@@ -313,7 +323,7 @@ static void dispatch_lost_tasks(AppContext *ctx) {
             break;
         }
         if (wid < 0) {
-            log_warn("[LostTasks] no IDLE worker available, requeue %s", path);
+            log_warn("[LostTasks] no IDLE worker available, requeue %s", path_log_mask(path));
             lost_tasks_push(&ctx->lost_tasks, path);
             break; /* 停止继续尝试，等下一轮 */
         }
@@ -326,7 +336,7 @@ static void dispatch_lost_tasks(AppContext *ctx) {
             continue;
         }
         atomic_fetch_add(&ctx->pending_tasks, 1);
-        log_debug("[LostTasks] dispatched %s to worker %d, pending_tasks=%ld", path, wid, atomic_load(&ctx->pending_tasks));
+        log_debug("[LostTasks] dispatched %s to worker %d, pending_tasks=%ld", path_log_mask(path), wid, atomic_load(&ctx->pending_tasks));
 
         slot->current_dev = 0;
         safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
@@ -467,7 +477,7 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             if (msg->data_len >= sizeof(DropPayload)) {
                 DropPayload *drop = (DropPayload*)msg->data;
                 if (!lost_tasks_push(&ctx->lost_tasks, strdup(drop->path))) {
-                    log_warn("[Bus] MSG_DROP requeue failed: %s", drop->path);
+                    log_warn("[Bus] MSG_DROP requeue failed: %s", path_log_mask(drop->path));
                 }
             }
             break;

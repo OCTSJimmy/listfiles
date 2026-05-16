@@ -176,9 +176,10 @@ void print_progress(Monitor *mon) {
             char path_display[32] = "-";
             if (slot->current_path[0] != '\0') {
                 /* 截断显示：仅保留最后 20 个字符 */
-                size_t plen = strlen(slot->current_path);
-                const char *p = slot->current_path;
-                if (plen > 20) p += plen - 20;
+                const char *masked = path_log_mask(slot->current_path);
+                size_t mlen = strlen(masked);
+                const char *p = masked;
+                if (mlen > 20) p += mlen - 20;
                 snprintf(path_display, sizeof(path_display), "...%.*s",
                          (int)(sizeof(path_display)-4), p);
             }

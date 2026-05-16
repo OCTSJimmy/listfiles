@@ -88,3 +88,76 @@ void safe_strcpy(char *dest, const char *src, size_t dest_size) {
         dest[dest_size - 1] = '\0';
     }
 }
+
+/**
+ * @brief  路径日志脱敏：每级目录保留最后一个字符，其余用 *** 替代
+ * @param  path  const char*  原始绝对路径或相对路径
+ * @return const char*  指向 thread-local 静态缓冲区的脱敏路径
+ *
+ * @note   返回线程局部存储(static __thread)缓冲区，无需释放。
+ *          同一线程后续调用会覆盖前一次结果。如需保留，调用方应自行拷贝。
+ *          示例: /public2/hw/a/b/c → /star2/starw/stara/starb/starc
+ */
+const char *path_log_mask(const char *path) {
+    static __thread char buf[4096];
+    if (!path || path[0] == '\0') {
+        buf[0] = '-';
+        buf[1] = '\0';
+        return buf;
+    }
+
+    size_t out_pos = 0;
+    const char *p = path;
+
+    /* 处理开头的多个 '/' */
+    while (*p == '/') {
+        if (out_pos < sizeof(buf) - 1) buf[out_pos++] = '/';
+        p++;
+    }
+
+    while (*p) {
+        /* 找到当前段的起止 */
+        const char *seg_start = p;
+        while (*p && *p != '/') p++;
+        size_t seg_len = (size_t)(p - seg_start);
+
+        if (seg_len == 0) {
+            /* 连续 / */
+            if (out_pos < sizeof(buf) - 1) buf[out_pos++] = '/';
+            if (*p == '/') p++;
+            continue;
+        }
+
+        if (seg_len <= 1) {
+            /* 单字符段，直接保留 */
+            if (out_pos + seg_len < sizeof(buf) - 1) {
+                memcpy(buf + out_pos, seg_start, seg_len);
+                out_pos += seg_len;
+            }
+        } else {
+            /* 多字符段：*** + 最后一个字符 */
+            if (out_pos + 3 < sizeof(buf) - 1) {
+                buf[out_pos++] = '*';
+                buf[out_pos++] = '*';
+                buf[out_pos++] = '*';
+            }
+            if (out_pos < sizeof(buf) - 1) {
+                buf[out_pos++] = seg_start[seg_len - 1];
+            }
+        }
+
+        /* 段后的 '/' */
+        if (*p == '/') {
+            if (out_pos < sizeof(buf) - 1) buf[out_pos++] = '/';
+            p++;
+            /* 跳过连续 '/' */
+            while (*p == '/') {
+                if (out_pos < sizeof(buf) - 1) buf[out_pos++] = '/';
+                p++;
+            }
+        }
+    }
+
+    buf[out_pos] = '\0';
+    return buf;
+}

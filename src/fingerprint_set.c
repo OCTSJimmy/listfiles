@@ -11,6 +11,7 @@
 #include "fingerprint_set.h"
 #define XXH_STATIC_LINKING_ONLY
 #include "xxhash.h"
+#include "log.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -151,6 +152,9 @@ static bool fp_shard_insert_internal(FingerprintShard *shard, const uint8_t md5[
             return true;
         }
     }
+    /* v15.1.2: should never reach here under normal conditions */
+    log_fatal("[FPSet] open-addressing loop exhausted capacity=%zu (count=%zu, tombstones=%zu). Table full or corrupted.",
+              shard->capacity, shard->count, shard->tombstones);
     return false; /* 不应该到达这里 */
 }
 
