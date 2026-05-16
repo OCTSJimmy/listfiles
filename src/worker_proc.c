@@ -510,8 +510,16 @@ static void *worker_scanner_thread(void *arg) {
         if (fin_buf) {
             memcpy(fin_buf, &fin, sizeof(fin));
             memcpy(fin_buf + sizeof(fin), path, plen);
-            int rc = ipc_send(ctx->fd_ctrl, IPC_MSG_FINISH, fin_buf, (uint32_t)fin_total);
-            log_debug("[W%d-Scanner] IPC_MSG_FINISH sent (rc=%d, path=%s)", ctx->worker_id, rc, path);
+            int rc;
+            int retry = 0;
+            while ((rc = ipc_send(ctx->fd_ctrl, IPC_MSG_FINISH, fin_buf, (uint32_t)fin_total)) == -2) {
+                usleep(1000);
+                retry++;
+                if (retry % 1000 == 0) {
+                    log_warn("[W%d-Scanner] IPC_MSG_FINISH EAGAIN retry %d", ctx->worker_id, retry);
+                }
+            }
+            log_debug("[W%d-Scanner] IPC_MSG_FINISH sent (rc=%d, path=%s, retries=%d)", ctx->worker_id, rc, path, retry);
             free(fin_buf);
         }
 

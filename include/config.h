@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.0.3" // Bugfix: 修复 main_loop_run 重复 init_ipc_threads 导致的卡死 + skip_interval 初始化 + 线程安全日志 + fd_data/fd_ctrl 非阻塞写
+#define VERSION "15.0.4" // Debug: IPC thread FINISH trace + send_return trace + CMD_SCAN dispatch trace + Worker FINISH EAGAIN trace
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000

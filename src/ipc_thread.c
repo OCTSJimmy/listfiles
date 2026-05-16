@@ -120,7 +120,7 @@ static void send_return(IpcThreadCtx *ctx, uint32_t type, void *data, size_t len
         log_error("[IPC-%d] ret_queue full, message type=%u dropped", ctx->slot_id, type);
         free(data);
     } else {
-        log_debug("[IPC-%d] ret_queue send OK (type=%u, len=%zu, queue=%p)", ctx->slot_id, type, len, (void*)ctx->ret_queue);
+        log_info("[IPC-%d] ret_queue send OK (type=%u, len=%zu, queue=%p)", ctx->slot_id, type, len, (void*)ctx->ret_queue);
         if (ctx->master_cond) {
             pthread_cond_signal(ctx->master_cond);
         }
@@ -230,7 +230,7 @@ static void read_ctrl_message(IpcThreadCtx *ctx) {
         case IPC_MSG_FINISH: {
             if (hdr.payload_len >= sizeof(IpcFinishPayload)) {
                 IpcFinishPayload *fin = (IpcFinishPayload*)payload;
-                log_debug("[IPC-%d] received FINISH (path_len=%u), forwarding RET_FINISH", ctx->slot_id, fin->path_len);
+                log_info("[IPC-%d] received FINISH (path_len=%u), forwarding RET_FINISH", ctx->slot_id, fin->path_len);
                 /* Payload: IpcFinishPayload + path bytes */
                 size_t path_len = fin->path_len;
                 if (path_len > 4095) path_len = 4095;
@@ -354,6 +354,7 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
                 worker_mark_dead(ctx, true);
             } else {
                 ctx->eagain_retry_count = 0;
+                log_info("[IPC-%d] CMD_SCAN sent to worker (path=%s, len=%u)", ctx->slot_id, scan->path, scan->path_len);
             }
             break;
         }

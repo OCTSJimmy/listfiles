@@ -9,6 +9,29 @@
 ---
 ---
 
+## [15.0.4] - 2026-05-17
+
+### Debug：增加 IPC 链路追踪日志，定位 FINISH 消息丢失点
+
+**问题背景**：v15.0.3 修复 Worker 侧阻塞写（`fd_data`/`fd_ctrl` 设为 `O_NONBLOCK` + FINISH 重试）后，扫描 `/public2` 仍卡死，`pending_tasks=477` 不归零，8 个 Worker 全部空闲（poll），无新 FINISH 到达主循环。
+
+**当前状态**：根因尚未完全定位。477 个 FINISH 消息在 IPC 链路中的丢失点未知：可能发生在 Worker→IPC 线程（fd_ctrl）、IPC 线程→ret_queue、ret_queue→主循环中的任一环节。
+
+**新增调试点**
+- `src/ipc_thread.c`：`read_ctrl_message` 的 `IPC_MSG_FINISH` 分支由 `log_debug` 提升为 `log_info`，确保任何 verbose 级别下都能看到 IPC 线程是否收到 FINISH。
+- `src/ipc_thread.c`：`send_return` 成功时增加 `log_info`，追踪 RET_FINISH 是否进入 ret_queue。
+- `src/ipc_thread.c`：`handle_cmd` 的 `CMD_SCAN` 成功路径增加 `log_info`，确认 SCAN 是否被成功发给 Worker。
+- `src/worker_proc.c`：FINISH 发送的 EAGAIN 重试超过 1000 次时打印 `log_warn`。
+
+**目的**：通过下次 `/public2` 测试的日志，精确判断 FINISH 消息在以下哪一环断裂：
+1. Worker 写入 fd_ctrl（无重试/重试耗尽）
+2. IPC 线程从 fd_ctrl 读取（safe_ipc_recv_header 超时/失败）
+3. IPC 线程 send_return 到 ret_queue（队列满/失败）
+4. 主循环 msg_queue_recv 从 ret_queue 取出（head/tail 异常）
+5. 主循环 handle_return_message 处理 RET_FINISH（未命中 case）
+
+---
+
 ## [15.0.3] - 2026-05-17
 
 ### Bugfix：修复 Worker 侧 `fd_data`/`fd_ctrl` 阻塞写导致的卡死
