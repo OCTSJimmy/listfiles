@@ -892,6 +892,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     slot->fd_data = data_pipe[0];
     slot->fd_ctrl = ctrl_pipe[0];
     atomic_store(&slot->is_alive, true);
+    atomic_store(&slot->state, WORKER_STATE_IDLE);  /* v15.1.0: spawn 初始为 IDLE */
     atomic_store(&slot->last_heartbeat, time(NULL));
     slot->current_dev = 0;
     slot->current_path[0] = '\0';
@@ -925,6 +926,7 @@ bool worker_pool_replace(WorkerPool *pool, int slot_id) {
         close(slot->fd_data);
         close(slot->fd_ctrl);
         atomic_store(&slot->is_alive, false);
+        atomic_store(&slot->state, WORKER_STATE_DEAD);  /* v15.1.0 */
         atomic_fetch_sub(&pool->active_count, 1);
     }
     return worker_pool_spawn(pool, slot_id);

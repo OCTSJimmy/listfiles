@@ -7,6 +7,22 @@
 ## [Unreleased]
 
 ---
+
+## [15.1.0] - 2026-05-17
+
+### Fixed：Master 侧 Worker 显式状态机（IDLE/BUSY/DEAD），修复多线程 Worker 任务覆盖导致的全局停摆
+
+**问题根因**：v14+ 引入 Worker 多线程（Scanner 子线程）后，Master 侧调度仍使用纯轮询（`next_dispatch_worker % num_workers`），仅以 `is_alive` 判定 Worker 可用性。一个已在处理任务的 Worker 会被再次选中，新任务通过 `fd_cmd` 管道塞入，Worker 主线程非阻塞读走并覆盖 `task_path`。Scanner 只处理最后一个任务，前面所有任务成为"幽灵任务"——Master 认为已下发（`pending_tasks` 已递增），但永远收不到 `FINISH`。
+
+**根因闭环**：8 个 Worker 全部处于 BUSY（Scanner 阻塞在 `pthread_cond_wait`），Master 仍在发但无 IDLE Worker 可处理。主线程等不到 `FINISH`，`pending_tasks` 不归零，全局停摆。
+
+**修复方案**：`WorkerSlot` 增加 `_Atomic int state` 字段，定义 `IDLE/BUSY/DEAD` 三个显式状态。
+- 调度目录（`process_completed_batch`）和 `dispatch_lost_tasks` 只选择 `STATE_IDLE` 的 Worker，找到后原子置为 `STATE_BUSY` 再发 `CMD_SCAN`。
+- 收到 `RET_FINISH` 后置 `STATE_IDLE`；收到 `RET_READY` 后置 `STATE_IDLE`；`cleanup`/`replace` 后置 `STATE_DEAD`。
+- 若无 IDLE Worker，任务入 `lost_tasks` 等待下一轮。
+
+**编译验证**：`make clean && make` 通过，无警告。
+
 ---
 
 ## [15.0.4] - 2026-05-17

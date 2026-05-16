@@ -192,18 +192,32 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                 fpbin_append(ctx, path, st);
             } else {
                 atomic_fetch_add(&ctx->pending_tasks, 1);
-                int wid = ctx->next_dispatch_worker % ctx->worker_pool->num_workers;
-                ctx->next_dispatch_worker++;
-                WorkerSlot *slot = &ctx->worker_pool->slots[wid];
-                if (!atomic_load(&slot->is_alive)) {
-                    log_warn("[Dispatch] selected dead worker %d (path=%s), skipping", wid, path);
+                /* v15.1.0: 只选择 STATE_IDLE 的 Worker */
+                int wid = -1;
+                int attempts = 0;
+                int num_workers = ctx->worker_pool->num_workers;
+                while (attempts < num_workers) {
+                    int candidate = ctx->next_dispatch_worker % num_workers;
+                    ctx->next_dispatch_worker++;
+                    WorkerSlot *cand_slot = &ctx->worker_pool->slots[candidate];
+                    if (!atomic_load(&cand_slot->is_alive)) continue;
+                    if (atomic_load(&cand_slot->state) != WORKER_STATE_IDLE) continue;
+                    wid = candidate;
+                    break;
+                }
+                if (wid < 0) {
+                    log_warn("[Dispatch] no IDLE worker available (path=%s), requeue to lost_tasks", path);
                     atomic_fetch_sub(&ctx->pending_tasks, 1);
+                    lost_tasks_push(&ctx->lost_tasks, strdup(path));
                     continue;
                 }
+                WorkerSlot *slot = &ctx->worker_pool->slots[wid];
+                atomic_store(&slot->state, WORKER_STATE_BUSY);
                 slot->current_dev = st->st_dev;
                 safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
                 if (!send_scan_to_ipc(ctx, wid, path, st->st_dev)) {
                     atomic_fetch_sub(&ctx->pending_tasks, 1);
+                    atomic_store(&slot->state, WORKER_STATE_IDLE);
                 }
             }
 
@@ -285,16 +299,29 @@ static void dispatch_lost_tasks(AppContext *ctx) {
     while (lost_tasks_pop(&ctx->lost_tasks, &path)) {
         if (!path) continue;
 
-        int wid = ctx->next_dispatch_worker % ctx->worker_pool->num_workers;
-        ctx->next_dispatch_worker++;
-        WorkerSlot *slot = &ctx->worker_pool->slots[wid];
-        if (!atomic_load(&slot->is_alive)) {
-            log_warn("[LostTasks] skip dead worker %d (path=%s), requeue", wid, path);
-            lost_tasks_push(&ctx->lost_tasks, path);
-            continue;
+        /* v15.1.0: 只选择 STATE_IDLE 的 Worker */
+        int wid = -1;
+        int attempts = 0;
+        int num_workers = ctx->worker_pool->num_workers;
+        while (attempts < num_workers) {
+            int candidate = ctx->next_dispatch_worker % num_workers;
+            ctx->next_dispatch_worker++;
+            WorkerSlot *cand_slot = &ctx->worker_pool->slots[candidate];
+            if (!atomic_load(&cand_slot->is_alive)) continue;
+            if (atomic_load(&cand_slot->state) != WORKER_STATE_IDLE) continue;
+            wid = candidate;
+            break;
         }
+        if (wid < 0) {
+            log_warn("[LostTasks] no IDLE worker available, requeue %s", path);
+            lost_tasks_push(&ctx->lost_tasks, path);
+            break; /* 停止继续尝试，等下一轮 */
+        }
+        WorkerSlot *slot = &ctx->worker_pool->slots[wid];
+        atomic_store(&slot->state, WORKER_STATE_BUSY);
 
         if (!send_scan_to_ipc(ctx, wid, path, 0)) {
+            atomic_store(&slot->state, WORKER_STATE_IDLE);
             lost_tasks_push(&ctx->lost_tasks, path);
             continue;
         }
@@ -369,6 +396,7 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
         atomic_store(&slot->is_alive, false);
         atomic_fetch_sub(&ctx->worker_pool->active_count, 1);
     }
+    atomic_store(&slot->state, WORKER_STATE_DEAD);  /* v15.1.0 */
     slot->pid = -1;
 }
 
@@ -402,11 +430,13 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
         case RET_READY: {
             log_info("[Bus] Worker %d READY", msg->slot_id);
             atomic_store(&ctx->worker_pool->slots[msg->slot_id].last_heartbeat, time(NULL));
+            atomic_store(&ctx->worker_pool->slots[msg->slot_id].state, WORKER_STATE_IDLE); /* v15.1.0 */
             break;
         }
         case RET_FINISH: {
             log_info("[Bus] Worker %d FINISH (pending_tasks=%ld)", msg->slot_id, atomic_load(&ctx->pending_tasks));
             atomic_fetch_sub(&ctx->pending_tasks, 1);
+            atomic_store(&ctx->worker_pool->slots[msg->slot_id].state, WORKER_STATE_IDLE); /* v15.1.0 */
             /* Task completed, Worker is now IDLE */
             break;
         }

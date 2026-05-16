@@ -10,6 +10,11 @@
 #include "reference_map.h"
 #include "ipc_protocol.h"
 
+/* Worker 显式状态机 (v15.1.0) */
+#define WORKER_STATE_IDLE  0
+#define WORKER_STATE_BUSY  1
+#define WORKER_STATE_DEAD  2
+
 typedef struct {
     int      slot_id;
     pid_t    pid;
@@ -19,6 +24,7 @@ typedef struct {
     int      fd_ctrl;          /* master read end (W→M control signals) */
     _Atomic time_t last_heartbeat;
     _Atomic bool   is_alive;
+    _Atomic int    state;      /* WORKER_STATE_IDLE / BUSY / DEAD (v15.1.0) */
     uint64_t current_dev;
     char     current_path[4096]; /* 从 40 扩展到 4096，防止路径截断 */
     char   **backlog_paths;
