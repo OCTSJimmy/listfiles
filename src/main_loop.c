@@ -399,6 +399,11 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             cleanup_dead_worker_slot(ctx, msg->slot_id, true);
             break;
         }
+        case RET_DEV_TIMEOUT: {
+            log_error("[Bus] Worker %d DEV_TIMEOUT (scanner stuck), replacing", msg->slot_id);
+            cleanup_dead_worker_slot(ctx, msg->slot_id, true);
+            break;
+        }
         case RET_EXIT: {
             log_info("[Bus] Worker %d normal exit", msg->slot_id);
             cleanup_dead_worker_slot(ctx, msg->slot_id, false);

@@ -539,7 +539,6 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
 
     struct pollfd pfd = { fd_in, POLLIN, 0 };
     time_t last_heartbeat = time(NULL);
-    bool scanner_timed_out = false;
 
     while (!ctx.stop_flag) {
         time_t now = time(NULL);
@@ -552,7 +551,7 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
             break;
         }
 
-        if (!scanner_timed_out && (rc == 0 || elapsed >= 5)) {
+        if (rc == 0 || elapsed >= 5) {
             IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
             ipc_send(fd_out, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
             last_heartbeat = time(NULL);
@@ -619,7 +618,7 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
             if (difftime(now, scanner_last) > timeout_sec) {
                 log_error("[Worker-%d] Scanner stuck for %ds on %s, reporting to master",
                           worker_id, timeout_sec, ctx.task_path);
-                /* Report stuck scanner to master via IPC_MSG_ERROR */
+                /* Report stuck scanner to master via IPC_MSG_DEV_TIMEOUT */
                 IpcErrorHeader eh = { ETIMEDOUT, 0 };
                 char stuck_path[4096];
                 pthread_mutex_lock(&ctx.task_mutex);
@@ -633,12 +632,10 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
                     memcpy(err_buf, &eh, sizeof(eh));
                     memcpy(err_buf + sizeof(eh), &plen, sizeof(plen));
                     memcpy(err_buf + sizeof(eh) + sizeof(plen), stuck_path, plen);
-                    ipc_send(fd_out, IPC_MSG_ERROR, err_buf, (uint32_t)err_total);
+                    ipc_send(fd_out, IPC_MSG_DEV_TIMEOUT, err_buf, (uint32_t)err_total);
                     free(err_buf);
                 }
-                /* Stop heartbeats so master IPC thread times out and SIGKILLs us */
-                /* (redispatch_current=true will requeue the stuck path) */
-                scanner_timed_out = true;
+                /* Master will receive RET_DEV_TIMEOUT and replace this worker */
             }
         }
     }

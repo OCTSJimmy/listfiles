@@ -196,6 +196,28 @@ static void read_worker_message(IpcThreadCtx *ctx) {
             free(payload);
             break;
         }
+        case IPC_MSG_DEV_TIMEOUT: {
+            if (hdr.payload_len >= sizeof(IpcErrorHeader)) {
+                IpcErrorHeader *eh = (IpcErrorHeader*)payload;
+                RetErrorPayload *ret = malloc(sizeof(RetErrorPayload));
+                if (ret) {
+                    ret->errno_code = eh->errno_code;
+                    ret->dev = eh->dev;
+                    if (hdr.payload_len > sizeof(IpcErrorHeader) + sizeof(uint32_t)) {
+                        const char *src = (const char*)payload + sizeof(IpcErrorHeader) + sizeof(uint32_t);
+                        size_t plen = hdr.payload_len - sizeof(IpcErrorHeader) - sizeof(uint32_t);
+                        if (plen >= sizeof(ret->path)) plen = sizeof(ret->path) - 1;
+                        memcpy(ret->path, src, plen);
+                        ret->path[plen] = '\0';
+                    } else {
+                        ret->path[0] = '\0';
+                    }
+                    send_return(ctx, RET_DEV_TIMEOUT, ret, sizeof(*ret));
+                }
+            }
+            free(payload);
+            break;
+        }
         case IPC_MSG_EXIT: {
             send_return(ctx, RET_EXIT, NULL, 0);
             worker_mark_dead(ctx, false); /* fd already closed by worker */

@@ -23,6 +23,7 @@
 #define RET_DEAD       13  /* Worker died (timeout/epoll error) */
 #define RET_EXIT       14  /* Worker normal exit */
 #define MSG_DROP       15  /* CMD_SCAN dropped during replacement window */
+#define RET_DEV_TIMEOUT 16  /* Worker scanner self-detected timeout */
 
 /**
  * @brief  Unified message structure for Master <-> IPC Thread queues

@@ -10,6 +10,7 @@
 #define IPC_MSG_ERROR      4
 #define IPC_MSG_EXIT       5
 #define IPC_MSG_STOP       6
+#define IPC_MSG_DEV_TIMEOUT 7  /* Scanner self-detected timeout */
 
 typedef struct __attribute__((packed)) {
     uint32_t msg_type;
