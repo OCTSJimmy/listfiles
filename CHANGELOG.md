@@ -22,7 +22,8 @@
 **好处**：
 1. 心跳连续性：即使 Scanner 卡在某个 lstat 上 30 分钟，IPC 线程每 5s 仍发心跳，IPC 线程不会误判 Worker 死亡。
 2. 可响应 STOP：IPC 线程收到 IPC_MSG_STOP 后立即设置 stop_flag、唤醒 Scanner、等待其退出后发送 EXIT。
-3. 为后续"扫描产出超时"检测打下基础：IPC 线程可独立监控 Scanner 的 `last_progress` 时间戳。
+3. **Scanner 超时检测**：IPC 线程监控 Scanner 的 `last_progress` 时间戳，若超过 `heartbeat_timeout`（默认 30s，`-t` 参数可调）无进展，则发送 `IPC_MSG_ERROR` 上报 Master 并停止心跳，Master 心跳超时后 SIGKILL 替换 Worker（`redispatch_current=true` 会重发 stuck 路径）。
+4. 双层超时架构：Master 侧心跳超时兜底 + Worker 侧 Scanner 进度超时自报。
 
 #### 修改的文件
 

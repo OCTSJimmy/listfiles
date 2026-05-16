@@ -539,6 +539,7 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
 
     struct pollfd pfd = { fd_in, POLLIN, 0 };
     time_t last_heartbeat = time(NULL);
+    bool scanner_timed_out = false;
 
     while (!ctx.stop_flag) {
         time_t now = time(NULL);
@@ -551,7 +552,7 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
             break;
         }
 
-        if (rc == 0 || elapsed >= 5) {
+        if (!scanner_timed_out && (rc == 0 || elapsed >= 5)) {
             IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
             ipc_send(fd_out, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
             last_heartbeat = time(NULL);
@@ -606,6 +607,39 @@ void worker_main(int fd_in, int fd_out, int worker_id) {
 
         if (pfd.revents & (POLLERR | POLLHUP)) {
             break;
+        }
+        /* 4. Scanner progress timeout check (v14.0.0) */
+        if (g_worker_cfg && ctx.scanner_active) {
+            pthread_mutex_lock(&ctx.progress_mutex);
+            time_t scanner_last = ctx.last_progress;
+            pthread_mutex_unlock(&ctx.progress_mutex);
+            int timeout_sec = g_worker_cfg->heartbeat_timeout > 0
+                              ? g_worker_cfg->heartbeat_timeout
+                              : HEARTBEAT_TIMEOUT_SEC;
+            if (difftime(now, scanner_last) > timeout_sec) {
+                log_error("[Worker-%d] Scanner stuck for %ds on %s, reporting to master",
+                          worker_id, timeout_sec, ctx.task_path);
+                /* Report stuck scanner to master via IPC_MSG_ERROR */
+                IpcErrorHeader eh = { ETIMEDOUT, 0 };
+                char stuck_path[4096];
+                pthread_mutex_lock(&ctx.task_mutex);
+                strncpy(stuck_path, ctx.task_path, sizeof(stuck_path) - 1);
+                stuck_path[sizeof(stuck_path) - 1] = '\0';
+                pthread_mutex_unlock(&ctx.task_mutex);
+                uint32_t plen = (uint32_t)strlen(stuck_path);
+                size_t err_total = sizeof(eh) + sizeof(plen) + plen;
+                uint8_t *err_buf = malloc(err_total);
+                if (err_buf) {
+                    memcpy(err_buf, &eh, sizeof(eh));
+                    memcpy(err_buf + sizeof(eh), &plen, sizeof(plen));
+                    memcpy(err_buf + sizeof(eh) + sizeof(plen), stuck_path, plen);
+                    ipc_send(fd_out, IPC_MSG_ERROR, err_buf, (uint32_t)err_total);
+                    free(err_buf);
+                }
+                /* Stop heartbeats so master IPC thread times out and SIGKILLs us */
+                /* (redispatch_current=true will requeue the stuck path) */
+                scanner_timed_out = true;
+            }
         }
     }
 
