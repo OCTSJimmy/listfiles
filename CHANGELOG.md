@@ -22,12 +22,16 @@
 **好处**：
 1. 心跳连续性：即使 Scanner 卡在某个 lstat 上 30 分钟，IPC 线程每 5s 仍发心跳，IPC 线程不会误判 Worker 死亡。
 2. 可响应 STOP：IPC 线程收到 IPC_MSG_STOP 后立即设置 stop_flag、唤醒 Scanner、等待其退出后发送 EXIT。
-3. **Scanner 超时检测**：IPC 线程监控 Scanner 的 `last_progress` 时间戳，若超过 `heartbeat_timeout`（默认 30s，`-t` 参数可调）无进展，则发送 `IPC_MSG_ERROR` 上报 Master 并停止心跳，Master 心跳超时后 SIGKILL 替换 Worker（`redispatch_current=true` 会重发 stuck 路径）。
-4. 双层超时架构：Master 侧心跳超时兜底 + Worker 侧 Scanner 进度超时自报。
+3. **Scanner 超时检测**：IPC 线程监控 Scanner 的 `last_progress` 时间戳，若超过 `heartbeat_timeout`（默认 30s，`-t` 参数可调）无进展，则发送 **`IPC_MSG_DEV_TIMEOUT`** 上报 Master。Master 收到 **`RET_DEV_TIMEOUT`** 后直接按超时逻辑处置：`cleanup_dead_worker_slot(..., true)`（SIGKILL 路径重发）。Worker 无需停止心跳，心跳继续直到 Master 完成替换。
+4. **双层超时架构**：Master 侧心跳超时兜底 + Worker 侧 Scanner 进度超时自报（`DEV_TIMEOUT` 协议）。
 
 #### 修改的文件
 
-- `src/worker_proc.c`（WorkerThreadCtx + worker_scanner_thread + worker_main 多线程重写）
+- `src/worker_proc.c`（WorkerThreadCtx + worker_scanner_thread + worker_main 多线程重写 + Scanner 超时检测）
+- `src/ipc_thread.c`（IPC_MSG_DEV_TIMEOUT 转发为 RET_DEV_TIMEOUT）
+- `src/main_loop.c`（RET_DEV_TIMEOUT 超时逻辑处置）
+- `include/ipc_protocol.h`（IPC_MSG_DEV_TIMEOUT 定义）
+- `include/msg_format.h`（RET_DEV_TIMEOUT 定义）
 - `include/config.h`（版本号 14.0.0）
 
 ---
