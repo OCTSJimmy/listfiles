@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "12.2.0" // 版本号升级
+#define VERSION "15.1.5" // attempts counter bugfix in dispatch loop
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
@@ -193,6 +193,7 @@ typedef struct {
     int batch_size;             // Worker batch 大小，默认 1024
     unsigned long estimated_files; // 预估文件数，用于预分配 HashSet
     int master_threads;         // Master 去重线程数，默认 4
+    int worker_count;           // [新增] Worker 进程数，0 表示自动（默认上限 8）
 } Config;
 
 // 运行时状态

@@ -6,6 +6,639 @@
 
 ## [Unreleased]
 
+## [15.1.5] - 2026-05-17
+
+### 修复
+- `process_completed_batch` 中 Worker 调度循环 `attempts` 计数器未递增，导致所有 Worker 均为 BUSY 时进入无限 `continue` 死循环。
+- `dispatch_lost_tasks` 中相同模式的 `attempts` 计数器未递增，一并修复。
+
+### 背景
+v15.1.4 `/public2` 测试运行 2 分 5 秒后卡死，`perf top` 仍显示 `process_completed_batch` 占 99.72% CPU。
+
+症状：
+- `pending_batches=4`，`pending_tasks=9`
+- 8 个 Worker 全部为 BUSY
+- `Dir rate / File rate / Dequeue = 0.00`
+
+根因：v15.1.0 引入的 `while (attempts < num_workers)` 调度循环中，`attempts` 变量未在 `continue` 路径上递增。当所有 Worker 均为 BUSY（或 DEAD）时，条件永远为真，循环永不退出，CPU 100% 空转。Master 卡死后不处理 ret_queue，Worker FINISH 不被消费，Worker 状态永远 BUSY，形成完美死锁闭环。
+
+### 修复内容
+两处 `continue` 前增加 `attempts++`：
+1. `process_completed_batch` 中的目录 dispatch 循环
+2. `dispatch_lost_tasks` 中的 lost task dispatch 循环
+
+---
+
+## [15.1.4] - 2026-05-17
+
+### 修复
+- `main_loop_handle_batch`：增加 `parsed.count` sanity check（0 ~ 1,000,000），超限则 `log_fatal` 丢弃 batch，防止 corrupted IPC payload 创建超大规模 batch。
+- `batch_dedup_worker`：入口处增加 `batch->count` sanity check，防止线程池 worker 处理 corrupted batch。
+- `process_completed_batch`：入口处增加 `batch->count` sanity check（0 ~ 1,000,000），超限则安全释放并 `atomic_fetch_sub pending_batches`。
+- `process_completed_batch`：循环体内增加 `PROC_ITER_LIMIT = 1,000,000` 硬上限，防止主线程在 batch count corruption 时无限 CPU 空转。
+
+### 背景
+v15.1.3 `/public2` 测试 Master PID 88601 运行 16+ 小时，`perf top` 显示 `process_completed_batch` 占 99.86% CPU。
+症状：
+- `pending_batches=3` 不再下降，`pending_tasks=196`
+- 8 个 Worker 全部空闲（poll / epoll_wait / futex_wait）
+- 无 `log_fatal` 输出，排除 `fp_shard_insert_internal` PROBE_LIMIT 路径
+- Master stack 为 `running`（纯用户态死循环，非 v15.1.2 的 `do_wait`）
+
+根因推断：主线程 `process_completed_batch` 中 `for (int i = 0; i < batch->count; i++)` 的 `batch->count` 被内存 corruption 覆盖为巨大正值（如 `INT_MAX`），导致 `int` 溢出后循环永不终止，或循环体内部 `continue` 路径过轻导致 CPU 空转 16+ 小时。
+
+v15.1.4 通过多层防御（parse 时 → dedup worker 时 → process 时 → loop 内）阻断裂口。
+
+---
+
+### 修复
+- `fp_shard_insert_internal` 开放寻址探测增加 `PROBE_LIMIT = 1,000,000` 硬上限，防止 `shard->capacity` 或 `meta[pos]` 内存 corruption 导致的无限循环死锁
+- `fp_shard_insert_internal` 增加 `shard->capacity` sanity check（>0、<=1<<30、必须为 2 的幂次），扩容时增加 `new_cap` 溢出检查
+- 扩容失败时回滚旧 table，防止内存泄漏和后续 corruption
+
+### 背景
+v15.1.2 在 `/public2` 测试仍卡死，`pending_batches=5` 永远不归零，4 个 thread_pool 工作线程全部 `futex_wait`。根因推断：
+- `batch_dedup_worker` 外层硬超时（10万次迭代）对 `fp_set_insert` 内部死锁无效，因为 `i` 不增加
+- `fp_shard_insert_internal` 的开放寻址探测在 `shard->capacity` 或 `meta[pos]` corruption 时进入无限循环，持有 `shard->mutex` 永不释放
+- 其他 thread_pool 工作线程在 `pthread_mutex_lock(&shard->mutex)` 中死锁
+
+v15.1.3 通过内层循环硬限制和 capacity sanity check 阻断该路径。
+
+---
+
+## [15.1.2] - 2026-05-17
+
+### 修复
+- `batch_dedup_worker` 硬超时检测：外层循环超过 10 万次迭代强制中断，防止 thread_pool 工作线程 CPU 死循环
+- `fp_shard_insert_internal` 开放寻址探测耗尽 capacity 时输出 `log_fatal`（理论上不应到达）
+- 新增 `path_log_mask()`：每级目录保留最后一个字符，其余 `***` 替代，应用于 IPC 线程、主循环、Monitor 的所有路径日志输出
+
+## [15.1.1] - 2026-05-17
+
+### Fixed：补全 Worker 状态机实现（INITIALIZING + startup_timeout + RET_ERROR 恢复 + Monitor 状态显示）
+
+**背景**：v15.1.0 引入 IDLE/BUSY/DEAD 三状态后，与设计文档对比发现 4 项缺失：INITIALIZING 状态、startup_timeout、RET_ERROR 后状态恢复、Monitor 独立 Worker 显示。
+
+**补全内容**：
+1. `WorkerSlot` 增加 `WORKER_STATE_INITIALIZING`（spawn 后未 READY 前）。IPC 线程通过 `spawn_time` 区分 startup_timeout（60s）与常规心跳超时（30s）。
+2. `RET_ERROR`（设备超时/EIO）处理后置 `STATE_IDLE`，避免 Worker 永久冻结。
+3. `RET_READY` 无条件置 `STATE_IDLE`，覆盖 INITIALIZING → IDLE 转换。
+4. Monitor 面板增加 `[Worker States]` 区块，逐 slot 显示 INIT/IDLE/BUSY/DEAD + pid + current_path 截断。
+
+**编译验证**：`make clean && make` 通过，零警告。
+
+---
+
+## [15.1.0] - 2026-05-17
+
+### Fixed：Master 侧 Worker 显式状态机（IDLE/BUSY/DEAD），修复多线程 Worker 任务覆盖导致的全局停摆
+
+**问题根因**：v14+ 引入 Worker 多线程（Scanner 子线程）后，Master 侧调度仍使用纯轮询（`next_dispatch_worker % num_workers`），仅以 `is_alive` 判定 Worker 可用性。一个已在处理任务的 Worker 会被再次选中，新任务通过 `fd_cmd` 管道塞入，Worker 主线程非阻塞读走并覆盖 `task_path`。Scanner 只处理最后一个任务，前面所有任务成为"幽灵任务"——Master 认为已下发（`pending_tasks` 已递增），但永远收不到 `FINISH`。
+
+**根因闭环**：8 个 Worker 全部处于 BUSY（Scanner 阻塞在 `pthread_cond_wait`），Master 仍在发但无 IDLE Worker 可处理。主线程等不到 `FINISH`，`pending_tasks` 不归零，全局停摆。
+
+**修复方案**：`WorkerSlot` 增加 `_Atomic int state` 字段，定义 `IDLE/BUSY/DEAD` 三个显式状态。
+- 调度目录（`process_completed_batch`）和 `dispatch_lost_tasks` 只选择 `STATE_IDLE` 的 Worker，找到后原子置为 `STATE_BUSY` 再发 `CMD_SCAN`。
+- 收到 `RET_FINISH` 后置 `STATE_IDLE`；收到 `RET_READY` 后置 `STATE_IDLE`；`cleanup`/`replace` 后置 `STATE_DEAD`。
+- 若无 IDLE Worker，任务入 `lost_tasks` 等待下一轮。
+
+**编译验证**：`make clean && make` 通过，无警告。
+
+---
+
+## [15.0.4] - 2026-05-17
+
+### Debug：增加 IPC 链路追踪日志，定位 FINISH 消息丢失点
+
+**问题背景**：v15.0.3 修复 Worker 侧阻塞写（`fd_data`/`fd_ctrl` 设为 `O_NONBLOCK` + FINISH 重试）后，扫描 `/public2` 仍卡死，`pending_tasks=477` 不归零，8 个 Worker 全部空闲（poll），无新 FINISH 到达主循环。
+
+**当前状态**：根因尚未完全定位。477 个 FINISH 消息在 IPC 链路中的丢失点未知：可能发生在 Worker→IPC 线程（fd_ctrl）、IPC 线程→ret_queue、ret_queue→主循环中的任一环节。
+
+**新增调试点**
+- `src/ipc_thread.c`：`read_ctrl_message` 的 `IPC_MSG_FINISH` 分支由 `log_debug` 提升为 `log_info`，确保任何 verbose 级别下都能看到 IPC 线程是否收到 FINISH。
+- `src/ipc_thread.c`：`send_return` 成功时增加 `log_info`，追踪 RET_FINISH 是否进入 ret_queue。
+- `src/ipc_thread.c`：`handle_cmd` 的 `CMD_SCAN` 成功路径增加 `log_info`，确认 SCAN 是否被成功发给 Worker。
+- `src/worker_proc.c`：FINISH 发送的 EAGAIN 重试超过 1000 次时打印 `log_warn`。
+
+**目的**：通过下次 `/public2` 测试的日志，精确判断 FINISH 消息在以下哪一环断裂：
+1. Worker 写入 fd_ctrl（无重试/重试耗尽）
+2. IPC 线程从 fd_ctrl 读取（safe_ipc_recv_header 超时/失败）
+3. IPC 线程 send_return 到 ret_queue（队列满/失败）
+4. 主循环 msg_queue_recv 从 ret_queue 取出（head/tail 异常）
+5. 主循环 handle_return_message 处理 RET_FINISH（未命中 case）
+
+---
+
+## [15.0.3] - 2026-05-17
+
+### Bugfix：修复 Worker 侧 `fd_data`/`fd_ctrl` 阻塞写导致的卡死
+
+**问题背景**：v15.0.2 修复计数器后，扫描 `/public2` 时 `pending_tasks=143` 仍卡住 3 分钟不下降，Worker 全部空闲（poll），无 FINISH 到达主循环。
+
+**根因：阻塞写死锁**
+- `worker_pool_spawn()` 中仅设置了 Master 读端（`data_pipe[0]` / `ctrl_pipe[0]`）和 Master 写端（`cmd_pipe[1]`）的 `O_NONBLOCK`。
+- 但 Worker 写端 `data_pipe[1]`（fd_data）和 `ctrl_pipe[1]`（fd_ctrl）仍为**阻塞写**。
+- 当 IPC 线程因 cmd_queue drain + `ipc_send` EAGAIN 重试而延迟 epoll_wait 时，fd_data / fd_ctrl 管道积满。
+- Worker Scanner 线程写 fd_data 阻塞，无法发 FINISH；Worker 主线程 poll fd_cmd 等 SCAN，形成死锁。
+
+**修复**
+- `fork` 前将 `data_pipe[1]` 和 `ctrl_pipe[1]` 设为 `O_NONBLOCK`。
+- Worker 侧 `ipc_send` 在 EAGAIN 时 `usleep(1000)` 重试，不再永久阻塞。
+
+---
+
+## [15.0.2] - 2026-05-16
+
+### Bugfix：修复 `pending_tasks` 计数器逻辑混乱 + `fd_cmd_rd` 保存无效 fd
+
+**问题背景**：v15.0.1 小目录测试正常，但 `/public2` 大目录测试 8 分钟后卡死，`pending_tasks=139` 永远不归零，Worker 全部空闲 poll。
+
+**根因 A：`process_completed_batch` 对每个 BATCH 都减 `pending_tasks`**
+- 单个目录扫描任务可能产生多个 BATCH，导致 `pending_tasks` 被多减。
+- `dispatch_lost_tasks` 重发 SCAN 时**不增加** `pending_tasks`，这些路径完成后 `process_completed_batch` 又减一次，净效果 `pending_tasks` 失真。
+- `RET_FINISH` 处理时**不减** `pending_tasks`，全靠 `cleanup_dead_worker_slot` 减。但正常 FINISH 后 Worker 不退出，cleanup 不调用，`pending_tasks` 永远无法归零。
+
+**根因 B：`worker_pool_spawn` 中 `cmd_pipe[0]` 被提前关闭**
+- `close(cmd_pipe[0])` 在 `slot->fd_cmd_rd = cmd_pipe[0]` 之前执行，保存的是已关闭的 fd 号。
+- `cleanup_dead_worker_slot` 调用 `ipc_drain_and_count_tasks(slot->fd_cmd_rd)` 时，读的是无效 fd，`orphaned` 计数永远是错的。
+
+#### 修复
+- **`src/main_loop.c`**：
+  - `process_completed_batch` 中移除 `atomic_fetch_sub(&ctx->pending_tasks, 1)`，只负责 `pending_batches`。
+  - `dispatch_lost_tasks` 中 `send_scan_to_ipc` 成功后增加 `atomic_fetch_add(&ctx->pending_tasks, 1)`。
+  - `handle_return_message` 的 `RET_FINISH` 分支增加 `atomic_fetch_sub(&ctx->pending_tasks, 1)`。
+  - 主循环每 10s 打印 `pending_tasks` / `pending_batches` / `lost_tasks` 调试点。
+- **`src/worker_proc.c`**：删除 `worker_pool_spawn` 中的 `close(cmd_pipe[0])`，保留读端给 `cleanup_dead_worker_slot` drain 用。
+- **`src/progress.c`**：`pump_pbin_batch` 开头/末尾增加 DEBUG 日志。
+
+#### 修改的文件
+- `src/main_loop.c`（计数器修复 + 调试点）
+- `src/worker_proc.c`（保留 `cmd_pipe[0]`）
+- `src/progress.c`（调试点）
+- `include/config.h`（版本号 15.0.2）
+
+---
+
+## [15.0.1] - 2026-05-16
+
+### Bugfix：修复 `main_loop_run()` 重复调用 `init_ipc_threads()` 导致的卡死 + 配置初始化补全 + 线程安全日志
+
+**问题背景**：v15.0.0 小目录测试时程序仍卡死，`timeout 5` 后 exit code = 124，`pending_tasks` 永远不归零。
+
+**根因 A：`init_ipc_threads()` 被调用了两次**
+- `main.c` 在 `main_loop_run()` 之前已调用 `init_ipc_threads()` 并发送初始 REPLACE。
+- 但 `main_loop_run()` 内部又重复调用 `init_ipc_threads()`，生成第二套完全独立的 IPC 线程和消息队列。
+- Worker 的 BATCH/FINISH 消息发到第一套 `ret_queue`，主循环 drain 的是第二套 `ret_queue`，消息永久丢失，`pending_tasks` 永远不减。
+- 重复发送的 REPLACE 还导致 IPC 线程 `epoll_ctl ADD` 已关闭 fd，触发 `Bad file descriptor`，进而将所有 Worker 标记为 DEAD。
+
+**根因 B：`skip_interval` 未显式初始化**
+- `cmdline.c` 中 `init_config()` 遗漏 `skip_interval = 0`，依赖 `app_context_init()` 的 `memset` 间接置 0，存在未来重构风险。
+
+**根因 C：多线程日志交错**
+- `log.c` 中 `fprintf(stderr)` 无锁保护，IPC 线程与主循环并发写时日志行错乱，干扰排查。
+
+#### 修复
+- **`src/main_loop.c`**：删除 `main_loop_run()` 中的 `init_ipc_threads()` 调用和初始 REPLACE 循环（`main.c` 已负责）。
+- **`src/cmdline.c`**：`init_config()` 中显式设置 `skip_interval = 0`。
+- **`src/log.c`**：所有 `fprintf(stderr)` 调用包裹 `flockfile(stderr)` / `funlockfile(stderr)`，确保多线程日志原子输出。
+
+#### 修改的文件
+- `src/main_loop.c`（删除重复初始化）
+- `src/cmdline.c`（补全 `skip_interval` 初始化）
+- `src/log.c`（线程安全日志锁）
+- `include/config.h`（版本号 15.0.1）
+
+---
+
+## [15.0.0] - 2026-05-16
+
+### 架构重构：三通道分离 + IPC 状态机
+
+**问题背景**：v14.0.x 中 Worker 拆分为 Scanner 线程 + IPC 线程后，两条线程并发写 `fd_out`，引入 `g_fd_out_mutex` 保护。但 mutex 持有者阻塞时（Scanner `write()` 被 pipe 满卡住），IPC 线程卡在 `pthread_mutex_lock` 上，心跳停止。同时多种语义消息（BATCH / HEARTBEAT / ERROR / EXIT / DEV_TIMEOUT）共享同一个 fd，字节交错导致 payload timeout 级联风暴。
+
+**新架构**：每个 Worker 配置三个独立 fd，语义分离：
+- `fd_cmd`：M→W 命令通道（SCAN / STOP）
+- `fd_data`：W→M 数据通道（BATCH 大 payload），Scanner 线程独占
+- `fd_ctrl`：W→M 控制通道（HEARTBEAT / ERROR / EXIT / DEV_TIMEOUT / READY / FINISH），IPC 线程独占
+
+**关键约束**：
+- `fd_data` 只有 Scanner 线程写，`fd_ctrl` 只有 IPC 线程写，永不竞争
+- IPC 线程 epoll 监听 `fd_data + fd_ctrl + cmd_queue eventfd`
+- `fd_ctrl` 消息长度均 < PIPE_BUF（4096），内核保证原子写入
+
+**新增 IPC 消息**：
+- `IPC_MSG_READY`（8）：Worker 初始化完成，进入主循环
+- `IPC_MSG_FINISH`（9）：Scanner 任务完成
+
+**Master 侧 Worker 状态机**：
+- `INITIALIZING` → `IDLE` → `BUSY` → `IDLE` / `DEAD`
+- 启动超时（60s）、心跳超时（30s）、任务超时（-t 参数）分离
+- `RET_READY` 收到前不检测心跳超时
+- `RET_FINISH` 收到后 Worker 回到 IDLE
+
+**修改的文件**：
+- `include/config.h` — 版本号 15.0.0
+- `include/ipc_protocol.h` — IPC_MSG_READY / IPC_MSG_FINISH
+- `include/msg_format.h` — RET_READY / RET_FINISH / CmdReplacePayload 三通道
+- `include/worker_proc.h` — WorkerSlot 三通道结构
+- `include/ipc_thread.h` — IpcThreadCtx 三通道
+- `include/main_loop.h` — send_replace_to_ipc 签名
+- `src/worker_proc.c` — spawn/replace/destroy/stop_all + worker_main 三通道化
+- `src/ipc_thread.c` — epoll 三通道监听 + read_data_message + read_ctrl_message
+- `src/main_loop.c` — handle_return_message READY/FINISH 处理 + 所有 fd 引用更新
+- `src/main.c` — send_replace_to_ipc 调用更新
+
+---
+
+## [14.0.1] - 2026-05-16
+
+### Bugfix：修复 v14.0.0 Worker 多线程 fd_out 竞争写入导致的 payload timeout 回归
+
+**问题背景**：v14.0.0 重构 Worker 为多线程（Scanner 线程 + IPC 线程）后，启动即出现大面积 `[IPC-X] payload timeout`，且 4-5 秒后所有 Worker 同时 timeout，循环往复。主进程卡在 `futex_wait`。
+
+**根因**：Scanner 线程与 IPC 线程**同时往 `fd_out` 写数据，没有互斥**。
+- Scanner 线程：`send_batch()` → `ipc_send(fd_out, IPC_MSG_BATCH, ...)`
+- IPC 线程：心跳 `ipc_send(fd_out, IPC_MSG_HEARTBEAT, ...)`
+- 两条线程并发 `write(fd_out)`，内核调度下消息字节交错：
+  - IPC 线程的 HEARTBEAT header（8 bytes）插入到 Scanner 线程的 BATCH header 和 BATCH payload 之间
+  - Master IPC 线程读到一个 BATCH header（payload_len=1197），但 pipe 里接下来只有 16 字节的 HEARTBEAT 数据，不够 1197
+  - `safe_ipc_recv_payload(100ms)` 超时 → `payload timeout`
+- 残留的 BATCH payload 字节留在 pipe 中，下一轮被当成新的 Header 解析 → garbage header → 连续 timeout
+- 8 个 Worker 同时触发，形成级联 payload timeout 风暴
+
+**修复**：
+- 新增 `static pthread_mutex_t g_fd_out_mutex = PTHREAD_MUTEX_INITIALIZER`
+- 所有往 `fd_out` 的 `ipc_send` 调用加锁保护：
+  - `send_batch()`
+  - `send_error_and_empty_batch()`
+  - IPC 线程的心跳发送
+  - `IPC_MSG_DEV_TIMEOUT` 上报
+  - `IPC_MSG_EXIT` 发送
+- 确保同一时刻只有一个线程向 `fd_out` 写数据，协议不再错乱。
+
+#### 修改的文件
+
+- `src/worker_proc.c`（g_fd_out_mutex + 所有 fd_out 写入点加锁）
+- `include/config.h`（版本号 14.0.1）
+
+---
+
+## [14.0.0] - 2026-05-16
+
+### 架构重构：Worker 多线程化（IPC 线程 + Scanner 线程分离）
+
+**问题背景**：v13.x 中 Worker 是单线程线性设计：阻塞读 fd_in → 阻塞扫描（readdir/lstat 可能卡住很久）→ 发 BATCH → 循环。扫描期间既不响应 STOP、也不发心跳，NFS 卡死时只能等 IPC 线程心跳超时后 SIGKILL。
+
+**新架构**：Worker 进程内部拆分为两条线程：
+- **Scanner 线程**：专职执行 readdir/lstat 等阻塞 IO，调用 `scan_and_send()` 直接写 fd_out（阻塞）。
+- **IPC 线程（主线程）**：专职维护与 Master 的通信。fd_in 设为非阻塞，通过 `poll(5s)` 循环同时处理读任务、发心跳、响应 STOP。Scanner 卡住不影响心跳节拍。
+
+**好处**：
+1. 心跳连续性：即使 Scanner 卡在某个 lstat 上 30 分钟，IPC 线程每 5s 仍发心跳，IPC 线程不会误判 Worker 死亡。
+2. 可响应 STOP：IPC 线程收到 IPC_MSG_STOP 后立即设置 stop_flag、唤醒 Scanner、等待其退出后发送 EXIT。
+3. **Scanner 超时检测**：IPC 线程监控 Scanner 的 `last_progress` 时间戳，若超过 `heartbeat_timeout`（默认 30s，`-t` 参数可调）无进展，则发送 **`IPC_MSG_DEV_TIMEOUT`** 上报 Master。Master 收到 **`RET_DEV_TIMEOUT`** 后直接按超时逻辑处置：`cleanup_dead_worker_slot(..., true)`（SIGKILL 路径重发）。Worker 无需停止心跳，心跳继续直到 Master 完成替换。
+4. **双层超时架构**：Master 侧心跳超时兜底 + Worker 侧 Scanner 进度超时自报（`DEV_TIMEOUT` 协议）。
+
+#### 修改的文件
+
+- `src/worker_proc.c`（WorkerThreadCtx + worker_scanner_thread + worker_main 多线程重写 + Scanner 超时检测）
+- `src/ipc_thread.c`（IPC_MSG_DEV_TIMEOUT 转发为 RET_DEV_TIMEOUT）
+- `src/main_loop.c`（RET_DEV_TIMEOUT 超时逻辑处置）
+- `include/ipc_protocol.h`（IPC_MSG_DEV_TIMEOUT 定义）
+- `include/msg_format.h`（RET_DEV_TIMEOUT 定义）
+- `include/config.h`（版本号 14.0.0）
+
+---
+
+## [13.0.3] - 2026-05-16
+
+### Bugfix：修复 Worker 写端非阻塞导致的 payload timeout 竞态
+
+**问题背景**：v13.0.2 运行时启动即出现 `[IPC-0] payload timeout (len=1197)`，IPC 线程读到 Header 后 100ms 内等不齐 payload。
+
+**根因**：`worker_pool_spawn()` 中 `out_pipe`（Worker → Master）被 `pipe2(O_NONBLOCK)` 设为非阻塞。Worker 写 BATCH 时，`write()` 可能部分写入后遇 `EAGAIN`；v13.0.2 的 `ipc_send()` retry 逻辑（`usleep(1ms)`）让 Worker 反复尝试。但 IPC 线程通过 epoll 已检测到 `fd_out` 可读，读取 Header 后 `poll_payload(100ms)` 等待剩余 payload，形成竞态——Worker 还没写完，IPC 线程已超时。
+
+**修复**：
+- `worker_pool_spawn()`：`out_pipe` 创建时不再带 `O_NONBLOCK`。
+- Worker 写端 `out_pipe[1]` 恢复阻塞模式，`ipc_send()` 的 `write()` 会一次性写完或阻塞到写完，不会出现 Header 到了 payload 没到的情况。
+- Master 读端 `out_pipe[0]` 显式加 `O_NONBLOCK`，保持 IPC 线程 epoll 响应性。
+
+#### 修改的文件
+
+- `src/worker_proc.c`（`worker_pool_spawn` out_pipe 阻塞化 + 读端单独加 O_NONBLOCK）
+- `include/config.h`（版本号 13.0.3）
+
+---
+
+## [13.0.2] - 2026-05-16
+
+### Bugfix：修复 double free / fd 生命周期混乱 + 重复 RET_DEAD + ipc_send 部分写入协议不同步
+
+**问题背景**：v13.0.1 运行时出现 `double free or corruption (fasttop)` 崩溃，发生在所有 8 个 Worker 同时 heartbeat timeout 被 SIGKILL 之后、主线程继续输出切片切换阶段。
+
+**根因 A：fd_in double close**
+- `worker_mark_dead()`（IPC 线程）与 `cleanup_dead_worker_slot()`（主线程）各自 `close(slot->fd_in)`。
+- `send_replace_to_ipc()` 将 `slot->fd_in` 直接赋值给 `ctx->fd_in`，二者**共享同一个内核 fd 号**，没有 `dup`。
+- IPC 线程先 close → fd 号释放 → async_writer 打开新切片文件时复用该 fd 号 → 主线程再次 close → 意外关闭 async_writer 的合法文件描述符 → `FILE*` 内部缓冲区指针被 double free。
+
+**根因 B：延迟/重复 RET_DEAD 清理新 Worker**
+- `worker_mark_dead()` 未将 `ctx->pid` 设为 `-1`，导致 heartbeat timeout check 可能再次触发，发送第二个 RET_DEAD。
+- 主线程收到第一个 RET_DEAD 后 spawn 新 Worker、重置 `cleanup_done`、发送 REPLACE。
+- 第二个延迟的 RET_DEAD 到达时，`cleanup_dead_worker_slot()` 因 `cleanup_done` 已重置，错误地再次清理新 Worker，关闭其 fd、释放其 backlog、扣减 pending_tasks。
+
+**根因 C：ipc_send 部分写入后 EAGAIN 导致协议不同步**
+- v13.0.1 将 `ipc_send()` 改为单次 `write()`，但对大于 `PIPE_BUF` 的 BATCH 消息，`write()` 可能部分写入后下一次返回 `EAGAIN`。
+- 此时函数返回 `-2`，但 pipe 中已残留不完整数据，再次调用时追加新消息，IPC 线程解析错乱。
+
+#### 修复
+
+- **`ipc_thread.c: worker_mark_dead()`**：
+  - 增加 `ctx->pid = -1;`，彻底阻止重复 heartbeat timeout 和重复 RET_DEAD。
+- **`main_loop.c: cleanup_dead_worker_slot()`**：
+  - 不再 `close(slot->fd_in)`，只设为 `-1`（IPC 线程已负责关闭）。
+- **`main_loop.c: handle_return_message()` (RET_DEAD)**：
+  - 增加 guard：`if (is_alive && pid != -1) break;`，忽略 REPLACE 之后才到达的延迟 RET_DEAD。
+- **`worker_proc.c: ipc_send()`**：
+  - 如果 `written > 0` 时遇到 `EAGAIN`，不再返回 `-2`，而是 `usleep(1ms)` 后继续重试，避免 pipe 中残留不完整数据。
+
+#### 修改的文件
+
+- `src/ipc_thread.c`（`worker_mark_dead` 设 pid=-1）
+- `src/main_loop.c`（`cleanup_dead_worker_slot` 不再 close fd_in + RET_DEAD guard）
+- `src/worker_proc.c`（`ipc_send` 部分写入 retry）
+- `include/config.h`（版本号 13.0.2）
+
+---
+
+## [13.0.1] - 2026-05-15
+
+### Bugfix：IPC 协议失步 + 栈值污染/历史块数异常 + archive 无限循环防呆
+
+**问题背景**：v13.0.0 重构后的首次运行时出现两个独立阻断性问题：
+1. `[IPC-0] payload timeout (len=42)` — 启动即死，IPC 线程在 fd_out 上读到孤悬 Header 后 poll payload 超时。
+2. `无索引文件，历史块数 140734670153448` — `total_blocks` 打印出异常大值（`0x7FFF5805A6E8`，x86_64 栈地址特征），导致恢复逻辑走入错误分支。
+
+**根因 A：IPC 协议 Header/Payload 断裂**
+- `ipc_send()` 分两次 `write()`（先 8 字节 Header，再 payload）。
+- 第二次 `write()` 遇 `EAGAIN` 时，第一次的 Header 已留在 pipe 中。函数返回 `-2`，调用方重试时重新发送 Header + payload。
+- 结果：pipe 中出现多个孤悬 Header。IPC 线程读到第一个 Header 后等待 payload，永远等不到。
+
+**根因 B：`total_blocks` 栈值污染 / `va_list` 传递异常**
+- `count_archive_blocks()` 与 `count_pbin_slices()` 均显式初始化为 0，返回值理论上为 0。
+- `0x7FFF5805A6E8` 是 x86_64 下未初始化栈内存 / `va_list` 因编译器优化/ABI 边界传递异常时读取到的栈残留值。
+- 非野指针，是栈值污染。`verbose_printf` → `log_vraw` → `vfprintf` 的 `va_list` 跨编译单元传递在特定栈布局下可能读取错误位置。
+
+**根因 C：`compressed_size == 0` 未防呆**
+- `count_archive_blocks()` 中若 `.archive` 文件损坏且 `bh.compressed_size == 0`，`fseek` 不移动，`fread` 原地重复读取同一 Header，`count` 无限增加。
+- 虽然单秒内不可能达到 `140734670153448`，但作为防御性修复必须堵住。
+
+#### 修复
+
+- **`ipc_send()` 合并为单次原子写入**：
+  - 分配 `sizeof(IpcMessageHeader) + payload_len` 连续缓冲区，一次 `write()` 发送全部数据。
+  - 对 SCAN 等小消息（<< `PIPE_BUF=4096`）天然原子，彻底消除 Header 孤悬问题。
+- **`count_archive_blocks()` 增加 `compressed_size == 0` 检查**：
+  - `bh.compressed_size == 0 || bh.compressed_size > 512MB` 时 `break`，防止无限循环。
+- **`restore_progress()` 增加 `total_blocks` sanity check**：
+  - 若 `total_blocks > 1000000000UL`，打印警告并强制置为 0，防止异常值触发错误的全量重扫分支。
+- **`verbose_printf` / `log_vraw` 添加 `__attribute__((noinline))`**：
+  - 防止编译器内联导致 `va_start` / `va_copy` 的寄存器保存区布局异常，确保 `va_list` 跨编译单元传递的 ABI 稳定性。
+
+#### 修改的文件
+
+- `src/worker_proc.c`（`ipc_send()` 合并写入）
+- `src/progress.c`（`count_archive_blocks` 防呆 + `total_blocks` sanity check）
+- `src/utils.c`（`verbose_printf` noinline）
+- `src/log.c`（`log_vraw` noinline）
+- `include/config.h`（版本号 13.0.1）
+
+---
+
+## [13.0.0] - 2026-05-15
+
+### 架构重构：IPC 线程隔离（v13.0.0）
+
+**问题背景**：v12.x 架构中，Master 主线程通过单线程 epoll 统一监听所有 8 个 Worker 的 fd_out。一个 Worker 的 fd 出问题（heartbeat 超时、D-State 卡死、fd 号重用竞争）会导致 epoll 反复返回 EPOLLERR|EPOLLHUP，污染整个 Master 事件循环，造成 Monitor 秒表冻结、CPU 空转、所有 Worker 假死。v12.2.15 修复了 cleanup_done 和日志问题，但单线程 epoll 的架构瓶颈仍然存在。
+
+**新架构核心**：
+- **8 个 IPC 线程常驻**，生命周期与 Master 进程相同。每个 IPC 线程管理一个 Worker 的非阻塞 epoll + 心跳检测 + SIGKILL。
+- **主线程 = 纯消息总线**，不再直接操作任何 fd、不再 epoll、不再 read/write。只负责：收消息（从 8 个返回队列轮询）、处理消息（BATCH 去重写文件、DEAD 收尾替换、ERROR 记日志）、发消息（SCAN 任务分发给 IPC 线程）。
+- **故障隔离**：一个 Worker 的 fd 出问题 → 只污染它自己的 IPC 线程 → IPC 线程发 DEAD 消息 → 主线程收到后优雅替换 Worker → 其他 7 路完全不受影响。
+
+#### 消息队列
+
+- **eventfd + 无锁环形队列**（64 位原子 CAS head/tail）。
+- 默认容量 1024 条消息/队列，有界设计天然实现背压。
+- 生产者（主线程/IPC 线程）：CAS 写尾指针 → 写入数据 → 写 eventfd 通知。
+- 消费者：读 eventfd → CAS 读头指针 → 读取数据。
+- 零 mutex、零上下文切换开销、支持 64 位原子操作。
+
+#### 消息格式
+
+- **命令（主线程 → IPC 线程）**：
+  - `CMD_SCAN`：发送 SCAN 任务路径给 Worker。
+  - `CMD_REPLACE`：替换 Worker fd/pid（Worker 死亡后主线程 spawn 新 Worker，发此命令让 IPC 线程换新 fd）。
+  - `CMD_STOP`：停止 IPC 线程。
+- **返回（IPC 线程 → 主线程）**：
+  - `RET_BATCH`：Worker 返回的扫描结果批次。
+  - `RET_HEARTBEAT`：Worker 心跳（用于 Monitor 面板显示）。
+  - `RET_ERROR`：Worker 遇到的设备级错误（ETIMEDOUT/EIO）。
+  - `RET_DEAD`：Worker 死亡（heartbeat 超时或 epoll error/hup）。
+  - `RET_EXIT`：Worker 正常退出。
+
+#### IPC 线程内部循环
+
+```
+while (running) {
+    // 1. 从主线程消息队列取命令（非阻塞 drain）
+    // 2. epoll_wait(fd_out + cmd_queue eventfd, 500ms)
+    // 3. 处理 fd_out 事件（非阻塞 read → 解析 BATCH/HEARTBEAT/ERROR/EXIT）
+    // 4. 心跳检测：超时 → SIGKILL Worker → 发 RET_DEAD → 等待 REPLACE
+}
+```
+
+- 每个 IPC 线程有自己的小 epoll（2 个 fd：fd_out + cmd_queue eventfd）。
+- fd 均为 O_NONBLOCK，read 采用 poll(100ms) 超时保护。
+- Worker 死亡后 IPC 线程自己 close fd、epoll DEL，不需要主线程介入 cleanup。
+
+#### 主线程消息总线循环
+
+```
+while (running) {
+    // 1. bus_epoll_wait(500ms) 监听所有 ret_queue eventfd + 线程池 event_fd
+    // 2. 处理返回消息（BATCH → 线程池去重；DEAD → 替换 Worker；ERROR → 设备熔断）
+    // 3. drain_completed_batches（线程池完成通知）
+    // 4. 泵送历史 pbin 目录
+    // 5. 收割僵尸进程
+    // 6. 替换死亡 Worker（spawn → send REPLACE）
+    // 7. dispatch_lost_tasks（通过 cmd_queue 发 CMD_SCAN）
+    // 8. 终止条件检查
+}
+```
+
+#### Monitor 线程精简
+
+- **删除 `check_workers_health`**：Worker 心跳超时检测完全下沉到 IPC 线程。
+- **保留职责**：进度面板输出（秒表、速率、Worker 状态）、敢死队探测调度、探测进程收割。
+- Monitor 不再直接操作 Worker fd 或发送 SIGKILL。
+
+#### 新增文件
+
+- `include/msg_format.h` — 消息格式定义（CMD/RET 类型、Payload 结构体）。
+- `include/msg_queue.h` — 无锁环形队列 API（eventfd 通知、CAS head/tail）。
+- `src/msg_queue.c` — 无锁队列实现（64 位原子操作、select-based recv_wait）。
+- `include/ipc_thread.h` — IPC 线程上下文和生命周期 API。
+- `src/ipc_thread.c` — IPC 线程主循环（独立 epoll、心跳检测、消息处理）。
+
+#### 修改的文件
+
+- `include/app_context.h` — 添加 IPC 线程数组、消息队列指针、主线程 cond/mutex。
+- `include/config.h` — `VERSION "13.0.0"`。
+- `include/main_loop.h` — 暴露 IPC 线程生命周期 API（init_ipc_threads、destroy_ipc_threads、send_replace_to_ipc）。
+- `src/main_loop.c` — **重写**：从单线程 epoll 驱动改为消息总线驱动。保留 BATCH 去重、lost_tasks 派发、Worker 替换、设备熔断、历史 pbin 泵送等所有现有功能。
+- `src/main.c` — 初始化 IPC 线程、发送初始 REPLACE、根任务改为通过 cmd_queue 发送 CMD_SCAN。
+- `src/monitor.c` — 删除 Worker 心跳超时检测，保留进度面板和敢死队探测。
+- `Makefile` — 自动包含新源文件（msg_queue.c、ipc_thread.c）。
+
+---
+
+### 紧急修复：v12.2.15 cleanup_done 未重置 + 日志系统 + dispatch 轮询缺陷（P0 阻断性）
+
+**问题背景**：v12.2.14 修复了数据竞争，但运行在生产环境（/public2，300万+文件）时仍然出现 Monitor 秒表冻结、所有 Worker 阻塞在 `pipe_wait`、主进程 throughput 归零的现象。`errlogs.err` 中 `[Epoll] Worker 1 fd error/hup` 重复 54万+次，`active=8->7` 始终不变。
+
+**根因 A：cleanup_done 未重置（核心）**
+- 当 Worker 超时死亡后，`cleanup_dead_worker_slot()` 通过 `atomic_flag_test_and_set()` 设置 `cleanup_done = true`。
+- 随后 `worker_pool_replace()` → `worker_pool_spawn()` 创建新 Worker，但**未重置 `cleanup_done`**。
+- 新 Worker 若再次死亡（或 epoll 报告残留事件），cleanup 因 `cleanup_done = true` 直接 return，不关闭 fd、不从 epoll 移除。
+- fd 持续打开 → epoll 每次 `epoll_wait` 都返回 `EPOLLERR|EPOLLHUP` → 54万+次重复日志，CPU 空转。
+
+**根因 B：dispatch_lost_tasks 轮询缺陷**
+- `dispatch_lost_tasks()` 中 `ipc_send()` 返回 `EAGAIN(-2)` 时直接 `break`，仅尝试了一个 Worker 就放弃。
+- 若轮询恰好选到 fd_in 满的 Worker，所有 `lost_tasks` 都发不出去，其他空闲 Worker 永远收不到任务。
+
+**根因 C：日志无时间戳，无法定位故障时刻**
+- 大量 `fprintf(stderr, ...)` 分散在各文件中，格式不统一，无时间戳，无法从日志推断卡死发生时刻。
+- 调试日志与错误日志混为一谈，verbose 开关无法精细控制。
+
+#### 修复
+
+- **worker_pool_spawn 重置 cleanup_done**：`atomic_flag_clear(&slot->cleanup_done)`，确保新 Worker 可被正常清理。
+- **dispatch_lost_tasks 不 break**：`EAGAIN` 时 `push back + continue`，轮询尝试下一个 Worker，直到所有 Worker 都试过或成功发送。
+- **统一日志模块 `log.c / log.h`**：
+  - 所有 `fprintf(stderr, ...)` 替换为 `log_fatal / log_error / log_warn / log_info / log_debug / log_trace`。
+  - 自动添加 `[YYYY-MM-DD HH:MM:SS] [LEVEL]` 前缀。
+  - 日志固定输出到 stderr，不污染 stdout。
+  - `verbose` 和 `verbose_level` 控制 DEBUG/TRACE 级别日志的显示。
+- **保留 FATAL/ERROR/WARN 始终输出**：不受 verbose 开关影响，确保错误信息始终可见。
+
+#### 新增文件
+
+- `src/log.c`
+- `include/log.h`
+
+#### 修改的文件
+
+- `src/worker_proc.c`（cleanup_done 重置 + 日志替换 + log.h 包含）
+- `src/main_loop.c`（dispatch break 修复 + 全部日志替换 + log.h 包含）
+- `src/monitor.c`（日志替换 + log.h 包含）
+- `src/main.c`（日志替换 + log_init 调用 + log.h 包含）
+- `src/cmdline.c`（日志替换 + log.h 包含）
+- `src/output.c`（日志替换 + log.h 包含）
+- `src/progress.c`（日志替换 + log.h 包含）
+- `src/device_manager.c`（日志替换 + log.h 包含）
+- `src/thread_pool.c`（日志替换 + log.h 包含）
+- `src/lost_tasks.c`（日志替换 + log.h 包含）
+- `src/utils.c`（日志替换 + log.h 包含）
+- `include/config.h`（版本号 12.2.15）
+
+---
+
+### 紧急修复：v12.2.14 LostTasksQueue 封装 + 原子化 is_alive/last_heartbeat
+
+**根因**：v12.2.13 的 scattered `lost_tasks[]/count/capacity/mutex` 方案，锁操作分散在调用方，容易遗漏。
+
+#### 修复
+
+- `lost_tasks` 封装为独立 `LostTasksQueue` 模块，所有锁操作隐藏在 `lost_tasks.c` 内部。
+- `is_alive` → `_Atomic bool`，`last_heartbeat` → `_Atomic time_t`。
+- `cleanup_dead_worker_slot` 新增 `redispatch_current` 参数，Worker 超时死亡时自动将 `current_path` 压入 `lost_tasks`。
+
+#### 修改的文件
+
+- `src/lost_tasks.c` / `include/lost_tasks.h`
+- `src/main_loop.c`
+- `src/worker_proc.c` / `include/worker_proc.h`
+- `include/app_context.h`
+
+---
+
+### 紧急修复：v12.2.13 active_count / lost_tasks 数据竞争（P0 阻断性）
+
+**问题背景**：Monitor 线程与 Main 线程并发访问 `active_count`（plain `int`）和 `lost_tasks[]`（无锁数组），导致数据竞争。在长期运行后可能引发计数器漂移、任务丢失或重复释放。
+
+#### 修复
+
+- `active_count` → `_Atomic int`，所有读写点使用 `atomic_load`/`atomic_fetch_add`/`atomic_fetch_sub`/`atomic_store`。
+- `lost_tasks` 增加 `pthread_mutex_t` 保护，Monitor 写和 Main 读全部被 mutex 包围。
+- `pending_tasks` 幽灵化泄漏：3 处 `atomic_fetch_sub` 修复（ipc_send 返回 -1 时）。
+
+#### 修改的文件
+
+- `src/worker_proc.c` / `include/worker_proc.h`
+- `src/main_loop.c`
+- `include/app_context.h`
+- `src/main.c`
+
+---
+
+### 紧急修复：poll 超时替代阻塞 read，彻底消除 Master hang 死（P0 阻断性）
+
+**问题背景**：v12.2.9 恢复 `fd_out` 的 `O_NONBLOCK` 后，strace 确认标志已生效，但 Master 仍然阻塞在 `pipe_read`。根本原因是：即使 `O_NONBLOCK` 设置正确，当 Worker 写了一半 header 后死亡（或处于特定竞态），Master 的 `ipc_recv_header()` 循环会在 `read()` 上等待剩余字节，导致 epoll 循环停滞，所有 Worker 的 `pipe_write` 因缓冲区满而阻塞。
+
+**v12.2.10 修复**（poll 超时）：
+- 新增 `safe_ipc_recv_header()` 和 `safe_ipc_recv_payload()`：在 `read()` 前先执行 `poll(fd, POLLIN, 100ms)` 超时检查。
+- 超时返回 `-2`，主循环 `continue` 安全跳过，不阻塞、不触发 cleanup，等待下一轮 epoll。
+- `payload` 接收也带 poll 超时，防止部分数据到达后永远等待剩余字节。
+- 保留 v12.2.9 的所有修复（`O_NONBLOCK`、`EPOLLERR|EPOLLHUP`、`EAGAIN` 处理、`pending_tasks` 泄漏修复），poll 超时作为第二道防线。
+
+**v12.2.11 修复**（O_NONBLOCK 原生创建）：
+- `pipe2(out_pipe, O_CLOEXEC | O_NONBLOCK)`：out_pipe 在创建时就自带 `O_NONBLOCK`，读写两端出生即非阻塞，彻底消除 `fcntl(F_SETFL)` 可能失败或不可靠的问题。
+- 移除 `worker_pool_spawn()` 中对 `out_pipe[0]` 的冗余 `fcntl` 调用。
+- `fcntl(in_pipe[1])` 增加错误检查，失败时输出警告日志。
+
+#### 修改的文件
+
+- `src/main_loop.c`
+- `src/worker_proc.c`
+- `include/worker_proc.h`
+- `include/main_loop.h`
+- `include/config.h`
+
+---
+
+### 紧急修复：主循环 fd 号重用竞争死锁（P0 阻断性）
+
+**问题背景**：v12.2.2 为修复 "worker epoll busy-loop"，移除了 master 读 fd_out 的 `O_NONBLOCK`。当 Worker 超时死亡后，cleanup 关闭 fd_out，但 epoll 上一轮返回的 events 数组中仍包含该 fd 的 `EPOLLIN` 残留事件。主循环处理该残留事件时调用阻塞 `read(fd_out)`，恰好新 Worker spawn 重用了相同 fd 号且尚未写数据，master 永久阻塞在 `pipe_wait` → 主循环 hang 死 → 所有 Worker 空等 → 完美死锁。
+
+**症状**：Monitor 秒表冻结，pbin/scan_dir.log/输出不再更新，进程 hang 死数小时。
+
+#### 修复
+
+- **恢复 fd_out 的 O_NONBLOCK**：`worker_pool_spawn()` 中给 `out_pipe[0]`（master 读端）重新设置 `O_NONBLOCK`，消除阻塞读死锁。
+- **ipc_recv_header 处理 EAGAIN**：返回 `-2`（`EAGAIN`/`EWOULDBLOCK`）而非 `-1`，允许调用方区分"暂时无数据"与"致命错误"。
+- **epoll 注册 EPOLLERR|EPOLLHUP**：事件循环中优先处理 Worker 死亡事件，避免在残留事件上尝试读取。
+- **EAGAIN 安全跳过**：主循环中 `ipc_recv_header` 返回 `-2` 时直接 `continue`，不触发 `cleanup_dead_worker_slot`，防止误杀新 Worker。
+- **ipc_send 失败时防幽灵化**：`process_completed_batch()` 和 `dispatch_lost_tasks()`、`flush_worker_backlogs()` 中 `rc == -1`（管道破裂）时递减 `pending_tasks` 并将路径加入 `lost_tasks` 重试队列，避免任务永久丢失导致 `pending_tasks` 不归零。
+- **根任务发送失败 fatal**：`main.c` 中根任务 `ipc_send` 失败时打印致命错误并立即退出，防止无任务可执行的空转。
+
+#### 修改的文件
+
+- `src/worker_proc.c`
+- `src/main_loop.c`
+- `src/main.c`
+
+---
+
 ### 紧急修复：双向管道死锁（P0 阻断性）
 
 **问题背景**：Master 与 Worker 通过 `pipe2(O_CLOEXEC)` 双向通信。`ipc_send()` 使用阻塞 `write()`，当 Worker 的 `fd_in` 管道缓冲区（默认 64KB）被 >580 个 SCAN 任务填满时，Master 阻塞在 `write(fd_in)`。与此同时，Worker 可能正在发送大 BATCH 并阻塞在 `write(fd_out)`。双方互相等待，形成**永久死锁**。

@@ -1,3 +1,11 @@
+/**
+ * @file cmdline.c
+ * @brief 命令行参数解析与配置初始化模块
+ *
+ * 负责解析用户传入的命令行选项，填充 Config 结构体，并进行基础合法性校验。
+ * 支持 GNU getopt_long 长/短选项，提供 --help 和 --version 的快速响应。
+ * 所有字符串型配置项均通过 strdup 动态分配，生命周期由 main 函数统一释放。
+ */
 #include "cmdline.h"
 #include "utils.h"
 #include "output.h"
@@ -7,11 +15,23 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "log.h"
 
+/**
+ * @brief  打印程序版本号到标准输出
+ * @return void
+ */
 void show_version() {
     printf("listfiles 版本 %s\n", VERSION);
 }
 
+/**
+ * @brief  打印程序帮助信息到标准输出
+ * @return void
+ *
+ * @note   包含所有支持的命令行选项说明、默认值以及格式说明符参考。
+ *         在 parse_arguments 中遇到 -h/--help 或参数错误时自动调用。
+ */
 void show_help() {
     printf("\n文件列表器 %s\n", VERSION);
     printf("递归列出文件及其元数据, 支持智能断点续传与半增量扫描\n\n");
@@ -25,6 +45,7 @@ void show_help() {
     printf("      --batch-size=数量  Worker batch 大小 (默认: %d)\n", DEFAULT_BATCH_SIZE);
     printf("      --estimated-files=数量 预估文件数,用于预分配内存 (默认: %u)\n", (unsigned)DEFAULT_ESTIMATED_FILES);
     printf("      --master-threads=数量  Master 去重线程数 (默认: %d)\n", DEFAULT_MASTER_THREADS);
+    printf("      --worker-count=数量  Worker 进程数 (默认: 自动, 上限 8)\n");
     printf("  -t, --timeout=秒       心跳超时时间 (默认: %d)\n", HEARTBEAT_TIMEOUT_SEC);
     printf("\n输出控制:\n");
     printf("  -f, --progress-file=文件 进度文件/历史记录前缀 (默认: progress)\n");
@@ -48,6 +69,15 @@ void show_help() {
     printf("  -h, --help             显示此帮助信息\n");
 }
 
+/**
+ * @brief  初始化配置结构体为默认值
+ * @param  cfg  Config*  指向要初始化的配置结构体的指针，不能为空
+ * @return void
+ *
+ * @note   所有指针型字段初始为 NULL 或由 strdup 分配默认字符串。
+ *         数值型字段采用编译期宏定义的默认值（如 DEFAULT_BATCH_SIZE、DEFAULT_MASTER_THREADS 等）。
+ *         调用本函数后，cfg 可直接传入 parse_arguments 进行覆盖更新。
+ */
 void init_config(Config *cfg) {
     memset(cfg, 0, sizeof(Config));
     cfg->progress_base = strdup("progress");
@@ -74,8 +104,22 @@ void init_config(Config *cfg) {
     cfg->batch_size = DEFAULT_BATCH_SIZE;
     cfg->estimated_files = DEFAULT_ESTIMATED_FILES;
     cfg->master_threads = DEFAULT_MASTER_THREADS;
+    cfg->worker_count = 0;
+    cfg->skip_interval = 0;
 }
 
+/**
+ * @brief  解析命令行参数并填充 Config 结构体
+ * @param  argc  int      命令行参数个数，取值范围: >= 1（argv[0] 为程序名）
+ * @param  argv  char**   命令行参数字符串数组，不能为空
+ * @param  cfg   Config*  指向要填充的配置结构体的指针，不能为空；调用前应先执行 init_config
+ * @return int   返回 0 表示解析成功；返回 2 表示遇到 --help 或 --version（已输出信息，应正常退出）；
+ *               返回 -1 表示参数错误（已输出错误信息，应异常退出）
+ *
+ * @note   本函数会对目标路径做 stat 校验（必须存在且为目录、普通文件或符号链接）。
+ *         互斥选项校验：-o 与 -O 不能同时使用；-Z 与 -C 不能同时使用。
+ *         若指定了 --format，解析结束后会自动调用 precompile_format 进行格式预编译。
+ */
 int parse_arguments(int argc, char *argv[], Config *cfg) {
     static struct option long_options[] = {
         {"path", required_argument, 0, 'p'},
@@ -112,6 +156,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"batch-size", required_argument, 0, 23},
         {"estimated-files", required_argument, 0, 24},
         {"master-threads", required_argument, 0, 25},
+        {"worker-count", required_argument, 0, 26},
         {"timeout", required_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         {0, 0, 0, 0}
@@ -136,7 +181,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 7:
                 cfg->output_slice_lines = atol(optarg);
                 if (cfg->output_slice_lines <= 0) {
-                    fprintf(stderr, "错误: 分片大小必须大于零\n");
+                    log_error("分片大小必须大于零");
                     exit(EXIT_FAILURE);
                 }
                 break;
@@ -146,7 +191,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
                 } else if (strcmp(optarg, "versioned") == 0 || strcmp(optarg, "1") == 0) {
                     cfg->verbose_type = VERBOSE_TYPE_VERSIONED;
                 } else {
-                    fprintf(stderr, "无效的verbose类型: %s, 使用默认值\n", optarg);
+                    log_warn("无效的verbose类型: %s, 使用默认值", optarg);
                 }
                 break;
             case 9:
@@ -194,44 +239,48 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
                 cfg->master_threads = atoi(optarg);
                 if (cfg->master_threads < 1) cfg->master_threads = DEFAULT_MASTER_THREADS;
                 break;
+            case 26:
+                cfg->worker_count = atoi(optarg);
+                if (cfg->worker_count < 1) cfg->worker_count = 0;
+                break;
             case 't':
                 cfg->heartbeat_timeout = atol(optarg);
                 if (cfg->heartbeat_timeout <= 0) {
-                    fprintf(stderr, "Error: Timeout must be positive.\n");
+                    log_error("Timeout must be positive.");
                     exit(EXIT_FAILURE);
                 }
                 break;
             case 'h': show_help(); return 2;
             default:
-                fprintf(stderr, "错误: 未知选项\n");
+                log_error("未知选项");
                 show_help();
                 return -1;
         }
     }
 
     if (!cfg->target_path) {
-        fprintf(stderr, "错误: 必须指定目标路径\n");
+        log_error("必须指定目标路径");
         show_help();
         return -1;
     }
 
     struct stat path_stat;
     if (stat(cfg->target_path, &path_stat) != 0) {
-        fprintf(stderr, "错误: 无法访问目标路径: %s\n", cfg->target_path);
+        log_error("无法访问目标路径: %s", cfg->target_path);
         return -1;
     }
     if (!S_ISDIR(path_stat.st_mode) && !S_ISREG(path_stat.st_mode) && !(S_ISLNK(path_stat.st_mode) && cfg->follow_symlinks)) {
-        fprintf(stderr, "错误: 无效的目标路径: %s (必须是目录、普通文件或符号链接)\n", cfg->target_path);
+        log_error("无效的目标路径: %s (必须是目录、普通文件或符号链接)", cfg->target_path);
         return -1;
     }
 
     if (cfg->is_output_file && cfg->is_output_split_dir) {
-        fprintf(stderr, "错误: -o 与 -O 不能同时使用\n");
+        log_error("-o 与 -O 不能同时使用");
         return -1;
     }
 
     if (cfg->archive && cfg->clean) {
-        fprintf(stderr, "错误: -Z 与 -C 不能同时使用\n");
+        log_error("-Z 与 -C 不能同时使用");
         return -1;
     }
 

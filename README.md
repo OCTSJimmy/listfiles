@@ -104,7 +104,7 @@ make clean
 | `--size, --user, --group, --mtime, --atime, --mode, --xattr` | 输出对应元数据（动态影响默认文本格式，不与 `--format` 同时生效） |
 | `--master-threads=数量` | Master CPU 去重线程数（默认：4） |
 | `--follow-symlinks` | 跟踪符号链接（递归遍历指向目录的符号链接） |
-| `-M, --mute` | 禁用所有输出（保留错误信息） |
+| `-M, --mute` | 禁用监控面板和诊断日志（`[System]`、`--verbose` 等），扫描数据正常输出。当不使用 `-o`/`-O` 而靠 stdout 管道化数据时，必须附加此参数。 |
 | `-Z, --archive` | 将已处理的进度分片压缩归档 |
 | `-C, --clean` | 删除已处理的进度分片（不与 `-Z` 同时使用） |
 | `-R, --resume-from=文件` | 仅从指定进度列表文件恢复（**预留，暂未实现**） |
@@ -138,7 +138,7 @@ make clean
 
 ```
 +-------------+
-|   Master    |  <-- epoll 事件循环，去重、分发、监控
+|   Master    |  <-- 消息总线，去重、分发、监控
 |  Process    |
 +--+-----+----+
    |     |
@@ -149,17 +149,53 @@ fd_in  fd_out   pipe(TLV IPC)
 +-------------+
 ```
 
-Master 进程通过 `epoll` 监听所有 Worker 的 `fd_out`，Worker 子进程阻塞读取 `fd_in` 上的扫描任务。Worker 完成目录遍历后，将结果批次（`IPC_MSG_BATCH`）写回 Master。
+Master 进程通过消息总线机制管理所有 Worker：主线程不再直接操作 fd，而是通过 **8 个常驻 IPC 线程** 分别管理每个 Worker 的非阻塞 epoll + 心跳检测 + SIGKILL。主线程自身是纯粹的消息总线，只负责：收消息（从 8 个返回队列轮询）、处理消息（BATCH 去重写文件、DEAD 收尾替换、ERROR 记日志）、发消息（SCAN 任务分发给 IPC 线程）。
+
+故障隔离：一个 Worker 的 fd 出问题 → 只污染它自己的 IPC 线程 → IPC 线程发 DEAD 消息 → 主线程收到后优雅替换 Worker → 其他 7 路完全不受影响。彻底消除了 v12.x 单线程 epoll 架构中"一个 Worker 出问题导致整个 Master 事件循环 hang 死"的瓶颈。
 
 Master 向 Worker 发送 `IPC_MSG_SCAN` 时采用**非阻塞写 + 积压队列**机制：`fd_in` 管道容量被提升至 1MB（默认 64KB），写满时 `ipc_send()` 返回 `EAGAIN`，任务被缓存到对应 Worker 的 `backlog_paths` 动态数组中，由主循环后续轮次重试刷出。这避免了 Master 在管道满时阻塞等待，彻底消除了双向管道死锁风险。
 
-Master 内部另设 **`ThreadPool`**（默认 4 线程），通过 `mutex + cond` 有界队列 + `eventfd` 通知，将 CPU 密集型的指纹计算与设备黑名单检查 offload 到工作线程，避免阻塞 `epoll` 主循环。队列满时自动降级为同步处理。
+Master 内部另设 **`ThreadPool`**（默认 4 线程），通过 `mutex + cond` 有界队列 + `eventfd` 通知，将 CPU 密集型的指纹计算与设备黑名单检查 offload 到工作线程，避免阻塞主循环。队列满时自动降级为同步处理。
 
 `AsyncWorker` 输出线程采用批量提交（攒 256 条记录一次性入队），将锁竞争降至 1/256。
 
-**`Monitor`** 是独立的监控线程，每 500ms 刷新一次统计面板（输出到 **stderr**），内容包括：运行时间、活跃 Worker 数、待处理任务数、目录/文件/消费速率、输出进度、设备状态（死设备/判死设备数）、探测状态等。监控线程同时负责 Worker 心跳超时检查和敢死队探测的调度与收割，使主循环专注处理 IPC 消息。
+**`Monitor`** 是独立的监控线程，每 500ms 刷新一次统计面板（输出到 **stdout**），内容包括：运行时间、活跃 Worker 数、待处理任务数、目录/文件/消费速率、输出进度、设备状态（死设备/判死设备数）、探测状态等。监控线程同时负责敢死队探测的调度与收割，使主循环专注处理 IPC 消息。Worker 心跳超时检测已下沉到 IPC 线程。
 
-所有诊断信息（`[System]` 消息、设备熔断日志、监控面板等）统一输出到 **stderr**；扫描数据输出到 **stdout** 或 `-o` / `-O` 指定的文件，便于管道处理。
+监控面板输出到 **stdout**，便于用户在终端实时查看扫描进度；其他诊断信息（`[System]` 消息、设备熔断日志、错误日志等）统一输出到 **stderr**。扫描数据输出到文件（通过 `-o` / `-O` 指定）或 **stdout**（未指定输出文件时），便于管道处理。
+
+#### IPC 线程内部循环
+
+```
+while (running) {
+    // 1. 从主线程消息队列取命令（非阻塞 drain）
+    // 2. epoll_wait(fd_out + cmd_queue eventfd, 500ms)
+    // 3. 处理 fd_out 事件（非阻塞 read → 解析 BATCH/HEARTBEAT/ERROR/EXIT）
+    // 4. 心跳检测：超时 → SIGKILL Worker → 发 RET_DEAD → 等待 REPLACE
+}
+```
+
+- 每个 IPC 线程有自己的小 epoll（2 个 fd：fd_out + cmd_queue eventfd）。
+- fd 均为 O_NONBLOCK，read 采用 poll(100ms) 超时保护。
+- Worker 死亡后 IPC 线程自己 close fd、epoll DEL，不需要主线程介入 cleanup。
+
+#### 消息队列
+
+- **eventfd + 无锁环形队列**（64 位原子 CAS head/tail）。
+- 默认容量 1024 条消息/队列，有界设计天然实现背压。
+- 零 mutex、零上下文切换开销、支持 64 位原子操作。
+
+#### 消息格式
+
+- **命令（主线程 → IPC 线程）**：
+  - `CMD_SCAN`：发送 SCAN 任务路径给 Worker。
+  - `CMD_REPLACE`：替换 Worker fd/pid（Worker 死亡后主线程 spawn 新 Worker，发此命令让 IPC 线程换新 fd）。
+  - `CMD_STOP`：停止 IPC 线程。
+- **返回（IPC 线程 → 主线程）**：
+  - `RET_BATCH`：Worker 返回的扫描结果批次。
+  - `RET_HEARTBEAT`：Worker 心跳（用于 Monitor 面板显示）。
+  - `RET_ERROR`：Worker 遇到的设备级错误（ETIMEDOUT/EIO）。
+  - `RET_DEAD`：Worker 死亡（heartbeat 超时或 epoll error/hup）。
+  - `RET_EXIT`：Worker 正常退出。
 
 ### 核心模块
 
@@ -285,7 +321,7 @@ restore_progress()
 
 ## 版本
 
-当前版本：**12.2.2-dev**
+当前版本：**15.0.4**
 
 ## 许可证
 

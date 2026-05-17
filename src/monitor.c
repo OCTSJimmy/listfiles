@@ -1,8 +1,23 @@
+/**
+ * @file monitor.c
+ * @brief 监控线程实现
+ *
+ * 独立的监控线程负责：
+ * 1. 每 500ms 刷新一次统计面板（输出到 stdout），显示运行时间、Worker 状态、吞吐量、进度、设备状态等
+ * 2. 调度敢死队探测进程：对熔断设备 fork 子进程执行 lstat 探测
+ * 3. 收割已完成的探测进程，根据退出状态决定设备恢复或重新调度探测
+ *
+ * v13.0.0: Worker 心跳检测已下沉到 IPC 线程，Monitor 不再直接管理 Worker 死活。
+ * 监控面板输出到 stdout，便于用户在终端实时查看进度；其他诊断信息（日志、错误等）统一输出到 stderr。
+ */
 #define _GNU_SOURCE
 #include "monitor.h"
 #include "app_context.h"
 #include "progress.h"
 #include "utils.h"
+#include "worker_proc.h"
+#include "main_loop.h"
+#include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +31,12 @@
  * Statistics helpers (ported from monitor.c.bak)
  * ================================================================ */
 
+/**
+ * @brief  计算简单平均速率（总数量 / 总耗时）
+ * @param  start_time  time_t          任务开始时间戳
+ * @param  count       unsigned long   累计数量（目录数或文件数）
+ * @return double  平均速率（个/秒）；若耗时小于 1 秒则返回 0.0
+ */
 static double calculate_rate_simple(time_t start_time, unsigned long count) {
     time_t current_time = time(NULL);
     double elapsed = difftime(current_time, start_time);
@@ -23,6 +44,16 @@ static double calculate_rate_simple(time_t start_time, unsigned long count) {
     return (double)count / elapsed;
 }
 
+/**
+ * @brief  更新运行时统计状态（滑动窗口速率计算）
+ * @param  state  RuntimeState*  运行时状态指针，不能为空
+ * @return void
+ *
+ * @note   使用 RATE_WINDOW_SIZE（60）个采样点的环形数组计算滑动窗口速率。
+ *         每秒钟记录一次当前 dir_count、file_count、dequeued_count，
+ *         然后计算当前窗口内的平均速率（dir_rate、file_rate、dequeue_rate）。
+ *         同时跟踪历史最大速率。
+ */
 static void update_statistics(RuntimeState *state) {
     Statistics *st = &state->stats;
     time_t now = time(NULL);
@@ -61,6 +92,15 @@ static void update_statistics(RuntimeState *state) {
     }
 }
 
+/**
+ * @brief  格式化已运行时间为可读字符串
+ * @param  start_time  time_t   任务开始时间戳
+ * @param  buffer      char*    输出缓冲区，不能为空
+ * @param  buf_size    size_t   缓冲区容量，建议 >= 32
+ * @return void
+ *
+ * @note   输出格式示例："1d 05:32:18"
+ */
 static void format_elapsed_time(time_t start_time, char *buffer, size_t buf_size) {
     long elapsed = difftime(time(NULL), start_time);
     int days = elapsed / 86400; elapsed %= 86400;
@@ -74,6 +114,16 @@ static void format_elapsed_time(time_t start_time, char *buffer, size_t buf_size
  * Progress panel output
  * ================================================================ */
 
+/**
+ * @brief  打印实时监控面板到 stdout
+ * @param  mon  Monitor*  监控器指针，不能为空
+ * @return void
+ *
+ * @note   若 stdout 为终端（isatty），则先清屏（ANSI 转义序列）。
+ *         面板内容包括：版本号、运行时间、活跃 Worker 数、待处理任务数、
+ *         目录/文件/消费速率、已扫描目录/文件数、输出切片状态、
+ *         进度分片状态、设备熔断状态、敢死队探测状态。
+ */
 void print_progress(Monitor *mon) {
     AppContext *ctx = mon->ctx;
     if (!ctx) return;
@@ -83,7 +133,7 @@ void print_progress(Monitor *mon) {
 
     update_statistics(state);
 
-    FILE *fp = stderr;
+    FILE *fp = stdout;
 
     char time_str[32];
     format_elapsed_time(state->start_time, time_str, sizeof(time_str));
@@ -92,9 +142,7 @@ void print_progress(Monitor *mon) {
     int total_workers = 0;
     if (ctx->worker_pool) {
         total_workers = ctx->worker_pool->num_workers;
-        for (int i = 0; i < total_workers; i++) {
-            if (ctx->worker_pool->slots[i].is_alive) alive_workers++;
-        }
+        alive_workers = atomic_load(&ctx->worker_pool->active_count);
     }
 
     long pending = atomic_load(&ctx->pending_tasks);
@@ -111,6 +159,34 @@ void print_progress(Monitor *mon) {
     fprintf(fp, "  Active: %d / %d\n", alive_workers, total_workers);
     fprintf(fp, "  Pending tasks: %ld\n", pending);
     fprintf(fp, "  Pending batches: %ld\n", pending_batches);
+
+    /* v15.1.1: 显示每个 Worker 的独立状态 */
+    if (ctx->worker_pool) {
+        fprintf(fp, "\n[Worker States]\n");
+        for (int i = 0; i < total_workers; i++) {
+            WorkerSlot *slot = &ctx->worker_pool->slots[i];
+            int state = atomic_load(&slot->state);
+            const char *state_str = "???";
+            switch (state) {
+                case WORKER_STATE_IDLE:         state_str = "IDLE"; break;
+                case WORKER_STATE_BUSY:         state_str = "BUSY"; break;
+                case WORKER_STATE_DEAD:         state_str = "DEAD"; break;
+                case WORKER_STATE_INITIALIZING: state_str = "INIT"; break;
+            }
+            char path_display[32] = "-";
+            if (slot->current_path[0] != '\0') {
+                /* 截断显示：仅保留最后 20 个字符 */
+                const char *masked = path_log_mask(slot->current_path);
+                size_t mlen = strlen(masked);
+                const char *p = masked;
+                if (mlen > 20) p += mlen - 20;
+                snprintf(path_display, sizeof(path_display), "...%.*s",
+                         (int)(sizeof(path_display)-4), p);
+            }
+            fprintf(fp, "  W%d: %-4s pid=%d path=%s\n", i, state_str,
+                    (int)slot->pid, path_display);
+        }
+    }
 
     fprintf(fp, "\n[Throughput]\n");
     fprintf(fp, "  Dir rate:  %8.2f/s (max: %.2f)\n", state->stats.current_dir_rate, state->stats.max_dir_rate);
@@ -154,40 +230,20 @@ void print_progress(Monitor *mon) {
 }
 
 /* ================================================================
- * Worker health check (directly inspect WorkerPool slots)
- * ================================================================ */
-
-static void check_workers_health(Monitor *mon) {
-    AppContext *ctx = mon->ctx;
-    if (!ctx || !ctx->worker_pool) return;
-
-    time_t now = time(NULL);
-    int timeout = ctx->cfg.heartbeat_timeout;
-
-    for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
-        WorkerSlot *slot = &ctx->worker_pool->slots[i];
-        if (!slot->is_alive) continue;
-
-        if (now - slot->last_heartbeat > timeout) {
-            fprintf(stderr, "[Monitor] Worker %d heartbeat timeout (dev=%lu, path=%s). Replacing.\n",
-                    i, (unsigned long)slot->current_dev, slot->current_path);
-
-            kill(slot->pid, SIGKILL);
-            int status;
-            waitpid(slot->pid, &status, WNOHANG);
-
-            slot->is_alive = false;
-            slot->pid = -1;
-            ctx->worker_pool->active_count--;
-            ctx->state.has_error = true;
-        }
-    }
-}
-
-/* ================================================================
  * Daredevil probe (fork-based, same logic as old main_loop.c)
  * ================================================================ */
 
+/**
+ * @brief  调度敢死队探测进程
+ * @param  mon  Monitor*  监控器指针，不能为空
+ * @return void
+ *
+ * @note   从 ProbeScheduler 中 peek 一个到期的探测任务：
+ *         - 若任务状态为 CONDEMNED，直接移除不再探测
+ *         - 否则 fork 子进程，子进程设置 alarm(PROBE_TIMEOUT_SEC=5s) 后执行 lstat
+ *         - 父进程记录 active_probe_pid 和 active_probe_dev
+ *         每次仅允许一个活跃探测进程，避免并发探测导致误判。
+ */
 static void dispatch_probes(Monitor *mon) {
     AppContext *ctx = mon->ctx;
     if (!ctx || !ctx->probe_scheduler) return;
@@ -214,6 +270,16 @@ static void dispatch_probes(Monitor *mon) {
     }
 }
 
+/**
+ * @brief  收割已完成的敢死队探测进程
+ * @param  mon  Monitor*  监控器指针，不能为空
+ * @return void
+ *
+ * @note   以 WNOHANG 方式 waitpid 检查活跃探测进程：
+ *         - 若正常退出（WIFEXITED）：设备恢复为 NORMAL，将 spbin 中该设备的积压路径重新入队扫描
+ *         - 若异常退出（被 signal 杀死，通常是 alarm 超时）：重新推入 ProbeScheduler 进行指数退避重试
+ *         无论结果如何，最后重置 active_probe_pid 为 -1，允许调度下一个探测任务。
+ */
 static void reap_probes(Monitor *mon) {
     if (mon->active_probe_pid <= 0) return;
 
@@ -252,6 +318,19 @@ static void reap_probes(Monitor *mon) {
  * Monitor thread lifecycle
  * ================================================================ */
 
+/**
+ * @brief  监控线程主入口函数
+ * @param  arg  void*  指向 Monitor 结构体的指针，不能为空
+ * @return void*  始终返回 NULL
+ *
+ * @note   循环周期约为 MONITOR_INTERVAL_MS（500ms）。每轮循环：
+ *         1. 若未开启 mute，打印监控面板到 stdout
+ *         2. 每 CHECK_INTERVAL_SEC（1s）执行一次健康检查和探测调度
+ *         -M (--mute) 仅静默监控面板和诊断信息，不影响扫描数据输出
+ *         3. 每轮都尝试收割探测进程（因为探测可能在任意时刻完成）
+ *         4. usleep 500ms 后继续下一轮
+ *         当 mon->running 被主线程设为 false 时退出循环。
+ */
 void* monitor_thread_entry(void *arg) {
     Monitor *mon = (Monitor*)arg;
     time_t last_check_time = 0;
@@ -263,7 +342,6 @@ void* monitor_thread_entry(void *arg) {
 
         time_t now = time(NULL);
         if (now - last_check_time >= CHECK_INTERVAL_SEC) {
-            check_workers_health(mon);
             dispatch_probes(mon);
             last_check_time = now;
         }
@@ -275,6 +353,14 @@ void* monitor_thread_entry(void *arg) {
     return NULL;
 }
 
+/**
+ * @brief  创建 Monitor 实例
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return Monitor*  成功返回指向新分配监控器的指针；内存不足时返回 NULL
+ *
+ * @note   初始化 running 为 true，active_probe_pid 为 -1。
+ *         监控线程本身由 main.c 创建（pthread_create），不在本函数内创建。
+ */
 Monitor* monitor_create(AppContext *ctx) {
     Monitor *mon = calloc(1, sizeof(Monitor));
     if (!mon) return NULL;
@@ -286,6 +372,15 @@ Monitor* monitor_create(AppContext *ctx) {
     return mon;
 }
 
+/**
+ * @brief  销毁 Monitor 实例
+ * @param  mon  Monitor*  要销毁的监控器指针，允许传入 NULL（空操作）
+ * @return void
+ *
+ * @note   设置 running 为 false 并 pthread_join 等待监控线程结束，然后释放内存。
+ *         若监控线程尚未创建（tid 未设置），join 行为未定义，
+ *         因此调用方应确保线程已创建后再调用本函数。
+ */
 void monitor_destroy(Monitor *mon) {
     if (!mon) return;
     mon->running = false;
