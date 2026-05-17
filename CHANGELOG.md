@@ -6,6 +6,29 @@
 
 ## [Unreleased]
 
+## [15.1.5] - 2026-05-17
+
+### 修复
+- `process_completed_batch` 中 Worker 调度循环 `attempts` 计数器未递增，导致所有 Worker 均为 BUSY 时进入无限 `continue` 死循环。
+- `dispatch_lost_tasks` 中相同模式的 `attempts` 计数器未递增，一并修复。
+
+### 背景
+v15.1.4 `/public2` 测试运行 2 分 5 秒后卡死，`perf top` 仍显示 `process_completed_batch` 占 99.72% CPU。
+
+症状：
+- `pending_batches=4`，`pending_tasks=9`
+- 8 个 Worker 全部为 BUSY
+- `Dir rate / File rate / Dequeue = 0.00`
+
+根因：v15.1.0 引入的 `while (attempts < num_workers)` 调度循环中，`attempts` 变量未在 `continue` 路径上递增。当所有 Worker 均为 BUSY（或 DEAD）时，条件永远为真，循环永不退出，CPU 100% 空转。Master 卡死后不处理 ret_queue，Worker FINISH 不被消费，Worker 状态永远 BUSY，形成完美死锁闭环。
+
+### 修复内容
+两处 `continue` 前增加 `attempts++`：
+1. `process_completed_batch` 中的目录 dispatch 循环
+2. `dispatch_lost_tasks` 中的 lost task dispatch 循环
+
+---
+
 ## [15.1.4] - 2026-05-17
 
 ### 修复

@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.1.4**（基于 v15.1.3 `fp_shard_insert_internal` 探测死锁修复 + `process_completed_batch` count corruption 防御）
+当前设计版本：**v15.1.5**（基于 v15.1.4 `process_completed_batch` count corruption 防御 + `attempts` 计数器修复）
 
 ---
 

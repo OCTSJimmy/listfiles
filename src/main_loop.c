@@ -239,8 +239,8 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                     int candidate = ctx->next_dispatch_worker % num_workers;
                     ctx->next_dispatch_worker++;
                     WorkerSlot *cand_slot = &ctx->worker_pool->slots[candidate];
-                    if (!atomic_load(&cand_slot->is_alive)) continue;
-                    if (atomic_load(&cand_slot->state) != WORKER_STATE_IDLE) continue;
+                    if (!atomic_load(&cand_slot->is_alive)) { attempts++; continue; }
+                    if (atomic_load(&cand_slot->state) != WORKER_STATE_IDLE) { attempts++; continue; }
                     wid = candidate;
                     break;
                 }
@@ -346,8 +346,8 @@ static void dispatch_lost_tasks(AppContext *ctx) {
             int candidate = ctx->next_dispatch_worker % num_workers;
             ctx->next_dispatch_worker++;
             WorkerSlot *cand_slot = &ctx->worker_pool->slots[candidate];
-            if (!atomic_load(&cand_slot->is_alive)) continue;
-            if (atomic_load(&cand_slot->state) != WORKER_STATE_IDLE) continue;
+            if (!atomic_load(&cand_slot->is_alive)) { attempts++; continue; }
+            if (atomic_load(&cand_slot->state) != WORKER_STATE_IDLE) { attempts++; continue; }
             wid = candidate;
             break;
         }
