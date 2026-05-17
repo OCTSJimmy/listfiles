@@ -82,6 +82,13 @@ fail:
  * ================================================================ */
 
 static void batch_dedup_worker(TPBatch *batch, void *user_data) {
+    /* v15.1.4: defensive sanity check */
+    if (!batch || batch->count < 0 || batch->count > 1000000) {
+        log_fatal("[DedupWorker] batch invalid or count out of range: %p count=%d",
+                  (void*)batch, batch ? batch->count : -999);
+        return;
+    }
+
     AppContext *ctx = user_data;
     const int ITERATION_LIMIT = 100000; /* v15.1.2: hard timeout for single batch */
     for (int i = 0; i < batch->count; i++) {
@@ -182,11 +189,33 @@ static void send_stop_to_ipc(AppContext *ctx, int wid) {
  * ================================================================ */
 
 static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
+    /* v15.1.4: defensive sanity check to prevent CPU spin from corrupted count */
+    if (!batch || batch->count < 0 || batch->count > 1000000) {
+        log_fatal("[Batch] batch invalid or count out of range: %p count=%d, worker=%d. Dropping.",
+                  (void*)batch, batch ? batch->count : -999,
+                  batch ? batch->worker_id : -999);
+        if (batch) {
+            for (int i = 0; i < batch->count && i < 1000000; i++) free(batch->paths[i]);
+            free(batch->paths);
+            free(batch->stats);
+            free(batch->results);
+            free(batch);
+        }
+        atomic_fetch_sub(&ctx->pending_batches, 1);
+        return;
+    }
+
     log_debug("[Batch] process_completed_batch start worker=%d count=%d pending_batches=%ld",
               batch->worker_id, batch->count, atomic_load(&ctx->pending_batches));
     OutputBatch out_batch = {0};
 
+    const int PROC_ITER_LIMIT = 1000000; /* v15.1.4 */
     for (int i = 0; i < batch->count; i++) {
+        if (i >= PROC_ITER_LIMIT) {
+            log_fatal("[Batch] process_completed_batch iteration limit exceeded: worker=%d count=%d i=%d. Aborting batch.",
+                      batch->worker_id, batch->count, i);
+            break;
+        }
         const char *path = batch->paths[i];
         struct stat *st = &batch->stats[i];
         uint8_t result = batch->results[i];
@@ -503,6 +532,14 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
         return;
     }
     log_debug("[Batch] Worker %d parse_batch OK (count=%d)", worker_id, parsed.count);
+
+    /* v15.1.4: defensive sanity check on parsed.count */
+    if (parsed.count < 0 || parsed.count > 1000000) {
+        log_fatal("[Batch] parsed.count out of range: %d (worker=%d, len=%u), dropping batch",
+                  parsed.count, worker_id, len);
+        parsed_batch_free(&parsed);
+        return;
+    }
 
     uint8_t *results = calloc((size_t)parsed.count, 1);
     if (!results) {

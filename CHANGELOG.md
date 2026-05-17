@@ -6,9 +6,27 @@
 
 ## [Unreleased]
 
----
+## [15.1.4] - 2026-05-17
 
-## [15.1.3] - 2026-05-17
+### 修复
+- `main_loop_handle_batch`：增加 `parsed.count` sanity check（0 ~ 1,000,000），超限则 `log_fatal` 丢弃 batch，防止 corrupted IPC payload 创建超大规模 batch。
+- `batch_dedup_worker`：入口处增加 `batch->count` sanity check，防止线程池 worker 处理 corrupted batch。
+- `process_completed_batch`：入口处增加 `batch->count` sanity check（0 ~ 1,000,000），超限则安全释放并 `atomic_fetch_sub pending_batches`。
+- `process_completed_batch`：循环体内增加 `PROC_ITER_LIMIT = 1,000,000` 硬上限，防止主线程在 batch count corruption 时无限 CPU 空转。
+
+### 背景
+v15.1.3 `/public2` 测试 Master PID 88601 运行 16+ 小时，`perf top` 显示 `process_completed_batch` 占 99.86% CPU。
+症状：
+- `pending_batches=3` 不再下降，`pending_tasks=196`
+- 8 个 Worker 全部空闲（poll / epoll_wait / futex_wait）
+- 无 `log_fatal` 输出，排除 `fp_shard_insert_internal` PROBE_LIMIT 路径
+- Master stack 为 `running`（纯用户态死循环，非 v15.1.2 的 `do_wait`）
+
+根因推断：主线程 `process_completed_batch` 中 `for (int i = 0; i < batch->count; i++)` 的 `batch->count` 被内存 corruption 覆盖为巨大正值（如 `INT_MAX`），导致 `int` 溢出后循环永不终止，或循环体内部 `continue` 路径过轻导致 CPU 空转 16+ 小时。
+
+v15.1.4 通过多层防御（parse 时 → dedup worker 时 → process 时 → loop 内）阻断裂口。
+
+---
 
 ### 修复
 - `fp_shard_insert_internal` 开放寻址探测增加 `PROBE_LIMIT = 1,000,000` 硬上限，防止 `shard->capacity` 或 `meta[pos]` 内存 corruption 导致的无限循环死锁

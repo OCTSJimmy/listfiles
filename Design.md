@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.1.3**（基于 v15.1.2 batch_dedup_worker 硬超时 + `fp_shard_insert_internal` 探测死锁修复）
+当前设计版本：**v15.1.4**（基于 v15.1.3 `fp_shard_insert_internal` 探测死锁修复 + `process_completed_batch` count corruption 防御）
 
 ---
 
