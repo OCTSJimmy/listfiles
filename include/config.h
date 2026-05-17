@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.1.2" // batch_dedup_worker hard timeout + path log masking
+#define VERSION "15.1.3" // batch_dedup_worker hard timeout + path log masking
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000

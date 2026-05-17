@@ -106,6 +106,16 @@ static size_t next_pow2(size_t n) {
  *         使用线性探测解决冲突；遇到 tombstone（删除标记）时会复用该槽位。
  */
 static bool fp_shard_insert_internal(FingerprintShard *shard, const uint8_t md5[FP_SIZE], bool *out_exists) {
+    /* v15.1.3: capacity sanity check */
+    if (shard->capacity == 0 || shard->capacity > (1ULL << 30)) {
+        log_fatal("[FPSet] shard capacity corrupted: %zu (valid range: [16, 1<<30])", shard->capacity);
+        return false;
+    }
+    if ((shard->capacity & (shard->capacity - 1)) != 0) {
+        log_fatal("[FPSet] shard capacity not power of 2: %zu", shard->capacity);
+        return false;
+    }
+
     if ((shard->count + shard->tombstones) * 2 >= shard->capacity * 3) {
         /* 扩容到 2 倍 */
         size_t old_cap = shard->capacity;
@@ -113,8 +123,20 @@ static bool fp_shard_insert_internal(FingerprintShard *shard, const uint8_t md5[
         Fingerprint *old_table = shard->table;
 
         size_t new_cap = old_cap << 1;
+        if (new_cap > (1ULL << 30)) {
+            log_fatal("[FPSet] shard capacity overflow during resize: %zu -> %zu", old_cap, new_cap);
+            return false;
+        }
         shard->meta = calloc(new_cap, sizeof(uint8_t));
         shard->table = calloc(new_cap, sizeof(Fingerprint));
+        if (!shard->meta || !shard->table) {
+            log_fatal("[FPSet] shard resize allocation failed: new_cap=%zu", new_cap);
+            free(shard->meta);
+            free(shard->table);
+            shard->meta = old_meta;
+            shard->table = old_table;
+            return false;
+        }
         shard->capacity = new_cap;
         shard->count = 0;
         shard->tombstones = 0;
@@ -131,8 +153,14 @@ static bool fp_shard_insert_internal(FingerprintShard *shard, const uint8_t md5[
 
     size_t idx = fp_hash(md5, shard->capacity);
     size_t first_tomb = (size_t)-1;
+    const size_t PROBE_LIMIT = 1000000; /* v15.1.3: hard limit to prevent infinite loop */
 
     for (size_t i = 0; i < shard->capacity; i++) {
+        if (i >= PROBE_LIMIT) {
+            log_fatal("[FPSet] open-addressing probe limit exceeded: capacity=%zu, count=%zu, tombstones=%zu",
+                      shard->capacity, shard->count, shard->tombstones);
+            return false;
+        }
         size_t pos = (idx + i) & (shard->capacity - 1);
         uint8_t m = shard->meta[pos];
 
@@ -152,7 +180,7 @@ static bool fp_shard_insert_internal(FingerprintShard *shard, const uint8_t md5[
             return true;
         }
     }
-    /* v15.1.2: should never reach here under normal conditions */
+    /* v15.1.3: should never reach here under normal conditions */
     log_fatal("[FPSet] open-addressing loop exhausted capacity=%zu (count=%zu, tombstones=%zu). Table full or corrupted.",
               shard->capacity, shard->count, shard->tombstones);
     return false; /* 不应该到达这里 */

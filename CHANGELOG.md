@@ -8,6 +8,23 @@
 
 ---
 
+## [15.1.3] - 2026-05-17
+
+### 修复
+- `fp_shard_insert_internal` 开放寻址探测增加 `PROBE_LIMIT = 1,000,000` 硬上限，防止 `shard->capacity` 或 `meta[pos]` 内存 corruption 导致的无限循环死锁
+- `fp_shard_insert_internal` 增加 `shard->capacity` sanity check（>0、<=1<<30、必须为 2 的幂次），扩容时增加 `new_cap` 溢出检查
+- 扩容失败时回滚旧 table，防止内存泄漏和后续 corruption
+
+### 背景
+v15.1.2 在 `/public2` 测试仍卡死，`pending_batches=5` 永远不归零，4 个 thread_pool 工作线程全部 `futex_wait`。根因推断：
+- `batch_dedup_worker` 外层硬超时（10万次迭代）对 `fp_set_insert` 内部死锁无效，因为 `i` 不增加
+- `fp_shard_insert_internal` 的开放寻址探测在 `shard->capacity` 或 `meta[pos]` corruption 时进入无限循环，持有 `shard->mutex` 永不释放
+- 其他 thread_pool 工作线程在 `pthread_mutex_lock(&shard->mutex)` 中死锁
+
+v15.1.3 通过内层循环硬限制和 capacity sanity check 阻断该路径。
+
+---
+
 ## [15.1.2] - 2026-05-17
 
 ### 修复

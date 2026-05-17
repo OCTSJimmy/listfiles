@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.1.2**（基于 v15.1.1 状态机 + batch_dedup_worker 硬超时 + 路径日志脱敏）
+当前设计版本：**v15.1.3**（基于 v15.1.2 batch_dedup_worker 硬超时 + `fp_shard_insert_internal` 探测死锁修复）
 
 ---
 
@@ -397,6 +397,8 @@ v14.0.x 中 Worker 拆分为 Scanner 线程 + IPC 线程后，两条线程并发
 2. **Monitor 秒表依赖**：Monitor 的秒表计时基于 `gettimeofday()`，如果 IPC 线程或主线程 hang 死，Monitor 线程本身不受影响，但秒表反映的是"Wall Clock"而非"有效处理时间"。
 
 3. **va_list 边界**：`noinline` 是 workaround 而非根治。如果未来遇到更多 `va_list` 相关问题，应考虑将 `verbose_printf` 的实现改为直接 `vsnprintf` 到栈缓冲区后输出，避免 `va_list` 跨函数传递。
+
+4. **`fp_shard_insert_internal` 内存 corruption**：v15.1.3 通过 `PROBE_LIMIT` 和 `capacity` sanity check 作为防御性修复，但未定位 corruption 的根本原因。如果 `log_fatal` 被触发，需进一步审计 `batch->results` / `batch->paths` 越界写、`parse_batch` 边界、`ipc_recv` 完整性、以及 `async_writer` 是否可能越界写 `visited_set` 所在内存。
 
 4. **fpbin 转正中断**：如果 fpbin 转正（封口 + rename）过程中进程崩溃，下次启动时会重新执行完整转正流程，但已转正的 pbin 不会被覆盖（`find_max_pbin_index()` 防呆）。
 
