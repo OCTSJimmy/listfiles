@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.4.3**（IPC FSM 续传 + 部分写入防御 + Shard 溢出修复 + 线程池安全上限）
+当前设计版本：**v15.4.4**（IPC FSM BATCH Footer 读取协议修复 + 部分写入防御 + Shard 溢出修复 + 线程池安全上限）
 
 ---
 
@@ -52,6 +52,7 @@
 | **v15.4.1** | **ipc_send 部分写入防御** | `MAX_PATH_LENGTH=4096` 导致 `total_len > PIPE_BUF`，非阻塞 pipe 部分写入后协议不同步 | `MAX_PATH_LENGTH` 4088 + 运行时 `PIPE_BUF` guard + 1000 次重试上限 |
 | **v15.4.2** | **fp_shard_insert_internal 安全加固** | `expected_count*2` 溢出、`PROBE_LIMIT` 截断探测、rehash 失败无回滚 | 饱和乘法、`PROBE_LIMIT=capacity`、rehash 失败完整回滚 |
 | **v15.4.3** | **thread_pool completed 链表安全** | `node` malloc 失败泄漏 batch、`completed` 链表自循环、`destroy` 无限 drain | malloc 失败释放 batch、自循环检测+断开、drain 安全上限 |
+| **v15.4.4** | **IPC FSM BATCH Footer 读取协议修复** | v15.4.0 FSM 中 PAYLOAD 阶段读完含 Footer 的全部 payload，FOOTER 阶段再读 8B 时管道已空超时 | PAYLOAD 只读 `payload_len-8` body；FOOTER 单独读 8B 验证后复制到 buf 末尾 |
 ---
 
 ## v13.0.0：IPC 线程隔离
@@ -571,6 +572,32 @@ rehash 失败（如 `fp_shard_insert_internal` 递归调用返回 false）时，
 
 - `src/scan/thread_pool.c` — node-oom 释放 batch、自循环检测、drain 上限
 - `include/core/config.h` — 版本号 15.4.3
+
+---
+
+## v15.4.4：IPC FSM BATCH Footer 读取协议修复
+
+### 问题背景
+
+v15.4.0 引入的 `IpcReadFsm` 续传机制中，`read_data_message()` 对 BATCH 消息的 PAYLOAD/FOOTER 阶段边界与 Worker `send_batch()` 的实际发送格式不一致：
+
+- **Worker 发送端**：`send_batch()` 将 `IpcBatchHeader` + records + `Footer magic(8B)` 打包为完整 payload，`ipc_send()` 的 `payload_len` = `total`（**已包含 Footer**）。
+- **IPC 接收端（原实现）**：
+  - PAYLOAD 阶段：`safe_ipc_recv_payload_fsm()` 读取 `fsm->hdr.payload_len` bytes，即**把整个 Payload+Footer 全部读入 `fsm->buf`**。
+  - FOOTER 阶段：`safe_ipc_recv_footer_fsm()` 试图**再从 fd 读取 8 bytes**。此时管道已空，`poll(100ms)` 超时返回 `-2`。
+
+FSM 永远卡在 `IPC_READ_FOOTER` 状态，BATCH 数据被锁死在 IPC 线程，无法通过 `send_return()` 转发给主线程。主线程只能收到 `FINISH`，收不到 `BATCH` → `pending_tasks` 减到 0 → 程序 0 秒退出、0 输出。
+
+### 修复
+
+- **PAYLOAD 阶段**：改为调用 `fsm_recv(ctx->fd_data, fsm->buf, payload_len - sizeof(uint64_t), &fsm->nread)`，只读取不含 Footer 的 payload body。
+- **FOOTER 阶段**：单独 `fsm_recv()` 读取 8 bytes 到局部缓冲区，验证 `IPC_FOOTER_MAGIC(0xDEADBEEF66AAC0FF)` 后，用 `memcpy` 将其复制到 `fsm->buf + payload_len - 8`，保持 `fsm->buf` 内存布局与 Worker 侧完全一致。
+- 转发给主线程时 `net_payload_len = payload_len - sizeof(uint64_t)`，`parse_batch()` 解析逻辑不受 Footer 影响。
+
+### 修改的文件
+
+- `src/ipc/ipc_message_handler.c` — `read_data_message()` PAYLOAD/FOOTER 阶段边界修正
+- `include/core/config.h` — 版本号 15.4.4
 
 ---
 

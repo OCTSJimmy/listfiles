@@ -5,6 +5,7 @@ bin/
 compile_commands.json
 test_output/
 test/
+logs/
 
 # Test progress files
 progress*.config

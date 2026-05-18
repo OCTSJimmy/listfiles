@@ -4,6 +4,23 @@
 
 ---
 
+## [15.4.4] - 2026-05-18
+
+### Fixed：IPC FSM BATCH Footer 读取协议修复（P0）
+
+**问题背景**：v15.4.0 引入的 FSM 续传机制中，`read_data_message()` 的 PAYLOAD 阶段读取了包含 Footer 的全部 `payload_len` bytes，随后 FOOTER 阶段试图再读取 8 bytes Footer，导致管道已空、`poll(100ms)` 超时。BATCH 永远卡在 FOOTER 阶段，主线程收不到任何 BATCH，程序 0 秒退出、0 输出。
+
+**修复**：
+- PAYLOAD 阶段：只读取 `payload_len - sizeof(uint64_t)` bytes（payload body，不含 Footer）。
+- FOOTER 阶段：单独 `fsm_recv()` 读取 8 bytes Footer，验证魔数后复制到 `fsm->buf` 末尾。
+- 转发时 `net_payload_len = payload_len - 8`，保持主线程解析逻辑不变。
+
+**修改的文件**：
+- `src/ipc/ipc_message_handler.c`
+- `include/core/config.h`（版本号 15.4.4）
+
+---
+
 ## [15.4.3] - 2026-05-18
 
 ### Fixed：thread_pool completed 链表安全（P2）

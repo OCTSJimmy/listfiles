@@ -253,7 +253,8 @@ void read_data_message(IpcThreadCtx *ctx) {
 
     /* --- PAYLOAD phase --- */
     if (fsm->state == IPC_READ_PAYLOAD) {
-        rc = safe_ipc_recv_payload_fsm(ctx->fd_data, fsm);
+        uint32_t payload_body_len = fsm->hdr.payload_len - sizeof(uint64_t);
+        rc = fsm_recv(ctx->fd_data, fsm->buf, payload_body_len, &fsm->nread);
         if (rc == -2) return;
         if (rc != 0) {
             log_error("[IPC-%d] data payload recv failed, marking worker dead", ctx->slot_id);
@@ -267,10 +268,18 @@ void read_data_message(IpcThreadCtx *ctx) {
 
     /* --- FOOTER phase --- */
     if (fsm->state == IPC_READ_FOOTER) {
-        uint64_t footer_magic = 0;
-        rc = safe_ipc_recv_footer_fsm(ctx->fd_data, fsm, &footer_magic);
+        uint8_t footer_buf[sizeof(uint64_t)];
+        rc = fsm_recv(ctx->fd_data, footer_buf, sizeof(footer_buf), &fsm->nread);
         if (rc == -2) return;
-        if (rc != 0 || footer_magic != IPC_FOOTER_MAGIC) {
+        if (rc != 0) {
+            log_error("[IPC-%d] data footer recv failed, dropping batch", ctx->slot_id);
+            free(fsm->buf); fsm->buf = NULL;
+            fsm->state = IPC_READ_IDLE;
+            return;
+        }
+        uint64_t footer_magic = 0;
+        memcpy(&footer_magic, footer_buf, sizeof(footer_magic));
+        if (footer_magic != IPC_FOOTER_MAGIC) {
             log_error("[IPC-%d] data footer mismatch (got=0x%016llx expected=0x%016llx), dropping batch",
                       ctx->slot_id, (unsigned long long)footer_magic,
                       (unsigned long long)IPC_FOOTER_MAGIC);
@@ -278,6 +287,8 @@ void read_data_message(IpcThreadCtx *ctx) {
             fsm->state = IPC_READ_IDLE;
             return;
         }
+        /* Copy footer into buf so it matches Worker-side format */
+        memcpy((uint8_t*)fsm->buf + fsm->hdr.payload_len - sizeof(uint64_t), footer_buf, sizeof(footer_buf));
     }
 
     /* --- Complete: strip Footer and forward to Master --- */
