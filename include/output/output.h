@@ -23,4 +23,11 @@ void cleanup_cache(RuntimeState *state);
 void close_output_file(FILE *fp);
 void format_mode_str(mode_t mode, char *buf);
 
+// 用户名/组名缓存查询
+const char *get_username(RuntimeState *state, uid_t uid);
+const char *get_groupname(RuntimeState *state, gid_t gid);
+
+// 扩展属性字符串获取
+void get_xattr_str(RuntimeState *state, const char *path, const struct stat *info, char *buf);
+
 #endif // OUTPUT_H

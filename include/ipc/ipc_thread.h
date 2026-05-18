@@ -58,4 +58,11 @@ void* ipc_thread_loop(void *arg);
  */
 void ipc_thread_stop(IpcThreadCtx *ctx);
 
+void worker_mark_dead(IpcThreadCtx *ctx, bool send_notify);
+void worker_timeout_kill(IpcThreadCtx *ctx);
+void send_return(IpcThreadCtx *ctx, uint32_t type, void *data, size_t len);
+void read_ctrl_message(IpcThreadCtx *ctx);
+void read_data_message(IpcThreadCtx *ctx);
+void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd);
+
 #endif

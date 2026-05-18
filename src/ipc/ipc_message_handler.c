@@ -1,23 +1,29 @@
+/**
+ * @file ipc_message_handler.c
+ * @brief IPC 消息接收与处理
+ *
+ * 负责 IPC 线程中的消息安全接收与协议处理：
+ * - 带 poll 超时的 IPC 安全接收（safe_ipc_recv_header / safe_ipc_recv_payload）
+ * - 控制消息读取：HEARTBEAT / ERROR / DEV_TIMEOUT / READY / FINISH / EXIT（read_ctrl_message）
+ * - 数据消息读取：BATCH 数据转发（read_data_message）
+ * - 主线程命令处理：CMD_SCAN / CMD_REPLACE / CMD_STOP（handle_cmd）
+ */
 #define _GNU_SOURCE
 #include "ipc_thread.h"
 #include "msg_format.h"
 #include "ipc_protocol.h"
 #include "log.h"
 #include "utils.h"
-#include "worker_proc.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
 #include <sys/epoll.h>
-#include <sys/eventfd.h>
-#include <signal.h>
 #include <poll.h>
 
 /* ================================================================
- * IPC Thread Implementation (v13.0.0)
- * Each thread manages one Worker: non-blocking epoll + heartbeat.
+ * Safe IPC receive helpers (static — only used within this file)
  * ================================================================ */
 
 static int safe_ipc_recv_header(int fd, IpcMessageHeader *hdr) {
@@ -63,72 +69,11 @@ static int safe_ipc_recv_payload(int fd, void *buf, uint32_t len) {
     return 0;
 }
 
-/* ---- Worker death handling inside IPC thread ---- */
-static void worker_mark_dead(IpcThreadCtx *ctx, bool send_notify) {
-    if (ctx->fd_cmd >= 0) {
-        close(ctx->fd_cmd);
-        ctx->fd_cmd = -1;
-    }
-    if (ctx->fd_data >= 0) {
-        if (ctx->epfd >= 0) {
-            epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->fd_data, NULL);
-        }
-        close(ctx->fd_data);
-        ctx->fd_data = -1;
-    }
-    if (ctx->fd_ctrl >= 0) {
-        if (ctx->epfd >= 0) {
-            epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->fd_ctrl, NULL);
-        }
-        close(ctx->fd_ctrl);
-        ctx->fd_ctrl = -1;
-    }
-    ctx->pid = -1;
-    atomic_store(&ctx->waiting_replace, true);
+/* ================================================================
+ * Read a complete IPC message from Worker fd_ctrl
+ * ================================================================ */
 
-    if (send_notify) {
-        IpcThreadMsg msg = {
-            .type = RET_DEAD,
-            .slot_id = ctx->slot_id,
-            .data = NULL,
-            .data_len = 0
-        };
-        if (!msg_queue_send(ctx->ret_queue, &msg)) {
-            log_error("[IPC-%d] ret_queue full, DEAD message dropped", ctx->slot_id);
-        }
-    }
-}
-
-static void worker_timeout_kill(IpcThreadCtx *ctx) {
-    log_error("[IPC-%d] Worker %d heartbeat timeout, sending SIGKILL (pid=%d)",
-            ctx->slot_id, ctx->slot_id, (int)ctx->pid);
-    if (ctx->pid > 0) {
-        kill(ctx->pid, SIGKILL);
-    }
-    worker_mark_dead(ctx, true);
-}
-
-/* ---- Send return message to master ---- */
-static void send_return(IpcThreadCtx *ctx, uint32_t type, void *data, size_t len) {
-    IpcThreadMsg msg = {
-        .type = type,
-        .slot_id = ctx->slot_id,
-        .data = data,
-        .data_len = len
-    };
-    if (!msg_queue_send(ctx->ret_queue, &msg)) {
-        log_error("[IPC-%d] ret_queue full, message type=%u dropped", ctx->slot_id, type);
-        free(data);
-    } else {
-        log_info("[IPC-%d] ret_queue send OK (type=%u, len=%zu, queue=%p)", ctx->slot_id, type, len, (void*)ctx->ret_queue);
-        if (ctx->master_cond) {
-            pthread_cond_signal(ctx->master_cond);
-        }
-    }
-}
-
-/* ---- Read a complete IPC message from Worker fd_ctrl ---- */
-static void read_ctrl_message(IpcThreadCtx *ctx) {
+void read_ctrl_message(IpcThreadCtx *ctx) {
     IpcMessageHeader hdr;
     int rc_hdr = safe_ipc_recv_header(ctx->fd_ctrl, &hdr);
     if (rc_hdr == -2) {
@@ -257,8 +202,11 @@ static void read_ctrl_message(IpcThreadCtx *ctx) {
     }
 }
 
-/* ---- Read a complete BATCH message from Worker fd_data ---- */
-static void read_data_message(IpcThreadCtx *ctx) {
+/* ================================================================
+ * Read a complete BATCH message from Worker fd_data
+ * ================================================================ */
+
+void read_data_message(IpcThreadCtx *ctx) {
     IpcMessageHeader hdr;
     int rc_hdr = safe_ipc_recv_header(ctx->fd_data, &hdr);
     if (rc_hdr == -2) {
@@ -304,8 +252,11 @@ static void read_data_message(IpcThreadCtx *ctx) {
     /* ownership transferred */
 }
 
-/* ---- Handle commands from master thread ---- */
-static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
+/* ================================================================
+ * Handle commands from master thread
+ * ================================================================ */
+
+void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
     switch (cmd->type) {
         case CMD_SCAN: {
             CmdScanPayload *scan = (CmdScanPayload*)cmd->data;
@@ -418,133 +369,4 @@ static void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
     }
     free(cmd->data);
     cmd->data = NULL;
-}
-
-/* ================================================================
- * Public API
- * ================================================================ */
-
-IpcThreadCtx* ipc_thread_ctx_create(int slot_id, WorkerPool *pool,
-                                   MsgQueue *cmd, MsgQueue *ret,
-                                   pthread_cond_t *master_cond) {
-    IpcThreadCtx *ctx = calloc(1, sizeof(IpcThreadCtx));
-    if (!ctx) return NULL;
-
-    ctx->slot_id = slot_id;
-    ctx->pool = pool;
-    ctx->cmd_queue = cmd;
-    ctx->ret_queue = ret;
-    ctx->master_cond = master_cond;
-    ctx->fd_cmd = -1;
-    ctx->fd_data = -1;
-    ctx->fd_ctrl = -1;
-    ctx->pid = -1;
-    atomic_init(&ctx->running, true);
-    atomic_init(&ctx->last_heartbeat, time(NULL));
-    atomic_init(&ctx->waiting_replace, false);
-    ctx->eagain_retry_count = 0;
-
-    ctx->epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (ctx->epfd < 0) {
-        log_error("[IPC-%d] epoll_create1 failed: %s", slot_id, strerror(errno));
-        free(ctx);
-        return NULL;
-    }
-
-    /* Add cmd_queue eventfd to epoll */
-    if (cmd && cmd->eventfd >= 0) {
-        struct epoll_event ev = {0};
-        ev.events = EPOLLIN;
-        ev.data.u32 = 1; /* slot 1 = cmd_queue eventfd */
-        if (epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, cmd->eventfd, &ev) != 0) {
-            log_error("[IPC-%d] epoll_ctl ADD cmd_queue eventfd failed: %s",
-                    slot_id, strerror(errno));
-        }
-    }
-
-    return ctx;
-}
-
-void ipc_thread_ctx_destroy(IpcThreadCtx *ctx) {
-    if (!ctx) return;
-    if (ctx->fd_cmd >= 0) close(ctx->fd_cmd);
-    if (ctx->fd_data >= 0) close(ctx->fd_data);
-    if (ctx->fd_ctrl >= 0) close(ctx->fd_ctrl);
-    if (ctx->epfd >= 0) close(ctx->epfd);
-    free(ctx);
-}
-
-void* ipc_thread_loop(void *arg) {
-    IpcThreadCtx *ctx = (IpcThreadCtx*)arg;
-    if (!ctx) return NULL;
-
-    struct epoll_event events[8];
-
-    while (atomic_load(&ctx->running)) {
-        /* 1. Handle commands (non-blocking drain) */
-        IpcThreadMsg cmd;
-        while (msg_queue_recv(ctx->cmd_queue, &cmd)) {
-            handle_cmd(ctx, &cmd);
-        }
-
-        /* 2. epoll_wait: fd_data + fd_ctrl + cmd_queue eventfd */
-        int nfds = epoll_wait(ctx->epfd, events, 8, 500);
-
-        for (int i = 0; i < nfds; i++) {
-            uint32_t slot = events[i].data.u32;
-
-            if (slot == 1) {
-                /* cmd_queue eventfd: drain and process commands */
-                msg_queue_drain_eventfd(ctx->cmd_queue);
-                while (msg_queue_recv(ctx->cmd_queue, &cmd)) {
-                    handle_cmd(ctx, &cmd);
-                }
-                continue;
-            }
-
-            if (slot == 2) {
-                /* fd_data event: BATCH data */
-                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                    log_error("[IPC-%d] fd_data error/hup (events=0x%x)",
-                            ctx->slot_id, events[i].events);
-                    worker_mark_dead(ctx, true);
-                    continue;
-                }
-                read_data_message(ctx);
-                continue;
-            }
-
-            if (slot == 3) {
-                /* fd_ctrl event: control signals */
-                if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                    log_error("[IPC-%d] fd_ctrl error/hup (events=0x%x)",
-                            ctx->slot_id, events[i].events);
-                    worker_mark_dead(ctx, true);
-                    continue;
-                }
-                read_ctrl_message(ctx);
-                continue;
-            }
-        }
-
-        /* 3. Heartbeat timeout check */
-        if (!atomic_load(&ctx->waiting_replace) && ctx->pid > 0) {
-            time_t now = time(NULL);
-            time_t last = atomic_load(&ctx->last_heartbeat);
-            /* v15.1.1: startup_timeout=60s for INITIALIZING workers, normal 30s after READY/HEARTBEAT */
-            int timeout_sec = (last == ctx->spawn_time) ? 60 : HEARTBEAT_TIMEOUT_SEC;
-            if (difftime(now, last) > timeout_sec) {
-                log_warn("[IPC-%d] heartbeat timeout (last=%ld, spawn=%ld, timeout=%ds), killing worker",
-                        ctx->slot_id, (long)last, (long)ctx->spawn_time, timeout_sec);
-                worker_timeout_kill(ctx);
-            }
-        }
-    }
-
-    return NULL;
-}
-
-void ipc_thread_stop(IpcThreadCtx *ctx) {
-    if (!ctx) return;
-    atomic_store(&ctx->running, false);
 }

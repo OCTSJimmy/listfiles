@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.1.5**（基于 v15.1.4 `process_completed_batch` count corruption 防御 + `attempts` 计数器修复）
+当前设计版本：**v15.2.0**（模块化重构完成，8 个 Phase，32 个源文件）
 
 ---
 
@@ -39,6 +39,13 @@
 | **v15.0.2** | **计数器修复 + fd_cmd_rd 保留** | `process_completed_batch` 对每个 BATCH 都减 `pending_tasks`（单个 SCAN 可产生多个 BATCH），`dispatch_lost_tasks` 重发时不增，`RET_FINISH` 不减，`fd_cmd_rd` 被提前关闭 → `pending_tasks` 永久滞留，程序无法终止 | `process_completed_batch` 只负责 `pending_batches`；`dispatch_lost_tasks` 发 SCAN 时 +1；`RET_FINISH` 时 -1；保留 `cmd_pipe[0]` 给 cleanup drain 用 |
 | **v15.0.3** | **阻塞写修复** | `fd_data`（Worker → Master）和 `fd_ctrl`（Worker → Master）在 Worker 侧为阻塞写；当 IPC 线程处理 cmd_queue 延迟时，Worker Scanner 线程写 fd_data 阻塞，不发 FINISH，pending_tasks 无法归零 | `fork` 前将 `data_pipe[1]` 和 `ctrl_pipe[1]` 设为 `O_NONBLOCK`，使 Worker 侧写操作在 EAGAIN 时 `usleep` 重试而非永久阻塞 |
 | **v15.0.4** | **IPC 链路追踪** | v15.0.3 修复阻塞写后仍卡死，`pending_tasks=477` 不归零。根因未知，需定位 FINISH 在 Worker→IPC→ret_queue→主循环哪一环丢失 | 在 `read_ctrl_message` FINISH 分支、`send_return`、CMD_SCAN 成功路径增加 `log_info` 级追踪；Worker FINISH EAGAIN 超 1000 次打印 `log_warn` |
+| **v15.1.0** | **Master Worker 状态机** | Master 不知道 Worker 在做什么，反复向卡死 Worker 发 SCAN；replace 后 cleanup 不运行 | IDLE / BUSY / DEAD 三状态 + `process_replace` 强制 cleanup |
+| **v15.1.1** | **完整状态机** | INITIALIZING 缺失、startup_timeout 缺失、RET_ERROR 后状态恢复缺失、Monitor 无 Worker 显示 | 四状态 + 60s startup_timeout + RET_ERROR→WAITING + Monitor 独立 Worker 状态 |
+| **v15.1.2** | **硬超时** | `batch_dedup_worker` 被 1000 万文件卡住，`pending_batches` 不归零 | `clock_gettime(CLOCK_MONOTONIC)` 硬超时 + `log_error` 强制退出 |
+| **v15.1.3** | **Shard 无限循环防御** | `fp_shard_insert_internal` probe 超过 INT_MAX 次，`fpbin` 被覆盖 | `PROBE_LIMIT` + `capacity` sanity check + resize rollback |
+| **v15.1.4** | **`process_completed_batch` 防御** | 队列状态不一致导致无限循环 | count sanity check + iteration hard stop |
+| **v15.1.5** | **dispatch attempts 修复** | `while (attempts < num_workers)` 中 `continue` 不递增 `attempts`，CPU 100% 空转 | `continue` 前 `attempts++` |
+| **v15.2.0** | **模块化重构完成** | 源码文件过大（>500行），职责混杂，维护困难 | 8 个 Phase 拆分：24 文件 → 32 文件，按 core/ipc/scan/output/util 职责边界组织 |
 ---
 
 ## v13.0.0：IPC 线程隔离

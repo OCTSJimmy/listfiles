@@ -9,6 +9,7 @@
 #include "fingerprint_set.h"
 #include "reference_map.h"
 #include "ipc_protocol.h"
+#include "worker_scanner.h"
 
 /* Worker 显式状态机 (v15.1.0) */
 #define WORKER_STATE_IDLE         0
@@ -47,14 +48,14 @@ bool        worker_pool_spawn(WorkerPool *pool, int slot_id);
 bool        worker_pool_replace(WorkerPool *pool, int slot_id);
 void        worker_pool_stop_all(WorkerPool *pool);
 
-/* IPC */
-int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_len);
-int ipc_recv_header(int fd, IpcMessageHeader *hdr);
-int ipc_recv_payload(int fd, void *buf, uint32_t len);
-int ipc_drain_and_count_tasks(int fd_in);
+/* Master-side */
+WorkerPool* worker_pool_create(int num_workers);
+void        worker_pool_destroy(WorkerPool *pool);
+bool        worker_pool_spawn(WorkerPool *pool, int slot_id);
+bool        worker_pool_replace(WorkerPool *pool, int slot_id);
+void        worker_pool_stop_all(WorkerPool *pool);
 
 /* Worker-side */
-void worker_set_context(const Config *cfg, const FingerprintSet *ref_set, const ReferenceMap *ref_map);
 void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id);
 
 /* Forward declaration to break circular dependency with app_context.h */

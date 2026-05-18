@@ -10,7 +10,7 @@ CC := gcc
 # -Wall -Wextra: 开启所有常用和额外的警告
 # -Iinclude: 告诉编译器去 'include' 目录下查找头文件 (.h)
 # -pthread: 启用 POSIX 线程支持
-CFLAGS := -g -Wall -Wextra -std=gnu11 -Iinclude -pthread
+CFLAGS := -g -Wall -Wextra -std=gnu11 -Iinclude -Iinclude/core -Iinclude/ipc -Iinclude/scan -Iinclude/output -Iinclude/util -Ilib/zlib -pthread
 
 # 链接选项
 # -pthread: 链接时加入线程库
@@ -30,12 +30,10 @@ BINDIR := bin
 # 目标可执行文件名
 TARGET := listfiles
 
-# 自动获取 src 目录下所有的 .c 文件
-# SOURCES := $(filter-out $(SRCDIR)/smart_queue.c, $(wildcard $(SRCDIR)/*.c))
-SOURCES :=  $(wildcard $(SRCDIR)/*.c)
+# 自动获取 src 及其子目录下所有的 .c 文件
+SOURCES := $(shell find $(SRCDIR) -name '*.c')
 # 根据 .c 文件列表，自动生成对应的 .o (object) 文件列表
-# 例如, src/main.c 会被转换为 obj/main.o
-OBJECTS := $(SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
+OBJECTS := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SOURCES))
 
 # ==============================================================================
 # 规则定义 (Rules)
@@ -57,7 +55,7 @@ $(BINDIR)/$(TARGET): $(OBJECTS)
 # 编译规则: 定义了如何从一个 .c 文件编译成一个 .o 文件
 # $< 代表规则的第一个依赖 (即对应的 .c 文件)
 $(OBJDIR)/%.o: $(SRCDIR)/%.c
-	@mkdir -p $(OBJDIR)
+	@mkdir -p $(dir $@)
 	@echo "===> Compiling $<..."
 	$(CC) $(CFLAGS) -c $< -o $@
 
