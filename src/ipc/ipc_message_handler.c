@@ -167,7 +167,7 @@ void read_ctrl_message(IpcThreadCtx *ctx) {
             break;
         }
         case IPC_MSG_READY: {
-            log_debug("[IPC-%d] received READY, forwarding RET_READY", ctx->slot_id);
+            log_debug_v(202605150000, "[IPC-%d] received READY, forwarding RET_READY", ctx->slot_id);
             send_return(ctx, RET_READY, NULL, 0);
             free(payload);
             break;
@@ -247,7 +247,7 @@ void read_data_message(IpcThreadCtx *ctx) {
         }
     }
 
-    log_debug("[IPC-%d] received BATCH (payload=%u), forwarding RET_BATCH", ctx->slot_id, hdr.payload_len);
+    log_debug_v(202605150000, "[IPC-%d] received BATCH (payload=%u), forwarding RET_BATCH", ctx->slot_id, hdr.payload_len);
     send_return(ctx, RET_BATCH, payload, hdr.payload_len);
     /* ownership transferred */
 }
@@ -305,7 +305,7 @@ void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
                 worker_mark_dead(ctx, true);
             } else {
                 ctx->eagain_retry_count = 0;
-                log_info("[IPC-%d] CMD_SCAN sent to worker (path=%s, len=%u)", ctx->slot_id, path_log_mask(scan->path), scan->path_len);
+                log_info_v(202605150000, "[IPC-%d] CMD_SCAN sent to worker (path=%s, len=%u)", ctx->slot_id, path_log_mask(scan->path), scan->path_len);
             }
             break;
         }

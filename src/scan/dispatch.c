@@ -143,7 +143,7 @@ void dispatch_lost_tasks(AppContext *ctx) {
             continue;
         }
         atomic_fetch_add(&ctx->pending_tasks, 1);
-        log_debug("[LostTasks] dispatched %s to worker %d, pending_tasks=%ld", path_log_mask(path), wid, atomic_load(&ctx->pending_tasks));
+        log_debug_v(202605150000, "[LostTasks] dispatched %s to worker %d, pending_tasks=%ld", path_log_mask(path), wid, atomic_load(&ctx->pending_tasks));
 
         slot->current_dev = 0;
         safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
@@ -168,7 +168,7 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
     if (slot->fd_cmd_rd >= 0) {
         orphaned = ipc_drain_and_count_tasks(slot->fd_cmd_rd);
         if (orphaned > 0) {
-            log_debug("[Cleanup] Worker %d drained %d orphaned tasks from fd_cmd_rd", worker_id, orphaned);
+            log_debug_v(202605150000, "[Cleanup] Worker %d drained %d orphaned tasks from fd_cmd_rd", worker_id, orphaned);
         }
         close(slot->fd_cmd_rd);
         slot->fd_cmd_rd = -1;

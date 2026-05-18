@@ -16,7 +16,8 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.2.0" // v15.2.0: modular refactor complete (8 phases, 24 files → 32 files)
+#define VERSION "15.3.0"
+#define VERSION_CODE 202605180903UL // v15.3.0: versioned logging framework + --verbose-version
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
@@ -174,6 +175,7 @@ typedef struct {
     bool verbose;
     int verbose_type;
     int verbose_level;
+    unsigned long verbose_version; /* --verbose-version, ULONG_MAX=use default VERSION_CODE */
     unsigned long progress_slice_lines;
     unsigned long output_slice_lines;
     bool decompress;

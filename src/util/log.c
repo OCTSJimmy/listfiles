@@ -4,6 +4,7 @@
  */
 #define _GNU_SOURCE
 #include "log.h"
+#include "config.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <time.h>
@@ -11,6 +12,7 @@
 
 static bool g_verbose = false;
 static int  g_verbose_level = 0;
+unsigned long g_log_version_threshold = VERSION_CODE;
 static const char *level_names[] = {
     "FATAL", "ERROR", "WARN", "INFO", "DEBUG", "TRACE"
 };
@@ -31,6 +33,14 @@ LogLevel log_get_threshold(void) {
     if (g_verbose_level >= 2) return LOG_LEVEL_DEBUG;
     if (g_verbose_level >= 1) return LOG_LEVEL_INFO;
     return LOG_LEVEL_INFO;
+}
+
+void log_set_version_threshold(unsigned long threshold) {
+    g_log_version_threshold = threshold;
+}
+
+unsigned long log_get_version_threshold(void) {
+    return g_log_version_threshold;
 }
 
 static void log_timestamp(char *buf, size_t size) {

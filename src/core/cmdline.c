@@ -66,6 +66,7 @@ void show_help() {
     printf("  -R, --resume-from=文件 仅从指定的进度列表文件恢复 (预留，暂未实现)\n");
     printf("  --max-slice=行数       每个输出切片的最大行数\n");
     printf("  -v, --verbose          启用详细日志\n");
+    printf("  --verbose-version=TIMESTAMP  只显示版本号>=TIMESTAMP的日志 (默认: 当前版本)\n");
     printf("  -h, --help             显示此帮助信息\n");
 }
 
@@ -94,6 +95,7 @@ void init_config(Config *cfg) {
     cfg->decompress = false;
     cfg->verbose_type = VERBOSE_TYPE_FULL;
     cfg->verbose_level = DEFAULT_VERBOSE_LEVEL;
+    cfg->verbose_version = ULONG_MAX;
     cfg->mute = false;
     cfg->sure = false;
     cfg->runone = false;
@@ -159,6 +161,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"worker-count", required_argument, 0, 26},
         {"timeout", required_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
+        {"verbose-version", required_argument, 0, 27},
         {0, 0, 0, 0}
     };
 
@@ -249,6 +252,9 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
                     log_error("Timeout must be positive.");
                     exit(EXIT_FAILURE);
                 }
+                break;
+            case 27:
+                cfg->verbose_version = strtoul(optarg, NULL, 10);
                 break;
             case 'h': show_help(); return 2;
             default:

@@ -84,7 +84,7 @@ void send_return(IpcThreadCtx *ctx, uint32_t type, void *data, size_t len) {
         log_error("[IPC-%d] ret_queue full, message type=%u dropped", ctx->slot_id, type);
         free(data);
     } else {
-        log_info("[IPC-%d] ret_queue send OK (type=%u, len=%zu, queue=%p)", ctx->slot_id, type, len, (void*)ctx->ret_queue);
+        log_info_v(202605150000, "[IPC-%d] ret_queue send OK (type=%u, len=%zu, queue=%p)", ctx->slot_id, type, len, (void*)ctx->ret_queue);
         if (ctx->master_cond) {
             pthread_cond_signal(ctx->master_cond);
         }

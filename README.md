@@ -109,6 +109,7 @@ make clean
 | `-C, --clean` | 删除已处理的进度分片（不与 `-Z` 同时使用） |
 | `-R, --resume-from=文件` | 仅从指定进度列表文件恢复（**预留，暂未实现**） |
 | `-v, --verbose` | 启用详细日志 |
+| `--verbose-version=TIMESTAMP` | 只显示版本号 `>= TIMESTAMP` 的日志。默认值为当前编译版本号 `VERSION_CODE`，旧版本引入的调试日志默认被遮蔽。与 `--verbose` 配合使用，传 `0` 显示所有日志 |
 | `-h, --help` | 显示帮助信息 |
 
 ### 格式说明符参考

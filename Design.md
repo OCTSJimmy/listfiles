@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.2.0**（模块化重构完成，8 个 Phase，32 个源文件）
+当前设计版本：**v15.3.0**（版本化日志框架 + 模块化重构，32 个源文件）
 
 ---
 
@@ -17,7 +17,8 @@
 3. [v13.0.1：启动崩溃修复](#v1301启动崩溃修复)
 4. [消息协议](#消息协议)
 5. [故障隔离模型](#故障隔离模型)
-6. [已知问题与待办](#已知问题与待办)
+6. [诊断与日志：版本化衰减](#诊断与日志版本化衰减)
+7. [已知问题与待办](#已知问题与待办)
 
 ---
 
@@ -394,6 +395,60 @@ v14.0.x 中 Worker 拆分为 Scanner 线程 + IPC 线程后，两条线程并发
 - `src/worker_proc.c` — Scanner 写 fd_data，IPC 写 fd_ctrl，移除 g_fd_out_mutex
 - `src/main_loop.c` — 状态机实现（INITIALIZING/IDLE/BUSY/DEAD），READY/FINISH/DEV_TIMEOUT 处理
 - `src/monitor.c` — 显示 Worker 真实状态
+
+---
+
+## 诊断与日志：版本化衰减
+
+### 问题背景
+
+v12.x ~ v15.x 期间为排查多次 P0 阻断性问题（fd 号重用死锁、payload timeout 级联、pending_tasks 不归零、IPC 线程卡死等），代码中引入了大量高频追踪日志。这些日志在排障阶段不可或缺，但在生产环境正常运行时每秒产生数千行，3 小时 41 分钟可累积 **987MB / 1000 万行**，严重污染 stderr 并拖慢 I/O。
+
+传统 `verbose_level`（0~3）按**重要性**过滤：ERROR/FATAL 始终输出，INFO/DEBUG/TRACE 按级别遮蔽。但追踪日志与关键状态日志往往同级（均为 `log_info` 或 `log_debug`），导致无法单独关闭追踪而不影响状态观察。
+
+### 设计：VERSION_CODE + 版本化阈值
+
+引入第二个过滤维度——**引入版本**（`VERSION_CODE`），与 `verbose_level` 正交共存：
+
+| 维度 | 控制粒度 | 作用 |
+|------|---------|------|
+| `verbose_level` | 粗（按级别） | 区分 ERROR / WARN / INFO / DEBUG / TRACE |
+| `verbose_version` | 细（按版本） | 区分 "当前版本日志" vs "旧版本追踪日志" |
+
+**核心规则**：
+- `config.h` 中定义 `VERSION_CODE = YYYYMMDDHHMM`（如 `202605180903`），每次发布递增。
+- 每条日志可带一个**版本标记**（通过 `log_info_v(ver, ...)` 宏）。
+- 全局阈值 `g_log_version_threshold`：
+  - **默认** = `VERSION_CODE`（不传 `--verbose-version` 时）。
+  - 只输出 `ver >= threshold` 的日志。
+  - 传 `--verbose-version=0` 时 `threshold = 0`，所有日志输出。
+- 现有 `log_info(...)` 等便捷宏自动等价于 `log_info_v(VERSION_CODE, ...)`，新日志无需显式传版本。
+
+**衰减策略**：
+- 关键日志（启动、完成、Worker 替换、设备熔断、错误）标记为当前 `VERSION_CODE`，始终输出。
+- 旧排障追踪日志（v15.0.x ~ v15.1.x 引入的 IPC 链路追踪、心跳、batch 处理细节）降级为 `log_*_v(202605150000, ...)`，默认被遮蔽。
+- 需要排查历史问题时，传 `--verbose-version=202605150000` 精确打开该版本之后的所有日志。
+
+### 与 verbose_level 的配合
+
+```
+生产运行（默认）：--verbose-level=0，不传 --verbose-version
+  → 只输出 ERROR/FATAL + 关键状态变化（VERSION_CODE 标记）
+
+日常观察：--verbose-level=1，不传 --verbose-version
+  → + INFO 级关键日志（VERSION_CODE 标记）
+
+问题排查：--verbose-level=2 --verbose-version=202605150000
+  → + DEBUG 级 + v15.0.x 之后所有追踪日志
+
+全开审计：--verbose-level=3 --verbose-version=0
+  → 所有 TRACE + 所有历史版本日志
+```
+
+### 已知限制
+
+- 旧日志的"引入版本"需要手动标记，无法自动追溯。但新追踪日志一旦完成使命，可在下次发布时批量降级版本号。
+- `VERSION_CODE` 以"分钟"为粒度，同一分钟内多次提交的日志版本相同。实践中足够区分发布周期。
 
 ---
 

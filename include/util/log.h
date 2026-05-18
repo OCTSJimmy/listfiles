@@ -8,6 +8,7 @@
 #ifndef LOG_H
 #define LOG_H
 
+#include "config.h"
 #include <stdbool.h>
 #include <stdarg.h>
 
@@ -47,13 +48,27 @@ LogLevel log_get_threshold(void);
  */
 void log_msg(LogLevel level, const char *fmt, ...);
 
-/* 便捷宏 */
-#define log_fatal(...)  log_msg(LOG_LEVEL_FATAL, __VA_ARGS__)
-#define log_error(...)  log_msg(LOG_LEVEL_ERROR, __VA_ARGS__)
-#define log_warn(...)   log_msg(LOG_LEVEL_WARN,  __VA_ARGS__)
-#define log_info(...)   log_msg(LOG_LEVEL_INFO,  __VA_ARGS__)
-#define log_debug(...)  log_msg(LOG_LEVEL_DEBUG, __VA_ARGS__)
-#define log_trace(...)  log_msg(LOG_LEVEL_TRACE, __VA_ARGS__)
+/* 版本化日志阈值 */
+extern unsigned long g_log_version_threshold;
+
+void log_set_version_threshold(unsigned long threshold);
+unsigned long log_get_version_threshold(void);
+
+/* 带版本的日志宏 */
+#define log_fatal_v(ver, ...)  do { if ((unsigned long)(ver) >= g_log_version_threshold) log_msg(LOG_LEVEL_FATAL, __VA_ARGS__); } while(0)
+#define log_error_v(ver, ...)  do { if ((unsigned long)(ver) >= g_log_version_threshold) log_msg(LOG_LEVEL_ERROR, __VA_ARGS__); } while(0)
+#define log_warn_v(ver, ...)   do { if ((unsigned long)(ver) >= g_log_version_threshold) log_msg(LOG_LEVEL_WARN,  __VA_ARGS__); } while(0)
+#define log_info_v(ver, ...)   do { if ((unsigned long)(ver) >= g_log_version_threshold) log_msg(LOG_LEVEL_INFO,  __VA_ARGS__); } while(0)
+#define log_debug_v(ver, ...)  do { if ((unsigned long)(ver) >= g_log_version_threshold) log_msg(LOG_LEVEL_DEBUG, __VA_ARGS__); } while(0)
+#define log_trace_v(ver, ...)  do { if ((unsigned long)(ver) >= g_log_version_threshold) log_msg(LOG_LEVEL_TRACE, __VA_ARGS__); } while(0)
+
+/* 默认版本 = VERSION_CODE（不传 --verbose-version 时始终输出） */
+#define log_fatal(...)  log_fatal_v(VERSION_CODE, __VA_ARGS__)
+#define log_error(...)  log_error_v(VERSION_CODE, __VA_ARGS__)
+#define log_warn(...)   log_warn_v(VERSION_CODE, __VA_ARGS__)
+#define log_info(...)   log_info_v(VERSION_CODE, __VA_ARGS__)
+#define log_debug(...)  log_debug_v(VERSION_CODE, __VA_ARGS__)
+#define log_trace(...)  log_trace_v(VERSION_CODE, __VA_ARGS__)
 
 /**
  * @brief 不带前缀的原始 stderr 输出（用于已有格式化内容）

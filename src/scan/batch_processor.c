@@ -144,7 +144,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
         return;
     }
 
-    log_debug("[Batch] process_completed_batch start worker=%d count=%d pending_batches=%ld",
+    log_debug_v(202605150000, "[Batch] process_completed_batch start worker=%d count=%d pending_batches=%ld",
               batch->worker_id, batch->count, atomic_load(&ctx->pending_batches));
     OutputBatch out_batch = {0};
 
@@ -236,7 +236,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
     }
 
     atomic_fetch_sub(&ctx->pending_batches, 1);
-    log_debug("[Batch] pending_batches after sub: %ld", atomic_load(&ctx->pending_batches));
+    log_debug_v(202605150000, "[Batch] pending_batches after sub: %ld", atomic_load(&ctx->pending_batches));
     ctx->state.total_dequeued_count++;
 
     for (int i = 0; i < batch->count; i++) free(batch->paths[i]);
@@ -263,7 +263,7 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
         log_error("[Batch] Worker %d parse_batch FAILED (len=%u)", worker_id, len);
         return;
     }
-    log_debug("[Batch] Worker %d parse_batch OK (count=%d)", worker_id, parsed.count);
+    log_debug_v(202605150000, "[Batch] Worker %d parse_batch OK (count=%d)", worker_id, parsed.count);
 
     /* v15.1.4: defensive sanity check on parsed.count */
     if (parsed.count < 0 || parsed.count > 1000000) {
@@ -291,15 +291,15 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
     batch->results = results;
     batch->worker_id = worker_id;
 
-    log_debug("[Batch] pending_batches before add: %ld", atomic_load(&ctx->pending_batches));
+    log_debug_v(202605150000, "[Batch] pending_batches before add: %ld", atomic_load(&ctx->pending_batches));
     atomic_fetch_add(&ctx->pending_batches, 1);
-    log_debug("[Batch] pending_batches after add: %ld", atomic_load(&ctx->pending_batches));
+    log_debug_v(202605150000, "[Batch] pending_batches after add: %ld", atomic_load(&ctx->pending_batches));
     if (thread_pool_submit(ctx->thread_pool, batch)) {
-        log_debug("[Batch] Worker %d submitted to thread pool", worker_id);
+        log_debug_v(202605150000, "[Batch] Worker %d submitted to thread pool", worker_id);
         return;
     }
 
-    log_debug("[Batch] Worker %d thread pool full, inline processing", worker_id);
+    log_debug_v(202605150000, "[Batch] Worker %d thread pool full, inline processing", worker_id);
     batch_dedup_worker(batch, ctx);
     process_completed_batch(ctx, batch);
 }

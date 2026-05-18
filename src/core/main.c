@@ -270,6 +270,13 @@ int main(int argc, char *argv[]) {
     /* Initialize logging with verbose settings */
     log_init(ctx.cfg.verbose, ctx.cfg.verbose_level);
 
+    /* Set version threshold: default = VERSION_CODE, override if --verbose-version specified */
+    if (ctx.cfg.verbose_version != ULONG_MAX) {
+        log_set_version_threshold(ctx.cfg.verbose_version);
+    } else {
+        log_set_version_threshold(VERSION_CODE);
+    }
+
     ctx.state.start_time = time(NULL);
     ctx.state.has_error = false;
     ctx.dev_mgr = dev_mgr_create();

@@ -98,7 +98,7 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
             IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
             int rc_hb = ipc_send(fd_ctrl, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
             if (heartbeat_count <= 3 || rc_hb != 0) {
-                log_debug("[Worker-%d] heartbeat sent (rc=%d, count=%d)", worker_id, rc_hb, heartbeat_count);
+                log_debug_v(202605150000, "[Worker-%d] heartbeat sent (rc=%d, count=%d)", worker_id, rc_hb, heartbeat_count);
             }
             last_heartbeat = time(NULL);
         }

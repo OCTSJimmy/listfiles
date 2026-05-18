@@ -4,6 +4,53 @@
 
 ---
 
+## [15.3.0] - 2026-05-18
+
+### 新增：版本化日志框架（Versioned Logging）+ `--verbose-version`
+
+**问题背景**：v12.x ~ v15.x 期间为排查多次 P0 阻断性问题（fd 号重用死锁、payload timeout 级联、pending_tasks 不归零、IPC 线程卡死等），引入了大量高频追踪日志（`ret_queue send OK`、`received FINISH forwarding`、`Bus Worker X FINISH`、`heartbeat sent`、`ipc_send fd=X` 等）。这些日志在生产环境正常运行时无价值，但默认 verbose 模式下每秒产生数千行，3 小时 41 分钟累积 **987MB / 1000 万行**，严重污染 stderr 并拖慢 I/O。
+
+**设计目标**：
+1. 默认运行（不传 `--verbose-version`）时，旧版本引入的调试追踪日志自动静默。
+2. 关键日志（启动、完成、错误、Worker 替换、设备熔断）始终输出，不受版本衰减影响。
+3. 需要排查历史问题时，可通过 `--verbose-version=TIMESTAMP` 精确打开某个版本之后的所有日志。
+4. 与现有 `verbose_level`（0~3）正交共存。
+
+**核心机制**：
+- `config.h` 定义 `VERSION_CODE = 202605180903UL`（年月日时分），每次发布递增。
+- 日志宏新增 `_v(版本, ...)` 变体：
+  - `log_info_v(ver, ...)`、`log_debug_v(ver, ...)` 等。
+  - 若 `ver < g_log_version_threshold`，该日志静默。
+  - 默认 `threshold = VERSION_CODE`（不传 `--verbose-version` 时）。
+  - 传 `--verbose-version=0` 时 `threshold = 0`，所有日志输出。
+- 现有 `log_info(...)` 等便捷宏自动等价于 `log_info_v(VERSION_CODE, ...)`，无需逐条迁移。
+- 旧高频追踪日志手动降级为 `log_*_v(202605150000, ...)`（v15.0.x ~ v15.1.x 引入），默认被遮蔽。
+
+**降级的高频日志（标记为 202605150000）**：
+| 文件 | 原日志 | 频率 |
+|------|--------|------|
+| `ipc_worker_mgmt.c` | `ret_queue send OK` | 每次 IPC 线程转发消息 |
+| `ipc_message_handler.c` | `received READY/FINISH/BATCH, forwarding` | 每条控制/数据消息 |
+| `ipc_message_handler.c` | `CMD_SCAN sent to worker` | 每次任务分发 |
+| `main_loop.c` | `Bus Worker X BATCH/FINISH` | 主线程处理返回消息 |
+| `worker_proc.c` | `heartbeat sent` | 每 5 秒 8 次 |
+| `ipc_protocol.c` | `ipc_send fd=X total=...` | 每次 IPC 发送 |
+| `batch_processor.c` | `process_completed_batch start` / `pending_batches` / `parse_batch OK` / `submitted to thread pool` | 每个 BATCH 处理 |
+| `dispatch.c` | `LostTasks dispatched` / `Cleanup drained orphaned` | 每次 lost task 重发 / Worker 清理 |
+
+**命令行新增**：
+- `--verbose-version=TIMESTAMP`：只显示版本号 `>= TIMESTAMP` 的日志。
+
+**修改的文件**：
+- `include/core/config.h`：`VERSION "15.3.0"`、`VERSION_CODE`
+- `include/util/log.h` / `src/util/log.c`：`_v` 宏、`g_log_version_threshold`
+- `src/core/cmdline.c`：`--verbose-version` 参数解析
+- `src/core/main.c`：threshold 初始化
+- `src/ipc/ipc_worker_mgmt.c`、`src/ipc/ipc_message_handler.c`、`src/scan/main_loop.c`、`src/ipc/worker_proc.c`、`src/ipc/ipc_protocol.c`、`src/scan/batch_processor.c`、`src/scan/dispatch.c`：高频追踪日志降级
+- `README.md`：`--verbose-version` 文档
+
+---
+
 ## [15.2.0] - 2026-05-18
 
 ### 架构重构完成：模块化拆分（Phase 2 ~ Phase 8）
