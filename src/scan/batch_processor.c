@@ -113,8 +113,15 @@ void batch_dedup_worker(TPBatch *batch, void *user_data) {
         uint8_t fp[FP_SIZE];
         fp_compute(path, st->st_dev, st->st_ino, fp);
         uint8_t result = 0;
-        if (fp_set_insert(ctx->visited_set, fp)) {
-            result |= 1; /* duplicate */
+        /* v15.4.4: In HIST_PUMP_OLD phase, skip visited_set dedup for directories
+         * so that re-scanning can discover sub-directories that were lost during
+         * the previous interrupted run. Files are still deduped to avoid duplicate
+         * output entries. */
+        bool is_dir = S_ISDIR(st->st_mode);
+        if (!is_dir || ctx->hist_pump_state != HIST_PUMP_OLD) {
+            if (fp_set_insert(ctx->visited_set, fp)) {
+                result |= 1; /* duplicate */
+            }
         }
         if (dev_mgr_is_blacklisted(ctx->dev_mgr, st->st_dev)) {
             result |= 2; /* blacklisted */
@@ -144,7 +151,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
         return;
     }
 
-    log_debug_v(202605150000, "[Batch] process_completed_batch start worker=%d count=%d pending_batches=%ld",
+    log_debug_v(202605181600UL, "[Batch] process_completed_batch start worker=%d count=%d pending_batches=%ld",
               batch->worker_id, batch->count, atomic_load(&ctx->pending_batches));
     OutputBatch out_batch = {0};
 
@@ -168,23 +175,27 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
         if (S_ISDIR(st->st_mode)) {
             if (ctx->hist_pump_state == HIST_PUMP_OLD) {
                 fpbin_append(ctx, path, st);
-            } else {
-                atomic_fetch_add(&ctx->pending_tasks, 1);
-                int wid = dispatch_find_idle_worker(ctx);
-                if (wid < 0) {
-                    log_warn("[Dispatch] no IDLE worker available (path=%s), requeue to lost_tasks", path_log_mask(path));
-                    atomic_fetch_sub(&ctx->pending_tasks, 1);
-                    lost_tasks_push(&ctx->lost_tasks, strdup(path));
-                    continue;
-                }
-                WorkerSlot *slot = &ctx->worker_pool->slots[wid];
-                atomic_store(&slot->state, WORKER_STATE_BUSY);
-                slot->current_dev = st->st_dev;
-                safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
-                if (!send_scan_to_ipc(ctx, wid, path, st->st_dev)) {
-                    atomic_fetch_sub(&ctx->pending_tasks, 1);
-                    atomic_store(&slot->state, WORKER_STATE_IDLE);
-                }
+                /* v15.4.4: During resume pumping, re-scan discovered directories
+                 * to recover sub-directories lost in the previous interrupted run. */
+            }
+            /* Unified dispatch: send CMD_SCAN for all non-duplicate directories.
+             * In HIST_PUMP_OLD, batch_dedup_worker no longer skips directories,
+             * so they reach here and get re-dispatched. */
+            atomic_fetch_add(&ctx->pending_tasks, 1);
+            int wid = dispatch_find_idle_worker(ctx);
+            if (wid < 0) {
+                log_warn("[Dispatch] no IDLE worker available (path=%s), requeue to lost_tasks", path_log_mask(path));
+                atomic_fetch_sub(&ctx->pending_tasks, 1);
+                lost_tasks_push(&ctx->lost_tasks, strdup(path));
+                continue;
+            }
+            WorkerSlot *slot = &ctx->worker_pool->slots[wid];
+            atomic_store(&slot->state, WORKER_STATE_BUSY);
+            slot->current_dev = st->st_dev;
+            safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
+            if (!send_scan_to_ipc(ctx, wid, path, st->st_dev)) {
+                atomic_fetch_sub(&ctx->pending_tasks, 1);
+                atomic_store(&slot->state, WORKER_STATE_IDLE);
             }
 
             ctx->state.dir_count++;
@@ -236,7 +247,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
     }
 
     atomic_fetch_sub(&ctx->pending_batches, 1);
-    log_debug_v(202605150000, "[Batch] pending_batches after sub: %ld", atomic_load(&ctx->pending_batches));
+    log_debug_v(202605181600UL, "[Batch] pending_batches after sub: %ld", atomic_load(&ctx->pending_batches));
     ctx->state.total_dequeued_count++;
 
     for (int i = 0; i < batch->count; i++) free(batch->paths[i]);
@@ -263,7 +274,7 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
         log_error("[Batch] Worker %d parse_batch FAILED (len=%u)", worker_id, len);
         return;
     }
-    log_debug_v(202605150000, "[Batch] Worker %d parse_batch OK (count=%d)", worker_id, parsed.count);
+    log_debug_v(202605181600UL, "[Batch] Worker %d parse_batch OK (count=%d)", worker_id, parsed.count);
 
     /* v15.1.4: defensive sanity check on parsed.count */
     if (parsed.count < 0 || parsed.count > 1000000) {
@@ -291,15 +302,15 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
     batch->results = results;
     batch->worker_id = worker_id;
 
-    log_debug_v(202605150000, "[Batch] pending_batches before add: %ld", atomic_load(&ctx->pending_batches));
+    log_debug_v(202605181600UL, "[Batch] pending_batches before add: %ld", atomic_load(&ctx->pending_batches));
     atomic_fetch_add(&ctx->pending_batches, 1);
-    log_debug_v(202605150000, "[Batch] pending_batches after add: %ld", atomic_load(&ctx->pending_batches));
+    log_debug_v(202605181600UL, "[Batch] pending_batches after add: %ld", atomic_load(&ctx->pending_batches));
     if (thread_pool_submit(ctx->thread_pool, batch)) {
-        log_debug_v(202605150000, "[Batch] Worker %d submitted to thread pool", worker_id);
+        log_debug_v(202605181600UL, "[Batch] Worker %d submitted to thread pool", worker_id);
         return;
     }
 
-    log_debug_v(202605150000, "[Batch] Worker %d thread pool full, inline processing", worker_id);
+    log_debug_v(202605181600UL, "[Batch] Worker %d thread pool full, inline processing", worker_id);
     batch_dedup_worker(batch, ctx);
     process_completed_batch(ctx, batch);
 }

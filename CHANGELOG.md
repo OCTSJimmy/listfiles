@@ -6,6 +6,18 @@
 
 ## [15.4.4] - 2026-05-18
 
+### Fixed：续传模式（--continue）丢失深层子目录（P0）
+
+**问题背景**：第一次执行被 Ctrl+C 中断后，续传（`--continue`）时 `batch_dedup_worker` 对所有目录都执行 `visited_set` 去重。由于父目录的 BATCH 结果中的子目录在第一次执行时就已经被插入 `visited_set`（作为"已见条目"），续传 pumping 阶段重新扫描父目录时，这些子目录被标记为 duplicate 跳过，导致其深层子目录永远无法被发现。程序 1 秒完成，但目标存储中仍有大量未扫描文件。
+
+**修复**：
+- `batch_dedup_worker()`：在 `HIST_PUMP_OLD` 阶段，对**目录**跳过 `visited_set` 去重（文件仍去重，避免输出重复）。这样 pumping 阶段发现的子目录不会被提前过滤。
+- `process_completed_batch()`：在 `HIST_PUMP_OLD` 阶段，对目录统一走 `fpbin_append` + `send_scan_to_ipc()`（之前仅 `fpbin_append`，不派发扫描任务）。这样丢失的目录在 pumping 阶段即被重新扫描，Worker 返回的 BATCH 中深层子目录若在 `visited_set` 中则正常跳过，若不在则继续递归扫描。
+- 同步更新 `batch_processor.c` 内部调试日志版本戳为 `202605181600UL`。
+
+**修改的文件**：
+- `src/scan/batch_processor.c`
+
 ### Fixed：IPC BATCH 消息 PIPE_BUF 大小限制（P0）
 
 **问题背景**：`ipc_send()` 对所有消息类型强制执行 `total_len > 4096` 即返回致命错误。Worker 侧 `scan_and_send()` 按固定 1024 条记录 batch，遇到大目录时 BATCH payload 可达数百 KB，`ipc_send()` 直接拒绝发送，导致 Worker 数据丢失、Master 统计不完整，程序提前退出但标记 Success。
