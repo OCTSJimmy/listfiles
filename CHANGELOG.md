@@ -4,7 +4,145 @@
 
 ---
 
-## [Unreleased]
+## [15.2.0] - 2026-05-18
+
+### 架构重构完成：模块化拆分（Phase 2 ~ Phase 8）
+
+**分支**：`v15.2.0-modular-refactor`
+
+**背景**：经过 8 个阶段的重构，将原本 24 个源文件的单体代码库拆分为 32 个模块，按职责边界重新组织。所有超过 500 行的源文件均已拆分完毕。
+
+**拆分总览**：
+
+| Phase | 原文件 | 拆分结果 | 职责 |
+|-------|--------|----------|------|
+| Phase 2 | 目录结构 | 模块化目录布局（core/ipc/scan/output/util） | — |
+| Phase 3 | 多文件 | 风格标准化 + dispatch 辅助函数提取 | — |
+| Phase 4 | `progress.c` (1790 行) | `progress.c` + `progress_io.c` + `progress_archive.c` | 进度核心 / 进度 IO / 进度归档 |
+| Phase 5 | `worker_proc.c` (951 行) | `ipc_protocol.c` + `worker_scanner.c` + `worker_proc.c` | IPC 协议 / 扫描引擎 / 进程池管理 |
+| Phase 6 | `main_loop.c` (823 行) | `batch_processor.c` + `dispatch.c` + `main_loop.c` | Batch 处理 / 任务分发 / 消息总线 |
+| Phase 7 | `output.c` (713 行) | `output.c` + `output_metadata.c` + `output_format.c` | 输出渲染 / 元数据缓存 / 格式预编译 |
+| Phase 8 | `ipc_thread.c` (550 行) | `ipc_thread.c` + `ipc_message_handler.c` + `ipc_worker_mgmt.c` | epoll 循环 / 消息处理 / Worker 生命周期 |
+
+**新增核心模块职责**：
+- `batch_processor.c`：Batch 解析、CPU 去重、完成处理
+- `dispatch.c`：任务分发、Worker 清理、IPC send 辅助
+- `ipc_protocol.c`：IPC TLV 协议封装（send/recv/drain）
+- `worker_scanner.c`：Worker 扫描引擎（scan_and_send / blind_trust）
+- `progress_io.c`：进度文件读写（save/load/shard）
+- `progress_archive.c`：进度分片压缩归档（gzip/zlib）
+- `output_metadata.c`：权限/xattr/用户名/组名缓存
+- `output_format.c`：格式预编译与输出文件管理
+- `ipc_message_handler.c`：IPC 消息接收与协议处理（HEARTBEAT/ERROR/FINISH/BATCH/CMD）
+- `ipc_worker_mgmt.c`：Worker 生命周期管理（死亡标记/超时杀掉/返回消息）
+
+**头文件调整**：
+- `include/scan/main_loop.h`：新增 `batch_dedup_worker()`、`send_scan_to_ipc()`、`send_stop_to_ipc()`、`dispatch_lost_tasks()`、`drain_completed_batches()` 声明
+- `include/output/output.h`：新增 `get_username()`、`get_groupname()`、`get_xattr_str()` 声明
+- `include/ipc/ipc_thread.h`：新增 `worker_mark_dead()`、`worker_timeout_kill()`、`send_return()`、`read_ctrl_message()`、`read_data_message()`、`handle_cmd()` 声明
+
+**接口调整（跨模块可见性）**：
+- `batch_dedup_worker`：从 `static` 改为非 static，供 `main_loop.c` 线程池回调注册
+- `send_scan_to_ipc` / `send_stop_to_ipc`：从 `main_loop.c` 内 static 改为 `dispatch.c` 导出
+- `get_xattr_str`：从 `static` 改为模块间可见，供 `output.c` 调用
+- `get_type_str` / `print_csv_field`：从 `output_metadata.c` 移入 `output.c`，保持 `static`
+- `read_ctrl_message` / `read_data_message` / `handle_cmd`：从 `static` 改为模块间可见
+- `worker_mark_dead` / `worker_timeout_kill` / `send_return`：从 `static` 改为模块间可见
+- `safe_ipc_recv_header` / `safe_ipc_recv_payload`：保持 `static`，仅在 `ipc_message_handler.c` 内部使用
+
+**编译**：`make clean && make` 零警告。源码总量约 8000 行（含注释）。
+
+**Git 分支迁移**：
+- 重构提交从 `dev` 分支迁移至独立分支 `v15.2.0-modular-refactor`
+- `dev` 分支重置为 `origin/dev`（v15.1.5），不再包含重构提交
+- 提交节点保持不变，仅迁移分支归属
+
+---
+
+## [Unreleased] (continued)
+
+### 架构：Phase 7 — 拆分 output.c（~600 行 → 3 模块）
+
+**背景**：`output.c` 混合格式化输出引擎、元数据查询（权限/xattr/用户名/组名缓存）、格式预编译与文件管理三种不同职责，且体积庞大。
+
+**拆分结果**：
+- `src/output/output.c` (~130 行)：核心格式化输出引擎 — `get_type_str` / `print_csv_field` / `print_to_stream` / `cleanup_cache`
+- `src/output/output_metadata.c` (~220 行)：元数据辅助函数 — `format_mode_str` / `get_xattr_str` / `get_username` / `get_groupname` / 设备状态缓存 (`get_device_status` / `set_device_status`)
+- `src/output/output_format.c` (~260 行)：格式预编译与文件管理 — `precompile_format` / `cleanup_compiled_format` / `create_output_file` / `open_output_file_append` / `close_output_file` / `init_output_files` / `rotate_output_slice`
+
+**头文件调整**：
+- `include/output/output.h`：新增 `get_username()`、`get_groupname()`、`get_xattr_str()` 外部声明
+
+**接口调整**：
+- `get_xattr_str()` 从 `static` 改为模块间可见，供 `output.c` 的 `print_to_stream` 调用
+- `get_type_str()` / `print_csv_field()` 从 `output_metadata.c` 移入 `output.c`，定位为输出引擎私有辅助函数（保持 `static`）
+
+**编译**：`make clean && make` 零警告。
+
+---
+
+### 架构：Phase 8 — 拆分 ipc_thread.c（550 行 → 3 模块）
+
+**背景**：`ipc_thread.c` 混合 IPC 消息处理、Worker 生命周期管理与线程入口/epoll 主循环三种职责。
+
+**拆分结果**：
+- `src/ipc/ipc_thread.c` (~130 行)：IPC 线程生命周期与 epoll 主循环 — `ipc_thread_ctx_create` / `ipc_thread_ctx_destroy` / `ipc_thread_loop` / `ipc_thread_stop`
+- `src/ipc/ipc_message_handler.c` (~340 行)：IPC 消息接收与处理 — `safe_ipc_recv_header` / `safe_ipc_recv_payload` / `read_ctrl_message` / `read_data_message` / `handle_cmd`
+- `src/ipc/ipc_worker_mgmt.c` (~65 行)：Worker 生命周期管理 — `worker_mark_dead` / `worker_timeout_kill` / `send_return`
+
+**头文件调整**：
+- `include/ipc/ipc_thread.h`：新增 `worker_mark_dead()`、`worker_timeout_kill()`、`send_return()`、`read_ctrl_message()`、`read_data_message()`、`handle_cmd()` 外部声明
+
+**接口调整**：
+- `safe_ipc_recv_header` / `safe_ipc_recv_payload` 保持 `static`，仅在 `ipc_message_handler.c` 内部使用
+- `read_ctrl_message` / `read_data_message` / `handle_cmd` 从 `static` 改为模块间可见，供 `ipc_thread_loop` 调用
+- `worker_mark_dead` / `worker_timeout_kill` / `send_return` 从 `static` 改为模块间可见，供 `ipc_message_handler.c` 调用
+
+**编译**：`make clean && make` 零警告。
+
+---
+
+## [Unreleased] (continued)
+
+### 架构：Phase 5 — 拆分 worker_proc.c（951 行 → 3 模块）
+
+**背景**：`worker_proc.c` 达 951 行，混合 IPC 协议、扫描引擎、进程池管理三种不同职责，成为仅次于 progress.c 的第二大文件。
+
+**拆分结果**：
+- `src/ipc/ipc_protocol.c` (164 行)：IPC TLV 协议封装 — `ipc_send` / `ipc_recv_header` / `ipc_recv_payload` / `ipc_drain_and_count_tasks`
+- `src/scan/worker_scanner.c` (371 行)：Worker 扫描引擎 — `scan_and_send` / `try_blind_trust` / `send_batch` / `worker_scanner_thread`
+- `src/ipc/worker_proc.c` (440 行)：进程池管理与 Worker 主入口 — `worker_pool_create/spawn/replace/destroy/stop_all` / `worker_main`
+
+**新增头文件**：
+- `include/scan/worker_scanner.h`：`WorkerThreadCtx` 结构体、`worker_scanner_thread` 声明、`worker_get_config` 访问器
+
+**头文件调整**：
+- `include/ipc/ipc_protocol.h`：新增 IPC 函数声明（原在 worker_proc.h 中）
+- `include/ipc/worker_proc.h`：移除 IPC 函数声明，添加 `worker_scanner.h` 依赖
+
+**接口解耦**：`worker_main`（在 worker_proc.c）通过 `worker_get_config()` 访问配置，替代直接引用 `g_worker_cfg` 静态变量，消除跨模块全局依赖。
+
+**编译**：`make clean && make` 零警告。
+
+## [15.1.6] - 2026-05-18
+
+### 架构：Phase 6 — 拆分 main_loop.c（823 行 → 3 模块）
+
+**背景**：`main_loop.c` 达 823 行，混合消息路由、Batch 处理、任务分发、Worker 清理、IPC 线程生命周期五种职责。
+
+**拆分结果**：
+- `src/scan/batch_processor.c` (~280 行)：Batch 解析 (`parse_batch`)、CPU 去重线程池回调 (`batch_dedup_worker`)、完成处理 (`process_completed_batch`、`drain_completed_batches`)
+- `src/scan/dispatch.c` (~180 行)：任务分发 (`dispatch_lost_tasks`)、Worker 清理 (`cleanup_dead_worker_slot`)、IPC send 辅助 (`send_scan_to_ipc`、`send_replace_to_ipc`、`send_stop_to_ipc`)、空闲 Worker 查找 (`dispatch_find_idle_worker`)
+- `src/scan/main_loop.c` (~350 行)：消息总线 (`handle_return_message`)、主循环框架 (`main_loop_run`)、IPC 线程生命周期 (`init_ipc_threads` / `destroy_ipc_threads` / `stop_all_ipc_threads`)
+
+**头文件调整**：
+- `include/scan/main_loop.h`：更新函数声明 — 添加 `send_scan_to_ipc`、`send_stop_to_ipc`、`dispatch_lost_tasks`、`drain_completed_batches`、`batch_dedup_worker`
+
+**接口解耦**：`batch_dedup_worker` 从 `static` 改为模块内可见，供 `main_loop.c` 创建线程池时传入回调指针。
+
+**编译**：`make clean && make` 零警告。
+
+---
 
 ## [15.1.5] - 2026-05-17
 

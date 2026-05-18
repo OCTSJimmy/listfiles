@@ -53,6 +53,10 @@ bool read_pbin_footer(const char *path, PbinFooter *out);
 bool verify_pbin_footer(const PbinFooter *f);
 unsigned long get_slice_row_count(const Config *cfg, unsigned long index);
 
+/* pbin 底层写入（内部使用，跨文件可见） */
+void write_pbin_record(FILE *fp, const char *path, const struct stat *info);
+void fpbin_open_slice(AppContext *ctx);
+
 /* Spbin memory cache */
 void spbin_append(AppContext *ctx, const SpbinEntry *entry);
 void spbin_requeue_recovered(AppContext *ctx, dev_t dev);

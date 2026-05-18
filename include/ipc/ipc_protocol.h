@@ -44,4 +44,10 @@ typedef struct __attribute__((packed)) {
     /* char path[path_len] follows */
 } IpcFinishPayload;
 
+/* IPC 协议函数 */
+int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_len);
+int ipc_recv_header(int fd, IpcMessageHeader *hdr);
+int ipc_recv_payload(int fd, void *buf, uint32_t len);
+int ipc_drain_and_count_tasks(int fd_in);
+
 #endif

@@ -1,5 +1,5 @@
-#ifndef CONFIG_H
-#define CONFIG_H
+#ifndef CORE_CONFIG_H
+#define CORE_CONFIG_H
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -16,7 +16,7 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.1.5" // attempts counter bugfix in dispatch loop
+#define VERSION "15.2.0" // v15.2.0: modular refactor complete (8 phases, 24 files → 32 files)
 #define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
