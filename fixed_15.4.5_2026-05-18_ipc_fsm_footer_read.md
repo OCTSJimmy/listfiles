@@ -1,4 +1,4 @@
-# fixed v15.4.4 — IPC FSM BATCH Footer 读取协议修复
+# fixed v15.4.5 — IPC FSM BATCH Footer 读取协议修复
 
 日期：2026-05-18
 
@@ -26,7 +26,7 @@ v15.4.0 引入的 IPC FSM 续传机制中，`read_data_message()` 的 PAYLOAD/FO
 ## 修改文件
 
 - `src/ipc/ipc_message_handler.c` — `read_data_message()` PAYLOAD/FOOTER 阶段边界修正
-- `include/core/config.h` — 版本号 15.4.4
+- `include/core/config.h` — 版本号 15.4.5
 
 ## 编译
 

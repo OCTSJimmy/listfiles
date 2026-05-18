@@ -113,7 +113,7 @@ void batch_dedup_worker(TPBatch *batch, void *user_data) {
         uint8_t fp[FP_SIZE];
         fp_compute(path, st->st_dev, st->st_ino, fp);
         uint8_t result = 0;
-        /* v15.4.4: In HIST_PUMP_OLD phase, skip visited_set dedup for directories
+        /* v15.4.5: In HIST_PUMP_OLD phase, skip visited_set dedup for directories
          * so that re-scanning can discover sub-directories that were lost during
          * the previous interrupted run. Files are still deduped to avoid duplicate
          * output entries. */
@@ -175,7 +175,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
         if (S_ISDIR(st->st_mode)) {
             if (ctx->hist_pump_state == HIST_PUMP_OLD) {
                 fpbin_append(ctx, path, st);
-                /* v15.4.4: During resume pumping, re-scan discovered directories
+                /* v15.4.5: During resume pumping, re-scan discovered directories
                  * to recover sub-directories lost in the previous interrupted run. */
             }
             /* Unified dispatch: send CMD_SCAN for all non-duplicate directories.

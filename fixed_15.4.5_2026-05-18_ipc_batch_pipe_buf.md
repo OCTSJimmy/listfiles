@@ -1,11 +1,11 @@
-# Fixed: v15.4.4 — IPC BATCH 消息 PIPE_BUF 大小限制
+# Fixed: v15.4.5 — IPC BATCH 消息 PIPE_BUF 大小限制
 
 ## 日期
 2026-05-18
 
 ## 问题描述
 
-运行 v15.4.4（含 Footer read fix）后，程序不再 0 秒退出，但仍工作不正常：
+运行 v15.4.5（含 Footer read fix）后，程序不再 0 秒退出，但仍工作不正常：
 - `errlogs.err` 中出现大量 `FATAL [ipc_send] total_len=... exceeds PIPE_BUF(4096)`
 - `ERROR [Worker] send_batch FAILED`
 - 运行 13 秒后标记 Success，但输出数据明显不完整（大量 batch 发送失败导致数据丢失）

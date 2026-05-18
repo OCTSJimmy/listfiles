@@ -16,8 +16,8 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.4.4"
-#define VERSION_CODE 202605181516UL // v15.4.4: IPC FSM BATCH Footer read protocol fix — PAYLOAD/FOOTER phase boundary correction
+#define VERSION "15.4.5"
+#define VERSION_CODE 202605181924UL // v15.4.5: IPC BATCH PIPE_BUF limit relaxation + resume lost sub-dir recovery
 #define MAX_PATH_LENGTH 4088 // v15.4.1: PIPE_BUF(4096) - sizeof(IpcMessageHeader)(8) = 4088, ensure atomic pipe writes
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000

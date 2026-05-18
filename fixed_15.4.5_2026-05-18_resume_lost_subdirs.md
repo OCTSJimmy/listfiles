@@ -1,4 +1,4 @@
-# Fixed: v15.4.4 — 续传模式丢失深层子目录
+# Fixed: v15.4.5 — 续传模式丢失深层子目录
 
 ## 日期
 2026-05-18
@@ -39,7 +39,7 @@ if (ctx->hist_pump_state == HIST_PUMP_OLD) {
 **1. `batch_dedup_worker()` — pumping 阶段对目录跳过 `visited_set` 去重**
 
 ```c
-/* v15.4.4: In HIST_PUMP_OLD phase, skip visited_set dedup for directories
+/* v15.4.5: In HIST_PUMP_OLD phase, skip visited_set dedup for directories
  * so that re-scanning can discover sub-directories that were lost during
  * the previous interrupted run. Files are still deduped to avoid duplicate
  * output entries. */

@@ -4,7 +4,7 @@
 
 ---
 
-## [15.4.4] - 2026-05-18
+## [15.4.5] - 2026-05-18
 
 ### Fixed：续传模式（--continue）丢失深层子目录（P0）
 
@@ -13,7 +13,6 @@
 **修复**：
 - `batch_dedup_worker()`：在 `HIST_PUMP_OLD` 阶段，对**目录**跳过 `visited_set` 去重（文件仍去重，避免输出重复）。这样 pumping 阶段发现的子目录不会被提前过滤。
 - `process_completed_batch()`：在 `HIST_PUMP_OLD` 阶段，对目录统一走 `fpbin_append` + `send_scan_to_ipc()`（之前仅 `fpbin_append`，不派发扫描任务）。这样丢失的目录在 pumping 阶段即被重新扫描，Worker 返回的 BATCH 中深层子目录若在 `visited_set` 中则正常跳过，若不在则继续递归扫描。
-- 同步更新 `batch_processor.c` 内部调试日志版本戳为 `202605181600UL`。
 
 **修改的文件**：
 - `src/scan/batch_processor.c`
@@ -25,10 +24,13 @@
 **修复**：
 - `ipc_send()`：仅对非 `IPC_MSG_BATCH` 消息保留 `PIPE_BUF(4096)` 原子写检查；BATCH 消息允许超过 4096 bytes。
 - 理由：`fd_data` 为单 Writer（Worker Scanner 线程）单 Reader（Master IPC 线程），pipe 上不存在多写者交错风险；`write()` 循环 + `partial_retry` 机制已可安全处理大消息的非阻塞写入。
-- 同步更新 `ipc_send` 内部调试日志版本戳为 `202605181600UL`。
 
 **修改的文件**：
 - `src/ipc/ipc_protocol.c`
+
+---
+
+## [15.4.4] - 2026-05-18
 
 ### Fixed：IPC FSM BATCH Footer 读取协议修复（P0）
 
