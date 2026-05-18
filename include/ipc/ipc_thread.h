@@ -26,6 +26,8 @@ typedef struct {
     _Atomic bool    waiting_replace;/* Set after DEAD, cleared after REPLACE */
     int             eagain_retry_count; /* EAGAIN retry counter (reset on REPLACE) */
     pthread_cond_t *master_cond;    /* Signal master thread when message sent */
+    IpcReadFsm      ctrl_fsm;       /* v15.4.0: resumable fd_ctrl read state */
+    IpcReadFsm      data_fsm;       /* v15.4.0: resumable fd_data read state */
 } IpcThreadCtx;
 
 /**

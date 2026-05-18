@@ -164,19 +164,23 @@ Master 内部另设 **`ThreadPool`**（默认 4 线程），通过 `mutex + cond
 
 监控面板输出到 **stdout**，便于用户在终端实时查看扫描进度；其他诊断信息（`[System]` 消息、设备熔断日志、错误日志等）统一输出到 **stderr**。扫描数据输出到文件（通过 `-o` / `-O` 指定）或 **stdout**（未指定输出文件时），便于管道处理。
 
-#### IPC 线程内部循环
+#### IPC 线程内部循环（v15.4.0 FSM 续传版）
 
 ```
 while (running) {
     // 1. 从主线程消息队列取命令（非阻塞 drain）
-    // 2. epoll_wait(fd_out + cmd_queue eventfd, 500ms)
-    // 3. 处理 fd_out 事件（非阻塞 read → 解析 BATCH/HEARTBEAT/ERROR/EXIT）
-    // 4. 心跳检测：超时 → SIGKILL Worker → 发 RET_DEAD → 等待 REPLACE
+    // 2. epoll_wait(fd_data + fd_ctrl + cmd_queue eventfd, 500ms)
+    // 3. fd_ctrl 采用 FSM 状态机续传读取（HDR → PAYLOAD 两阶段）
+    // 4. fd_data 采用 FSM 状态机续传读取（HDR → PAYLOAD → FOOTER 三阶段）
+    // 5. 心跳检测：超时 → SIGKILL Worker → 发 RET_DEAD → 等待 REPLACE
 }
 ```
 
-- 每个 IPC 线程有自己的小 epoll（2 个 fd：fd_out + cmd_queue eventfd）。
-- fd 均为 O_NONBLOCK，read 采用 poll(100ms) 超时保护。
+- 每个 IPC 线程有自己的小 epoll（3 个 fd：`fd_data` + `fd_ctrl` + `cmd_queue eventfd`）。
+- fd 均为 `O_NONBLOCK`，read 采用 `fsm_recv()` 通用续传原语：`poll(100ms)` + `read`，`EAGAIN` 时保存进度返回 `-2`，由下次 `epoll_wait` 调度继续读取。
+- `fd_ctrl` 使用两阶段 FSM（`IPC_READ_HDR` → `IPC_READ_PAYLOAD`），处理 HEARTBEAT / ERROR / EXIT / READY / FINISH。
+- `fd_data` 使用三阶段 FSM（`IPC_READ_HDR` → `IPC_READ_PAYLOAD` → `IPC_READ_FOOTER`），处理 BATCH 大数据，Footer 魔数（`0xDEADBEEF66AAC0FF`）校验数据完整性。
+- `CMD_REPLACE` 时彻底重置两个 FSM 并释放 `buf`，防止旧 Worker 读取状态污染新连接。
 - Worker 死亡后 IPC 线程自己 close fd、epoll DEL，不需要主线程介入 cleanup。
 
 #### 消息队列
@@ -209,7 +213,7 @@ while (running) {
 | `ProbeScheduler` | 基于小根堆的渐进探测调度器，指数退避：5s → 10s → 20s → ... → 300s |
 | `DeviceManager` | 设备状态机：`NORMAL` → `PROBING` → `DEAD` → `CONDEMNED` |
 | `MainLoop` | `epoll_wait` 循环：处理 `BATCH` / `HEARTBEAT` / `ERROR` / `EXIT` 消息 |
-| `ThreadPool` | Master 内嵌 CPU 去重线程池（`mutex + cond + eventfd`），处理指纹计算与黑名单检查 |
+| `ThreadPool` | Master 内嵌 CPU 去重线程池（`mutex + cond + eventfd`），处理指纹计算与黑名单检查。`poll_completed` 带自循环检测与遍历上限，`destroy` 清理带安全上限，防止 completed 链表循环导致主线程阻塞 |
 | `AsyncWorker` | 独立输出线程，接收主循环批量提交的任务，格式化并写入文件 |
 | `Monitor` | 独立监控线程：统计面板输出、Worker 心跳超时检查、敢死队探测调度与收割 |
 | `Progress` | pbin（已处理记录）/ spbin（跳过记录）的写入、归档、恢复 |
@@ -322,7 +326,7 @@ restore_progress()
 
 ## 版本
 
-当前版本：**15.3.0**
+当前版本：**15.4.3**
 
 ## 许可证
 

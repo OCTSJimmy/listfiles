@@ -4,6 +4,81 @@
 
 ---
 
+## [15.4.3] - 2026-05-18
+
+### Fixed：thread_pool completed 链表安全（P2）
+
+**问题背景**：`worker_thread()` 中 `malloc(sizeof(CompletedNode))` 失败时原实现打印 `log_fatal` 后继续循环但不释放 batch，导致内存泄漏且 `pending_batches` 不归零；`poll_completed` 无链表完整性校验，自循环时主线程永久空转；`destroy` 无 drain 上限。
+
+**修复**：
+- `worker_thread()`: `node` malloc 失败时释放 batch 全部内存并 `continue`。
+- `thread_pool_poll_completed()`: 自循环检测（`node->next == node` 时断开）+ 遍历上限 100000。
+- `thread_pool_destroy()`: drain 安全上限 `drained_count < 100000`。
+
+**修改的文件**：
+- `src/scan/thread_pool.c`
+- `include/core/config.h`（版本号 15.4.3）
+
+---
+
+## [15.4.2] - 2026-05-18
+
+### Fixed：fp_shard_insert_internal 安全加固（P1）
+
+**问题背景**：`fp_set_create()` 中 `expected_count * 2` 溢出导致 per_shard 极小值；`PROBE_LIMIT = 1000000` 截断小容量分片的探测循环；rehash 失败时旧 table 已丢失。
+
+**修复**：
+- `fp_set_create()`: `expected_count > (SIZE_MAX / 4)` 时返回 NULL，饱和防溢出。
+- `fp_shard_insert_internal()`: `PROBE_LIMIT` → `shard->capacity`，消除截断。
+- rehash 失败时完整回滚旧指针、旧 capacity、旧 count/tombstones，数据零丢失。
+
+**修改的文件**：
+- `src/scan/fingerprint_set.c`
+- `include/core/config.h`（版本号 15.4.2）
+
+---
+
+## [15.4.1] - 2026-05-18
+
+### Fixed：ipc_send 部分写入防御（P0）
+
+**问题背景**：`MAX_PATH_LENGTH = 4096` 与 `PIPE_BUF = 4096` 相同，当 payload 含 4096 字节路径时 `total_len = 4104 > PIPE_BUF`，非阻塞 pipe 可能部分写入导致协议失步。`write()` 返回 `n == 0` 无处理，部分写入后 `EAGAIN` 无限重试。
+
+**修复**：
+- `config.h`: `MAX_PATH_LENGTH` 4096 → 4088（`PIPE_BUF - sizeof(IpcMessageHeader)`）。
+- `ipc_send()`: 运行时 `total_len > PIPE_BUF` fatal guard；`n == 0` 防御返回 `-1`；部分写入后 `EAGAIN` 增加 1000 次重试上限。
+
+**修改的文件**：
+- `include/core/config.h`
+- `src/ipc/ipc_protocol.c`
+
+---
+
+## [15.4.0] - 2026-05-18
+
+### 架构：IPC FSM 续传读取 + BATCH Footer 魔数
+
+**问题背景**：v15.0.x ~ v15.3.x 期间 IPC 线程使用一次性 `read()` 读取 Header/Payload，`EAGAIN` 时丢弃部分数据，下次 `epoll_wait` 后从断点继续但调用方已丢失进度，导致协议解析错乱。BATCH 大数据尤其脆弱，反复丢弃 → 无限失步 → payload timeout。
+
+**设计**：
+- `IpcReadFsm` 状态机：为每个 fd 维护独立的 `state`、`nread`、`hdr`、`buf`，支持跨多次 `epoll_wait` 调用的可恢复续传读取。
+- `fd_ctrl`（控制通道）：两阶段 FSM（`HDR → PAYLOAD`），处理 HEARTBEAT/ERROR/EXIT/READY/FINISH。
+- `fd_data`（数据通道）：三阶段 FSM（`HDR → PAYLOAD → FOOTER`），处理 BATCH 大数据。Footer 魔数 `0xDEADBEEF66AAC0FF` 校验数据完整性。
+- `fsm_recv()` 通用续传原语：`poll(100ms)` + `read`，`EAGAIN` 返回 `-2` 但保留 `buf` 和 `nread`，下次继续同阶段读取。
+- `CMD_REPLACE` 时彻底重置两个 FSM 并释放 `buf`，防止旧 Worker 状态污染新连接。
+- `ipc_msg_type_valid()` 白名单 + `hdr.payload_len > 100MB` 上限，防御性拒绝畸形数据。
+
+**修改的文件**：
+- `include/ipc/ipc_protocol.h` — `IPC_FOOTER_MAGIC`、`IpcReadFsm`、`fsm_recv`、`safe_*_fsm`、`ipc_msg_type_valid`
+- `include/ipc/ipc_thread.h` — `ctrl_fsm`、`data_fsm`
+- `src/ipc/ipc_protocol.c` — `fsm_recv` 实现、三阶段 `safe_*_fsm`、`ipc_msg_type_valid`
+- `src/ipc/ipc_thread.c` — FSM 初始化、`CMD_REPLACE` 重置
+- `src/ipc/ipc_message_handler.c` — `read_ctrl_message` / `read_data_message` FSM 版本
+- `src/scan/worker_scanner.c` — `send_batch` 追加 Footer 魔数
+- `include/core/config.h`（版本号 15.4.0）
+
+---
+
 ## [15.3.0] - 2026-05-18
 
 ### 新增：版本化日志框架（Versioned Logging）+ `--verbose-version`

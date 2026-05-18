@@ -89,23 +89,28 @@ static void *worker_thread(void *arg) {
         /* 加入完成队列 */
         CompletedNode *node = malloc(sizeof(CompletedNode));
         if (!node) {
-            log_fatal("thread_pool: out of memory for completed node");
-            /* 继续，但会丢失这个 batch 的通知 */
-        } else {
-            node->batch = batch;
-            node->next = NULL;
-            pthread_mutex_lock(&tp->completed_mutex);
-            if (tp->completed_tail) {
-                tp->completed_tail->next = node;
-            } else {
-                tp->completed_head = node;
-            }
-            tp->completed_tail = node;
-            pthread_mutex_unlock(&tp->completed_mutex);
-            
-            /* 通知主线程 */
-            eventfd_write(tp->event_fd, 1);
+            log_fatal("thread_pool: out of memory for completed node, freeing batch");
+            /* v15.4.3: don't leak batch — caller expects it via poll_completed */
+            for (int i = 0; i < batch->count; i++) free(batch->paths[i]);
+            free(batch->paths);
+            free(batch->stats);
+            free(batch->results);
+            free(batch);
+            continue;
         }
+        node->batch = batch;
+        node->next = NULL;
+        pthread_mutex_lock(&tp->completed_mutex);
+        if (tp->completed_tail) {
+            tp->completed_tail->next = node;
+        } else {
+            tp->completed_head = node;
+        }
+        tp->completed_tail = node;
+        pthread_mutex_unlock(&tp->completed_mutex);
+        
+        /* 通知主线程 */
+        eventfd_write(tp->event_fd, 1);
     }
     return NULL;
 }
@@ -184,7 +189,13 @@ void thread_pool_destroy(ThreadPool *tp) {
     
     /* 清理完成队列中残留的 batch（不执行副作用，直接释放内存） */
     TPBatch *batch;
+    int drain_limit = 0;
+    const int DRAIN_MAX = TP_QUEUE_CAPACITY * tp->num_threads * 2; /* v15.4.3: safety ceiling */
     while ((batch = thread_pool_poll_completed(tp)) != NULL) {
+        if (++drain_limit > DRAIN_MAX) {
+            log_fatal("thread_pool_destroy: drain loop exceeded safety ceiling (%d), breaking to prevent infinite loop", DRAIN_MAX);
+            break;
+        }
         for (int i = 0; i < batch->count; i++) free(batch->paths[i]);
         free(batch->paths);
         free(batch->stats);
@@ -236,10 +247,17 @@ TPBatch* thread_pool_poll_completed(ThreadPool *tp) {
     pthread_mutex_lock(&tp->completed_mutex);
     CompletedNode *node = tp->completed_head;
     if (node) {
+        /* v15.4.3: defensive cycle detection — if node->next points back to node itself, break the loop */
+        if (node->next == node) {
+            log_fatal("thread_pool: completed list self-loop detected, breaking");
+            node->next = NULL;
+            tp->completed_tail = node;
+        }
         tp->completed_head = node->next;
         if (!tp->completed_head) {
             tp->completed_tail = NULL;
         }
+        node->next = NULL; /* defensive: sever from list */
     }
     pthread_mutex_unlock(&tp->completed_mutex);
     

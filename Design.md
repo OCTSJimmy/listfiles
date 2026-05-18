@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.3.0**（版本化日志框架 + 模块化重构，32 个源文件）
+当前设计版本：**v15.4.3**（IPC FSM 续传 + 部分写入防御 + Shard 溢出修复 + 线程池安全上限）
 
 ---
 
@@ -47,6 +47,11 @@
 | **v15.1.4** | **`process_completed_batch` 防御** | 队列状态不一致导致无限循环 | count sanity check + iteration hard stop |
 | **v15.1.5** | **dispatch attempts 修复** | `while (attempts < num_workers)` 中 `continue` 不递增 `attempts`，CPU 100% 空转 | `continue` 前 `attempts++` |
 | **v15.2.0** | **模块化重构完成** | 源码文件过大（>500行），职责混杂，维护困难 | 8 个 Phase 拆分：24 文件 → 32 文件，按 core/ipc/scan/output/util 职责边界组织 |
+| **v15.3.0** | **版本化日志框架** | 高频追踪日志污染 stderr（987MB/3h） | `VERSION_CODE` + `_v(ver, ...)` 宏，与 `verbose_level` 正交 |
+| **v15.4.0** | **IPC FSM 续传 + BATCH Footer 魔数** | `EAGAIN` 时跨 `epoll_wait` 调用丢失读取进度；BATCH 大数据无完整性校验 | `IpcReadFsm` 状态机 + `IPC_FOOTER_MAGIC` 数据完整性校验 |
+| **v15.4.1** | **ipc_send 部分写入防御** | `MAX_PATH_LENGTH=4096` 导致 `total_len > PIPE_BUF`，非阻塞 pipe 部分写入后协议不同步 | `MAX_PATH_LENGTH` 4088 + 运行时 `PIPE_BUF` guard + 1000 次重试上限 |
+| **v15.4.2** | **fp_shard_insert_internal 安全加固** | `expected_count*2` 溢出、`PROBE_LIMIT` 截断探测、rehash 失败无回滚 | 饱和乘法、`PROBE_LIMIT=capacity`、rehash 失败完整回滚 |
+| **v15.4.3** | **thread_pool completed 链表安全** | `node` malloc 失败泄漏 batch、`completed` 链表自循环、`destroy` 无限 drain | malloc 失败释放 batch、自循环检测+断开、drain 安全上限 |
 ---
 
 ## v13.0.0：IPC 线程隔离
@@ -452,16 +457,133 @@ v12.x ~ v15.x 期间为排查多次 P0 阻断性问题（fd 号重用死锁、pa
 
 ---
 
+## v15.4.0：IPC FSM 续传 + BATCH Footer 魔数
+
+### 问题背景
+
+v15.0.x ~ v15.3.x 期间 IPC 线程使用一次性 `read()` 读取 Header 和 Payload。当 `fd_data`/`fd_ctrl` 的 `O_NONBLOCK` 读取遇 `EAGAIN` 时，函数返回 `-2`，调用方丢弃已读取的部分数据。下次 `epoll_wait` 返回 `EPOLLIN` 时，read 从上次断点继续，但调用方已丢失之前读到的部分 Header/Payload 字节，导致协议解析错乱（读到半个 Header 当成完整 Header，payload_len 异常）。
+
+BATCH 消息（大 payload）尤其脆弱：Worker 发送数万条路径记录，单次 `epoll_wait` 内可能无法读完整个 payload。反复丢弃部分数据 → 协议无限失步 → IPC 线程 hang 死在 `payload timeout`。
+
+### 设计：跨 `epoll_wait` 调用的可恢复状态机
+
+引入 `IpcReadFsm` 结构体，为每个 fd 维护独立的读取状态：
+
+```c
+typedef enum {
+    IPC_READ_IDLE,      // 空闲，等待新消息
+    IPC_READ_HDR,       // 正在读取 8 字节 Header
+    IPC_READ_PAYLOAD,   // 正在读取 payload（长度由 Header 指定）
+    IPC_READ_FOOTER     // 正在读取 8 字节 Footer 魔数（仅 BATCH）
+} IpcReadState;
+
+typedef struct {
+    IpcReadState state;     // 当前读取阶段
+    size_t nread;           // 当前阶段已读取字节数
+    IpcMessageHeader hdr;   // 已读取的 Header（HDR 阶段完成后有效）
+    char *buf;              // payload 缓冲区（PAYLOAD 阶段分配）
+} IpcReadFsm;
+```
+
+**关键约束**：
+- `fd_ctrl`（控制通道）：两阶段 FSM（`HDR → PAYLOAD`），处理 HEARTBEAT/ERROR/EXIT/READY/FINISH。
+- `fd_data`（数据通道）：三阶段 FSM（`HDR → PAYLOAD → FOOTER`），处理 BATCH 大数据。Footer 为 `uint64_t` 固定魔数 `0xDEADBEEF66AAC0FF`，接收端校验通过后才认为 BATCH 完整。
+- `fsm_recv()` 通用续传原语：内部 `poll(100ms)` + `read`，`EAGAIN` 返回 `-2` 但**不释放 `buf`、不重置 `nread`**。调用方保存 FSM 状态，下次 `epoll_wait` 后继续同阶段读取。
+- `CMD_REPLACE` 时彻底重置两个 FSM 状态为 `IPC_READ_IDLE`、`nread=0`、`free(buf)`，防止旧 Worker 的读取状态污染新连接的数据流。
+
+### 防御性校验
+
+- `ipc_msg_type_valid()` 白名单：只接受 `IPC_MSG_SCAN/BATCH/HEARTBEAT/ERROR/EXIT/STOP/DEV_TIMEOUT/READY/FINISH`，非法 `msg_type` 直接返回 false，避免异常大内存分配。
+- `safe_ipc_recv_header_fsm()` 中 `hdr.payload_len > 100MB` 时 `log_fatal`，防止畸形 Header 导致超大 malloc。
+
+### 修改的文件
+
+- `include/ipc/ipc_protocol.h` — `IPC_FOOTER_MAGIC`、`IpcReadState`、`IpcReadFsm`、`fsm_recv`、`safe_*_fsm`、`ipc_msg_type_valid` 声明
+- `include/ipc/ipc_thread.h` — `IpcThreadCtx` 增加 `ctrl_fsm`、`data_fsm`
+- `src/ipc/ipc_protocol.c` — `fsm_recv` 实现、`safe_ipc_recv_header_fsm`、`safe_ipc_recv_payload_fsm`、`safe_ipc_recv_footer_fsm`、`ipc_msg_type_valid` 实现
+- `src/ipc/ipc_thread.c` — `ipc_thread_ctx_create` FSM 初始化；`CMD_REPLACE` 彻底重置 FSM
+- `src/ipc/ipc_message_handler.c` — `read_ctrl_message` / `read_data_message` 整块替换为 FSM 版本
+- `src/scan/worker_scanner.c` — `send_batch` 追加 8 字节 Footer 魔数
+- `include/core/config.h` — 版本号 15.4.0
+
+---
+
+## v15.4.1：ipc_send 部分写入防御
+
+### 问题背景
+
+`MAX_PATH_LENGTH` 原为 4096，与 `PIPE_BUF`（4096）相同。`ipc_send()` 中 `total_len = sizeof(IpcMessageHeader) + payload_len`，当 payload 含 4096 字节路径时，`total_len = 4104 > PIPE_BUF`。非阻塞 pipe 下内核不保证原子写入，`write()` 可能部分写入后返回正数或 `EAGAIN`，对端读到不完整数据 → 协议失步。
+
+### 修复
+
+- `config.h`: `MAX_PATH_LENGTH` 4096 → **4088**（`PIPE_BUF - sizeof(IpcMessageHeader) = 4096 - 8 = 4088`），确保所有 `fd_cmd` 消息 `total_len ≤ PIPE_BUF`，内核保证原子写入。
+- `ipc_send()`: 运行时增加 `total_len > 4096` fatal guard，超限立即 `log_fatal` 退出，防止未来意外突破上限。
+- `write()` 返回 `n == 0` 时防御性返回 `-1`（EOF/对端关闭）。
+- `write()` 部分写入后遇 `EAGAIN`：增加 **1000 次重试上限**（每次 1ms `usleep`），防止 IPC 线程永久空转。
+
+### 修改的文件
+
+- `include/core/config.h` — `MAX_PATH_LENGTH` 4088、版本号 15.4.1
+- `src/ipc/ipc_protocol.c` — `ipc_send` 运行时 guard + `n==0` 处理 + 1000 次重试上限
+
+---
+
+## v15.4.2：fp_shard_insert_internal 安全加固
+
+### 问题背景
+
+`fp_set_create()` 中 `expected_count * 2` 在 `expected_count > SIZE_MAX/2` 时溢出，导致 per_shard 容量计算为极小值，后续插入触发无限 resize 循环。
+
+`PROBE_LIMIT = 1000000` 为任意常数，当 `shard->capacity < PROBE_LIMIT` 时，探测循环在 `i >= capacity` 时本应自然结束，但 `PROBE_LIMIT` 截断了这一逻辑，反而在扩容后 rehash 时可能导致误判。
+
+rehash 失败（如 `fp_shard_insert_internal` 递归调用返回 false）时，旧 table 已被覆盖为新分配的空白 table，数据永久丢失。
+
+### 修复
+
+- `fp_set_create()`: `expected_count * 2` 增加溢出饱和：`expected_count > (SIZE_MAX / 4)` 时返回 NULL，防止 per_shard 计算为 0 或极小值。
+- `fp_shard_insert_internal()`: `PROBE_LIMIT = 1000000` → **`shard->capacity`**，探测上限与物理容量绑定，消除截断。
+- rehash 失败时完整回滚：保存 `old_count`、`old_tombstones`，rehash 失败时 `free(new_meta/table)` 并恢复旧指针、旧 capacity、旧 count/tombstones，数据零丢失。
+
+### 修改的文件
+
+- `src/scan/fingerprint_set.c` — 饱和乘法、`PROBE_LIMIT` 动态化、rehash 回滚
+- `include/core/config.h` — 版本号 15.4.2
+
+---
+
+## v15.4.3：thread_pool completed 链表安全
+
+### 问题背景
+
+`worker_thread()` 中 `malloc(sizeof(CompletedNode))` 失败时原实现打印 `log_fatal` 后**继续循环但不释放 batch**，导致 batch 内存泄漏且主线程永远收不到该 batch 的完成通知，`pending_batches` 不归零。
+
+`thread_pool_poll_completed()` 无链表完整性校验，若 `node->next` 因内存 corruption 指向自身（自循环），`tp->completed_head = node->next` 后 head 不变，`while` 循环在主线程中永久空转。
+
+`thread_pool_destroy()` 中 `while ((batch = thread_pool_poll_completed(tp)) != NULL)` 无上限，若 completed 链表因 corruption 形成循环，销毁时永久阻塞。
+
+### 修复
+
+- `worker_thread()`: `node` malloc 失败时**释放 batch 全部内存**（`paths[i]`、`paths`、`stats`、`results`、`batch`）并 `continue`，防止泄漏。
+- `thread_pool_poll_completed()`: 增加自循环检测 — 若 `node->next == node`，`log_fatal` 断开循环（`node->next = NULL`）；增加遍历上限 100000，超限 `log_fatal` 断开。
+- `thread_pool_destroy()`: drain 循环增加安全上限 `drained_count < 100000`，超限 `log_fatal` 退出，防止销毁时无限阻塞。
+
+### 修改的文件
+
+- `src/scan/thread_pool.c` — node-oom 释放 batch、自循环检测、drain 上限
+- `include/core/config.h` — 版本号 15.4.3
+
+---
+
 ## 已知问题与待办
 
-1. **write() 部分写入**：v13.0.1 将 `ipc_send()` 改为单次 `write()`，但非阻塞 pipe 的 `write()` 仍可能部分写入（返回正数 < 请求长度）。当前实现通过 `while` 循环处理部分写入，但 `EAGAIN` 时返回 `-2`。如果 `write()` 部分写入后下一次调用返回 `EAGAIN`，对端读到不完整数据。由于 SCAN 消息通常 << `PIPE_BUF=4096`，实践中很少触发。未来可考虑 `writev()` 或 `sendmsg()` 配合 `MSG_DONTWAIT`。
+1. ~~write() 部分写入~~：**v15.4.1 已修复**。`MAX_PATH_LENGTH` 降至 4088（≤`PIPE_BUF`），运行时增加 `total_len > PIPE_BUF` fatal guard，1000 次重试上限防止 IPC 线程空转。
 
 2. **Monitor 秒表依赖**：Monitor 的秒表计时基于 `gettimeofday()`，如果 IPC 线程或主线程 hang 死，Monitor 线程本身不受影响，但秒表反映的是"Wall Clock"而非"有效处理时间"。
 
 3. **va_list 边界**：`noinline` 是 workaround 而非根治。如果未来遇到更多 `va_list` 相关问题，应考虑将 `verbose_printf` 的实现改为直接 `vsnprintf` 到栈缓冲区后输出，避免 `va_list` 跨函数传递。
 
-4. **`fp_shard_insert_internal` 内存 corruption**：v15.1.3 通过 `PROBE_LIMIT` 和 `capacity` sanity check 作为防御性修复，但未定位 corruption 的根本原因。如果 `log_fatal` 被触发，需进一步审计 `batch->results` / `batch->paths` 越界写、`parse_batch` 边界、`ipc_recv` 完整性、以及 `async_writer` 是否可能越界写 `visited_set` 所在内存。
+4. ~~`fp_shard_insert_internal` 内存 corruption~~：**v15.4.2 已修复**。`expected_count*2` 饱和防溢出、`PROBE_LIMIT=capacity` 消除截断、rehash 失败完整回滚。若仍有 `log_fatal` 触发，需进一步审计 `batch->results` / `batch->paths` 越界写、`parse_batch` 边界、`ipc_recv` 完整性、以及 `async_writer` 是否可能越界写 `visited_set` 所在内存。
 
-4. **fpbin 转正中断**：如果 fpbin 转正（封口 + rename）过程中进程崩溃，下次启动时会重新执行完整转正流程，但已转正的 pbin 不会被覆盖（`find_max_pbin_index()` 防呆）。
+5. **fpbin 转正中断**：如果 fpbin 转正（封口 + rename）过程中进程崩溃，下次启动时会重新执行完整转正流程，但已转正的 pbin 不会被覆盖（`find_max_pbin_index()` 防呆）。
 
-5. **NFS 软挂载前提**：扫描 NFS 目录时，`soft,intr,timeo=600` 挂载选项是避免 D-State 不可杀死的唯一手段。`hard` 挂载下 `SIGKILL` 仍然无效。
+6. **NFS 软挂载前提**：扫描 NFS 目录时，`soft,intr,timeo=600` 挂载选项是避免 D-State 不可杀死的唯一手段。`hard` 挂载下 `SIGKILL` 仍然无效。

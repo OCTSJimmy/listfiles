@@ -46,6 +46,14 @@ IpcThreadCtx* ipc_thread_ctx_create(int slot_id, WorkerPool *pool,
     atomic_init(&ctx->waiting_replace, false);
     ctx->eagain_retry_count = 0;
 
+    /* v15.4.0: initialize FSM states */
+    ctx->ctrl_fsm.state = IPC_READ_IDLE;
+    ctx->ctrl_fsm.nread = 0;
+    ctx->ctrl_fsm.buf = NULL;
+    ctx->data_fsm.state = IPC_READ_IDLE;
+    ctx->data_fsm.nread = 0;
+    ctx->data_fsm.buf = NULL;
+
     ctx->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (ctx->epfd < 0) {
         log_error("[IPC-%d] epoll_create1 failed: %s", slot_id, strerror(errno));

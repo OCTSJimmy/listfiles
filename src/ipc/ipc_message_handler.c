@@ -1,11 +1,11 @@
 /**
  * @file ipc_message_handler.c
- * @brief IPC 消息接收与处理
+ * @brief IPC 消息接收与处理 (v15.4.0 FSM)
  *
  * 负责 IPC 线程中的消息安全接收与协议处理：
- * - 带 poll 超时的 IPC 安全接收（safe_ipc_recv_header / safe_ipc_recv_payload）
+ * - 跨 epoll 可续传的 FSM 读取（safe_ipc_recv_header_fsm / payload_fsm / footer_fsm）
  * - 控制消息读取：HEARTBEAT / ERROR / DEV_TIMEOUT / READY / FINISH / EXIT（read_ctrl_message）
- * - 数据消息读取：BATCH 数据转发（read_data_message）
+ * - 数据消息读取：BATCH 数据 + Footer 魔数校验（read_data_message）
  * - 主线程命令处理：CMD_SCAN / CMD_REPLACE / CMD_STOP（handle_cmd）
  */
 #define _GNU_SOURCE
@@ -22,234 +22,278 @@
 #include <sys/epoll.h>
 #include <poll.h>
 
-/* ================================================================
- * Safe IPC receive helpers (static — only used within this file)
- * ================================================================ */
-
-static int safe_ipc_recv_header(int fd, IpcMessageHeader *hdr) {
-    struct pollfd pfd = { fd, POLLIN, 0 };
-    int rc = poll(&pfd, 1, 100);
-    if (rc == 0) return -2;
-    if (rc < 0) {
-        if (errno == EINTR) return -2;
-        log_error("[IPC] poll error on fd=%d: errno=%d (%s)",
-                fd, errno, strerror(errno));
-        return -1;
-    }
-    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-        log_error("[IPC] poll error/hup on fd=%d (revents=0x%x)",
-                fd, pfd.revents);
-        return -1;
-    }
-    return ipc_recv_header(fd, hdr);
-}
-
-static int safe_ipc_recv_payload(int fd, void *buf, uint32_t len) {
-    if (len == 0) return 0;
-    size_t nread = 0;
-    while (nread < len) {
-        struct pollfd pfd = { fd, POLLIN, 0 };
-        int rc = poll(&pfd, 1, 100);
-        if (rc == 0) return -2;
-        if (rc < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
-
-        ssize_t n = read(fd, (char*)buf + nread, len - nread);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
-            return -1;
-        }
-        if (n == 0) return -1;
-        nread += n;
-    }
-    return 0;
+static void drain_fd(int fd) {
+    uint8_t buf[4096];
+    while (read(fd, buf, sizeof(buf)) > 0) {}
 }
 
 /* ================================================================
- * Read a complete IPC message from Worker fd_ctrl
+ * Read a complete IPC message from Worker fd_ctrl (v15.4.0 FSM)
  * ================================================================ */
 
 void read_ctrl_message(IpcThreadCtx *ctx) {
-    IpcMessageHeader hdr;
-    int rc_hdr = safe_ipc_recv_header(ctx->fd_ctrl, &hdr);
-    if (rc_hdr == -2) {
-        return; /* timeout, try next loop */
-    }
-    if (rc_hdr != 0) {
-        log_error("[IPC-%d] recv_header failed on fd_ctrl, marking worker dead", ctx->slot_id);
-        worker_mark_dead(ctx, true);
-        return;
-    }
+    int rc;
+    IpcReadFsm *fsm = &ctx->ctrl_fsm;
 
-    if (hdr.payload_len > 16 * 1024 * 1024) {
-        void *tmp = malloc(hdr.payload_len);
-        if (tmp) { safe_ipc_recv_payload(ctx->fd_ctrl, tmp, hdr.payload_len); free(tmp); }
-        return;
+    /* --- HDR phase --- */
+    if (fsm->state == IPC_READ_IDLE) {
+        fsm->state = IPC_READ_HDR;
+        fsm->nread = 0;
     }
-
-    void *payload = NULL;
-    if (hdr.payload_len > 0) {
-        payload = malloc(hdr.payload_len);
-        int rc_payload = safe_ipc_recv_payload(ctx->fd_ctrl, payload, hdr.payload_len);
-        if (rc_payload != 0) {
-            free(payload);
-            if (rc_payload == -2) {
-                log_warn("[IPC-%d] ctrl payload timeout (len=%u)", ctx->slot_id, hdr.payload_len);
-            } else {
-                log_error("[IPC-%d] ctrl payload recv failed, marking worker dead", ctx->slot_id);
-                worker_mark_dead(ctx, true);
-            }
+    if (fsm->state == IPC_READ_HDR) {
+        rc = safe_ipc_recv_header_fsm(ctx->fd_ctrl, fsm);
+        if (rc == -2) return; /* EAGAIN, resume next epoll */
+        if (rc != 0) {
+            log_error("[IPC-%d] ctrl recv_header failed, marking worker dead", ctx->slot_id);
+            worker_mark_dead(ctx, true);
             return;
         }
+        /* Header complete — validate before allocating payload */
+        if (!ipc_msg_type_valid(fsm->hdr.msg_type)) {
+            log_error("[IPC-%d] ctrl garbage header (type=%u len=%u), draining fd",
+                      ctx->slot_id, fsm->hdr.msg_type, fsm->hdr.payload_len);
+            drain_fd(ctx->fd_ctrl);
+            fsm->state = IPC_READ_IDLE;
+            return;
+        }
+        if (fsm->hdr.payload_len > 16 * 1024 * 1024) {
+            log_warn("[IPC-%d] ctrl payload_len %u suspicious, draining",
+                     ctx->slot_id, fsm->hdr.payload_len);
+            drain_fd(ctx->fd_ctrl);
+            fsm->state = IPC_READ_IDLE;
+            return;
+        }
+        if (fsm->hdr.payload_len == 0) {
+            /* No payload — skip directly to dispatch */
+            goto dispatch;
+        }
+        /* Allocate and enter PAYLOAD phase */
+        fsm->buf = malloc(fsm->hdr.payload_len);
+        if (!fsm->buf) {
+            log_error("[IPC-%d] ctrl malloc(%u) failed, marking worker dead",
+                      ctx->slot_id, fsm->hdr.payload_len);
+            worker_mark_dead(ctx, true);
+            return;
+        }
+        fsm->state = IPC_READ_PAYLOAD;
+        fsm->nread = 0;
     }
 
-    switch (hdr.msg_type) {
-        case IPC_MSG_HEARTBEAT: {
-            if (hdr.payload_len >= sizeof(IpcHeartbeatPayload)) {
-                IpcHeartbeatPayload *hb = (IpcHeartbeatPayload*)payload;
-                atomic_store(&ctx->last_heartbeat, (time_t)hb->timestamp);
+    /* --- PAYLOAD phase --- */
+    if (fsm->state == IPC_READ_PAYLOAD) {
+        rc = safe_ipc_recv_payload_fsm(ctx->fd_ctrl, fsm);
+        if (rc == -2) return; /* timeout, resume next epoll */
+        if (rc != 0) {
+            log_error("[IPC-%d] ctrl payload recv failed, marking worker dead", ctx->slot_id);
+            free(fsm->buf); fsm->buf = NULL;
+            worker_mark_dead(ctx, true);
+            return;
+        }
+        /* Payload complete */
+    }
 
-                RetHeartbeatPayload *ret = malloc(sizeof(RetHeartbeatPayload));
-                if (ret) {
-                    ret->timestamp = hb->timestamp;
-                    send_return(ctx, RET_HEARTBEAT, ret, sizeof(*ret));
-                }
-            }
-            free(payload);
-            break;
-        }
-        case IPC_MSG_ERROR: {
-            if (hdr.payload_len >= sizeof(IpcErrorHeader)) {
-                IpcErrorHeader *eh = (IpcErrorHeader*)payload;
-                RetErrorPayload *ret = malloc(sizeof(RetErrorPayload));
-                if (ret) {
-                    ret->errno_code = eh->errno_code;
-                    ret->dev = eh->dev;
-                    if (hdr.payload_len > sizeof(IpcErrorHeader) + sizeof(uint32_t)) {
-                        const char *src = (const char*)payload + sizeof(IpcErrorHeader) + sizeof(uint32_t);
-                        size_t plen = hdr.payload_len - sizeof(IpcErrorHeader) - sizeof(uint32_t);
-                        if (plen >= sizeof(ret->path)) plen = sizeof(ret->path) - 1;
-                        memcpy(ret->path, src, plen);
-                        ret->path[plen] = '\0';
-                    } else {
-                        ret->path[0] = '\0';
+dispatch:
+    {
+        void *payload = fsm->buf;
+        IpcMessageHeader hdr = fsm->hdr;
+        /* Reset FSM before dispatch so recursive calls won't confuse state */
+        fsm->state = IPC_READ_IDLE;
+        fsm->nread = 0;
+        fsm->buf = NULL;
+
+        switch (hdr.msg_type) {
+            case IPC_MSG_HEARTBEAT: {
+                if (hdr.payload_len >= sizeof(IpcHeartbeatPayload)) {
+                    IpcHeartbeatPayload *hb = (IpcHeartbeatPayload*)payload;
+                    atomic_store(&ctx->last_heartbeat, (time_t)hb->timestamp);
+                    RetHeartbeatPayload *ret = malloc(sizeof(RetHeartbeatPayload));
+                    if (ret) {
+                        ret->timestamp = hb->timestamp;
+                        send_return(ctx, RET_HEARTBEAT, ret, sizeof(*ret));
                     }
-                    send_return(ctx, RET_ERROR, ret, sizeof(*ret));
                 }
+                free(payload);
+                break;
             }
-            free(payload);
-            break;
-        }
-        case IPC_MSG_DEV_TIMEOUT: {
-            if (hdr.payload_len >= sizeof(IpcErrorHeader)) {
-                IpcErrorHeader *eh = (IpcErrorHeader*)payload;
-                RetErrorPayload *ret = malloc(sizeof(RetErrorPayload));
-                if (ret) {
-                    ret->errno_code = eh->errno_code;
-                    ret->dev = eh->dev;
-                    if (hdr.payload_len > sizeof(IpcErrorHeader) + sizeof(uint32_t)) {
-                        const char *src = (const char*)payload + sizeof(IpcErrorHeader) + sizeof(uint32_t);
-                        size_t plen = hdr.payload_len - sizeof(IpcErrorHeader) - sizeof(uint32_t);
-                        if (plen >= sizeof(ret->path)) plen = sizeof(ret->path) - 1;
-                        memcpy(ret->path, src, plen);
-                        ret->path[plen] = '\0';
-                    } else {
-                        ret->path[0] = '\0';
+            case IPC_MSG_ERROR: {
+                if (hdr.payload_len >= sizeof(IpcErrorHeader)) {
+                    IpcErrorHeader *eh = (IpcErrorHeader*)payload;
+                    RetErrorPayload *ret = malloc(sizeof(RetErrorPayload));
+                    if (ret) {
+                        ret->errno_code = eh->errno_code;
+                        ret->dev = eh->dev;
+                        if (hdr.payload_len > sizeof(IpcErrorHeader) + sizeof(uint32_t)) {
+                            const char *src = (const char*)payload + sizeof(IpcErrorHeader) + sizeof(uint32_t);
+                            size_t plen = hdr.payload_len - sizeof(IpcErrorHeader) - sizeof(uint32_t);
+                            if (plen >= sizeof(ret->path)) plen = sizeof(ret->path) - 1;
+                            memcpy(ret->path, src, plen);
+                            ret->path[plen] = '\0';
+                        } else {
+                            ret->path[0] = '\0';
+                        }
+                        send_return(ctx, RET_ERROR, ret, sizeof(*ret));
                     }
-                    send_return(ctx, RET_DEV_TIMEOUT, ret, sizeof(*ret));
                 }
+                free(payload);
+                break;
             }
-            free(payload);
-            break;
-        }
-        case IPC_MSG_READY: {
-            log_debug_v(202605150000, "[IPC-%d] received READY, forwarding RET_READY", ctx->slot_id);
-            send_return(ctx, RET_READY, NULL, 0);
-            free(payload);
-            break;
-        }
-        case IPC_MSG_FINISH: {
-            if (hdr.payload_len >= sizeof(IpcFinishPayload)) {
-                IpcFinishPayload *fin = (IpcFinishPayload*)payload;
-                log_info("[IPC-%d] received FINISH (path_len=%u), forwarding RET_FINISH", ctx->slot_id, fin->path_len);
-                /* Payload: IpcFinishPayload + path bytes */
-                size_t path_len = fin->path_len;
-                if (path_len > 4095) path_len = 4095;
-                char *path_buf = malloc(path_len + 1);
-                if (path_buf) {
-                    if (hdr.payload_len >= sizeof(IpcFinishPayload) + path_len) {
-                        memcpy(path_buf, (char*)payload + sizeof(IpcFinishPayload), path_len);
+            case IPC_MSG_DEV_TIMEOUT: {
+                if (hdr.payload_len >= sizeof(IpcErrorHeader)) {
+                    IpcErrorHeader *eh = (IpcErrorHeader*)payload;
+                    RetErrorPayload *ret = malloc(sizeof(RetErrorPayload));
+                    if (ret) {
+                        ret->errno_code = eh->errno_code;
+                        ret->dev = eh->dev;
+                        if (hdr.payload_len > sizeof(IpcErrorHeader) + sizeof(uint32_t)) {
+                            const char *src = (const char*)payload + sizeof(IpcErrorHeader) + sizeof(uint32_t);
+                            size_t plen = hdr.payload_len - sizeof(IpcErrorHeader) - sizeof(uint32_t);
+                            if (plen >= sizeof(ret->path)) plen = sizeof(ret->path) - 1;
+                            memcpy(ret->path, src, plen);
+                            ret->path[plen] = '\0';
+                        } else {
+                            ret->path[0] = '\0';
+                        }
+                        send_return(ctx, RET_DEV_TIMEOUT, ret, sizeof(*ret));
                     }
-                    path_buf[path_len] = '\0';
-                    send_return(ctx, RET_FINISH, path_buf, path_len + 1);
                 }
+                free(payload);
+                break;
             }
-            free(payload);
-            break;
+            case IPC_MSG_READY: {
+                log_debug_v(202605150000, "[IPC-%d] received READY, forwarding RET_READY", ctx->slot_id);
+                send_return(ctx, RET_READY, NULL, 0);
+                free(payload);
+                break;
+            }
+            case IPC_MSG_FINISH: {
+                if (hdr.payload_len >= sizeof(IpcFinishPayload)) {
+                    IpcFinishPayload *fin = (IpcFinishPayload*)payload;
+                    log_info("[IPC-%d] received FINISH (path_len=%u), forwarding RET_FINISH", ctx->slot_id, fin->path_len);
+                    size_t path_len = fin->path_len;
+                    if (path_len > 4095) path_len = 4095;
+                    char *path_buf = malloc(path_len + 1);
+                    if (path_buf) {
+                        if (hdr.payload_len >= sizeof(IpcFinishPayload) + path_len) {
+                            memcpy(path_buf, (char*)payload + sizeof(IpcFinishPayload), path_len);
+                        }
+                        path_buf[path_len] = '\0';
+                        send_return(ctx, RET_FINISH, path_buf, path_len + 1);
+                    }
+                }
+                free(payload);
+                break;
+            }
+            case IPC_MSG_EXIT: {
+                send_return(ctx, RET_EXIT, NULL, 0);
+                worker_mark_dead(ctx, false);
+                free(payload);
+                break;
+            }
+            default:
+                free(payload);
+                break;
         }
-        case IPC_MSG_EXIT: {
-            send_return(ctx, RET_EXIT, NULL, 0);
-            worker_mark_dead(ctx, false);
-            break;
-        }
-        default:
-            free(payload);
-            break;
     }
 }
 
 /* ================================================================
- * Read a complete BATCH message from Worker fd_data
+ * Read a complete BATCH message from Worker fd_data (v15.4.0 FSM)
  * ================================================================ */
 
 void read_data_message(IpcThreadCtx *ctx) {
-    IpcMessageHeader hdr;
-    int rc_hdr = safe_ipc_recv_header(ctx->fd_data, &hdr);
-    if (rc_hdr == -2) {
-        return; /* timeout, try next loop */
+    int rc;
+    IpcReadFsm *fsm = &ctx->data_fsm;
+
+    /* --- HDR phase --- */
+    if (fsm->state == IPC_READ_IDLE) {
+        fsm->state = IPC_READ_HDR;
+        fsm->nread = 0;
     }
-    if (rc_hdr != 0) {
-        log_error("[IPC-%d] recv_header failed on fd_data, marking worker dead", ctx->slot_id);
-        worker_mark_dead(ctx, true);
-        return;
+    if (fsm->state == IPC_READ_HDR) {
+        rc = safe_ipc_recv_header_fsm(ctx->fd_data, fsm);
+        if (rc == -2) return;
+        if (rc != 0) {
+            log_error("[IPC-%d] data recv_header failed, marking worker dead", ctx->slot_id);
+            worker_mark_dead(ctx, true);
+            return;
+        }
+        /* Validate */
+        if (fsm->hdr.msg_type != IPC_MSG_BATCH) {
+            log_error("[IPC-%d] data unexpected type=%u, draining fd", ctx->slot_id, fsm->hdr.msg_type);
+            drain_fd(ctx->fd_data);
+            fsm->state = IPC_READ_IDLE;
+            return;
+        }
+        /* payload_len must cover at least Footer (8 bytes) */
+        if (fsm->hdr.payload_len < sizeof(uint64_t)) {
+            log_error("[IPC-%d] data payload_len %u < footer size, draining",
+                      ctx->slot_id, fsm->hdr.payload_len);
+            drain_fd(ctx->fd_data);
+            fsm->state = IPC_READ_IDLE;
+            return;
+        }
+        if (fsm->hdr.payload_len > 16 * 1024 * 1024 + sizeof(uint64_t)) {
+            log_warn("[IPC-%d] data payload_len %u suspicious, draining",
+                     ctx->slot_id, fsm->hdr.payload_len);
+            drain_fd(ctx->fd_data);
+            fsm->state = IPC_READ_IDLE;
+            return;
+        }
+        /* Allocate buffer for payload (includes Footer) */
+        fsm->buf = malloc(fsm->hdr.payload_len);
+        if (!fsm->buf) {
+            log_error("[IPC-%d] data malloc(%u) failed, marking worker dead",
+                      ctx->slot_id, fsm->hdr.payload_len);
+            worker_mark_dead(ctx, true);
+            return;
+        }
+        fsm->state = IPC_READ_PAYLOAD;
+        fsm->nread = 0;
     }
 
-    if (hdr.msg_type != IPC_MSG_BATCH) {
-        /* Unexpected message type on fd_data - discard */
-        void *tmp = malloc(hdr.payload_len);
-        if (tmp) { safe_ipc_recv_payload(ctx->fd_data, tmp, hdr.payload_len); free(tmp); }
-        return;
+    /* --- PAYLOAD phase --- */
+    if (fsm->state == IPC_READ_PAYLOAD) {
+        rc = safe_ipc_recv_payload_fsm(ctx->fd_data, fsm);
+        if (rc == -2) return;
+        if (rc != 0) {
+            log_error("[IPC-%d] data payload recv failed, marking worker dead", ctx->slot_id);
+            free(fsm->buf); fsm->buf = NULL;
+            worker_mark_dead(ctx, true);
+            return;
+        }
+        fsm->state = IPC_READ_FOOTER;
+        fsm->nread = 0;
     }
 
-    if (hdr.payload_len > 16 * 1024 * 1024) {
-        void *tmp = malloc(hdr.payload_len);
-        if (tmp) { safe_ipc_recv_payload(ctx->fd_data, tmp, hdr.payload_len); free(tmp); }
-        return;
-    }
-
-    void *payload = NULL;
-    if (hdr.payload_len > 0) {
-        payload = malloc(hdr.payload_len);
-        int rc_payload = safe_ipc_recv_payload(ctx->fd_data, payload, hdr.payload_len);
-        if (rc_payload != 0) {
-            free(payload);
-            if (rc_payload == -2) {
-                log_warn("[IPC-%d] data payload timeout (len=%u)", ctx->slot_id, hdr.payload_len);
-            } else {
-                log_error("[IPC-%d] data payload recv failed, marking worker dead", ctx->slot_id);
-                worker_mark_dead(ctx, true);
-            }
+    /* --- FOOTER phase --- */
+    if (fsm->state == IPC_READ_FOOTER) {
+        uint64_t footer_magic = 0;
+        rc = safe_ipc_recv_footer_fsm(ctx->fd_data, fsm, &footer_magic);
+        if (rc == -2) return;
+        if (rc != 0 || footer_magic != IPC_FOOTER_MAGIC) {
+            log_error("[IPC-%d] data footer mismatch (got=0x%016llx expected=0x%016llx), dropping batch",
+                      ctx->slot_id, (unsigned long long)footer_magic,
+                      (unsigned long long)IPC_FOOTER_MAGIC);
+            free(fsm->buf); fsm->buf = NULL;
+            fsm->state = IPC_READ_IDLE;
             return;
         }
     }
 
-    log_debug_v(202605150000, "[IPC-%d] received BATCH (payload=%u), forwarding RET_BATCH", ctx->slot_id, hdr.payload_len);
-    send_return(ctx, RET_BATCH, payload, hdr.payload_len);
-    /* ownership transferred */
+    /* --- Complete: strip Footer and forward to Master --- */
+    {
+        void *payload = fsm->buf;
+        uint32_t net_payload_len = fsm->hdr.payload_len - sizeof(uint64_t);
+        /* Reset FSM */
+        fsm->state = IPC_READ_IDLE;
+        fsm->nread = 0;
+        fsm->buf = NULL;
+
+        log_debug_v(202605150000, "[IPC-%d] received BATCH (net_payload=%u), forwarding RET_BATCH",
+                    ctx->slot_id, net_payload_len);
+        send_return(ctx, RET_BATCH, payload, net_payload_len);
+        /* ownership transferred */
+    }
 }
 
 /* ================================================================
@@ -334,6 +378,14 @@ void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
             atomic_store(&ctx->last_heartbeat, time(NULL));
             ctx->spawn_time = time(NULL);  /* v15.1.1: record spawn time for startup_timeout */
             atomic_store(&ctx->waiting_replace, false);
+
+            /* v15.4.0: reset FSM states for new Worker */
+            ctx->ctrl_fsm.state = IPC_READ_IDLE;
+            ctx->ctrl_fsm.nread = 0;
+            free(ctx->ctrl_fsm.buf); ctx->ctrl_fsm.buf = NULL;
+            ctx->data_fsm.state = IPC_READ_IDLE;
+            ctx->data_fsm.nread = 0;
+            free(ctx->data_fsm.buf); ctx->data_fsm.buf = NULL;
 
             /* Add new fd_data to epoll */
             if (ctx->epfd >= 0 && ctx->fd_data >= 0) {

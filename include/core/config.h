@@ -16,9 +16,9 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.3.0"
-#define VERSION_CODE 202605180903UL // v15.3.0: versioned logging framework + --verbose-version
-#define MAX_PATH_LENGTH 4096 // 扩大路径支持，防止深层目录截断
+#define VERSION "15.4.3"
+#define VERSION_CODE 202605181315UL // v15.4.3: P2 thread_pool completed list cycle defense + node-oom free batch + drain safety ceiling
+#define MAX_PATH_LENGTH 4088 // v15.4.1: PIPE_BUF(4096) - sizeof(IpcMessageHeader)(8) = 4088, ensure atomic pipe writes
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
 #define MAX_SYMLINK_DEPTH 8

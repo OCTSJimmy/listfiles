@@ -106,7 +106,12 @@ static size_t next_pow2(size_t n) {
  *         使用线性探测解决冲突；遇到 tombstone（删除标记）时会复用该槽位。
  */
 static bool fp_shard_insert_internal(FingerprintShard *shard, const uint8_t md5[FP_SIZE], bool *out_exists) {
-    /* v15.1.3: capacity sanity check */
+    /* v15.4.2: NULL pointer guards */
+    if (!shard || !md5 || !out_exists) {
+        log_fatal("[FPSet] fp_shard_insert_internal NULL pointer: shard=%p md5=%p out_exists=%p",
+                  (void*)shard, (void*)md5, (void*)out_exists);
+        return false;
+    }
     if (shard->capacity == 0 || shard->capacity > (1ULL << 30)) {
         log_fatal("[FPSet] shard capacity corrupted: %zu (valid range: [16, 1<<30])", shard->capacity);
         return false;
@@ -121,22 +126,25 @@ static bool fp_shard_insert_internal(FingerprintShard *shard, const uint8_t md5[
         size_t old_cap = shard->capacity;
         uint8_t *old_meta = shard->meta;
         Fingerprint *old_table = shard->table;
+        size_t old_count = shard->count;
+        size_t old_tombstones = shard->tombstones;
 
         size_t new_cap = old_cap << 1;
         if (new_cap > (1ULL << 30)) {
             log_fatal("[FPSet] shard capacity overflow during resize: %zu -> %zu", old_cap, new_cap);
             return false;
         }
-        shard->meta = calloc(new_cap, sizeof(uint8_t));
-        shard->table = calloc(new_cap, sizeof(Fingerprint));
-        if (!shard->meta || !shard->table) {
+        uint8_t *new_meta = calloc(new_cap, sizeof(uint8_t));
+        Fingerprint *new_table = calloc(new_cap, sizeof(Fingerprint));
+        if (!new_meta || !new_table) {
             log_fatal("[FPSet] shard resize allocation failed: new_cap=%zu", new_cap);
-            free(shard->meta);
-            free(shard->table);
-            shard->meta = old_meta;
-            shard->table = old_table;
+            free(new_meta);
+            free(new_table);
             return false;
         }
+        /* v15.4.2: atomic update — only swap pointers after successful allocation */
+        shard->meta = new_meta;
+        shard->table = new_table;
         shard->capacity = new_cap;
         shard->count = 0;
         shard->tombstones = 0;
@@ -144,7 +152,18 @@ static bool fp_shard_insert_internal(FingerprintShard *shard, const uint8_t md5[
         for (size_t i = 0; i < old_cap; i++) {
             if (old_meta[i] == 1) {
                 bool ignored;
-                fp_shard_insert_internal(shard, old_table[i].md5, &ignored);
+                if (!fp_shard_insert_internal(shard, old_table[i].md5, &ignored)) {
+                    /* v15.4.2: rehash failure — rollback to old table to prevent data loss/corruption */
+                    log_fatal("[FPSet] rehash failed at i=%zu/%zu, rolling back to old_cap=%zu", i, old_cap, old_cap);
+                    free(shard->meta);
+                    free(shard->table);
+                    shard->meta = old_meta;
+                    shard->table = old_table;
+                    shard->capacity = old_cap;
+                    shard->count = old_count;
+                    shard->tombstones = old_tombstones;
+                    return false;
+                }
             }
         }
         free(old_meta);
@@ -153,7 +172,8 @@ static bool fp_shard_insert_internal(FingerprintShard *shard, const uint8_t md5[
 
     size_t idx = fp_hash(md5, shard->capacity);
     size_t first_tomb = (size_t)-1;
-    const size_t PROBE_LIMIT = 1000000; /* v15.1.3: hard limit to prevent infinite loop */
+    /* v15.4.2: probe limit = capacity, no arbitrary truncation */
+    const size_t PROBE_LIMIT = shard->capacity;
 
     for (size_t i = 0; i < shard->capacity; i++) {
         if (i >= PROBE_LIMIT) {
@@ -198,7 +218,14 @@ FingerprintSet* fp_set_create(size_t expected_count) {
     FingerprintSet *set = malloc(sizeof(FingerprintSet));
     if (!set) return NULL;
 
-    size_t per_shard = next_pow2((expected_count * 2 + FP_SHARD_COUNT - 1) / FP_SHARD_COUNT);
+    /* v15.4.2: saturate expected_count * 2 to prevent size_t overflow */
+    size_t doubled;
+    if (expected_count > SIZE_MAX / 2) {
+        doubled = SIZE_MAX;
+    } else {
+        doubled = expected_count * 2;
+    }
+    size_t per_shard = next_pow2((doubled + FP_SHARD_COUNT - 1) / FP_SHARD_COUNT);
     if (per_shard < 16) per_shard = 16;
 
     for (int s = 0; s < FP_SHARD_COUNT; s++) {

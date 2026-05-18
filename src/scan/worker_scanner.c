@@ -142,6 +142,7 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
         total += strlen(paths[i]);
         total += sizeof(struct stat);
     }
+    total += sizeof(uint64_t); /* v15.4.0: Footer magic */
 
     if (total > UINT32_MAX) {
         log_error("[Worker] Batch payload too large (%zu), aborting.", total);
@@ -165,6 +166,10 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
         memcpy(p, paths[i], plen);      p += plen;
         memcpy(p, &stats[i], sizeof(struct stat)); p += sizeof(struct stat);
     }
+
+    /* v15.4.0: append Footer magic */
+    uint64_t footer = IPC_FOOTER_MAGIC;
+    memcpy(p, &footer, sizeof(footer));
 
     /* Worker side: retry on EAGAIN until success (pipe buffer should be large enough) */
     int rc;

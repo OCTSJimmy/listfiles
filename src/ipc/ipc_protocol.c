@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <errno.h>
+#include <poll.h>
 
 /**
  * @brief  通过文件描述符发送 IPC 消息
@@ -30,6 +31,13 @@
  */
 int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_len) {
     size_t total_len = sizeof(IpcMessageHeader) + payload_len;
+    if (total_len > 4096) {
+        log_fatal("[ipc_send] total_len=%zu exceeds PIPE_BUF(4096), msg_type=%u payload_len=%u. "
+                  "Ensure MAX_PATH_LENGTH <= 4088 to guarantee atomic pipe writes.",
+                  total_len, msg_type, payload_len);
+        return -1;
+    }
+
     char *buf = malloc(total_len);
     if (!buf) return -1;
 
@@ -41,9 +49,15 @@ int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_le
     }
 
     size_t written = 0;
+    int partial_retry = 0;  /* v15.4.1: limit partial-write retries to prevent IPC thread hang */
     log_debug_v(202605150000, "[ipc_send] fd=%d total=%zu msg_type=%u", fd, total_len, msg_type);
     while (written < total_len) {
         ssize_t n = write(fd, buf + written, total_len - written);
+        if (n == 0) {
+            log_error("[ipc_send] write returned 0 on fd=%d (EOF/unexpected), aborting", fd);
+            free(buf);
+            return -1;
+        }
         if (n < 0) {
             int saved_errno = errno;
             log_debug_v(202605150000, "[ipc_send] write error fd=%d written=%zu n=%zd errno=%d (%s)",
@@ -51,7 +65,13 @@ int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_le
             if (saved_errno == EINTR) continue;
             if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
                 if (written == 0) { free(buf); return -2; }
-                /* Partial write occurred; must retry to avoid protocol desync */
+                /* Partial write occurred on non-blocking fd; retry with limit */
+                partial_retry++;
+                if (partial_retry > 1000) {
+                    log_error("[ipc_send] partial write retry exhausted (1000x1ms) on fd=%d, aborting", fd);
+                    free(buf);
+                    return -1;
+                }
                 usleep(1000); /* 1ms back-off */
                 continue;
             }
@@ -162,3 +182,123 @@ int ipc_drain_and_count_tasks(int fd_in) {
     }
     return count;
 }
+
+/* ================================================================
+ * v15.4.0: FSM-based resumable IPC receive
+ * Cross-epoll stateful reads with poll timeout & EAGAIN resumption
+ * ================================================================ */
+
+/**
+ * @brief  通用续传 read 函数
+ * @param  fd     int      文件描述符
+ * @param  dst    void*    目标缓冲区
+ * @param  total  size_t   需要读取的总字节数
+ * @param  nread  size_t*  已读字节数（输入输出参数，跨调用保持）
+ * @return int  返回 0 表示完成；返回 -2 表示 EAGAIN/EWOULDBLOCK（需下次 epoll 续传）；
+ *              返回 -1 表示错误或 EOF
+ *
+ * @note   本函数不重置 nread；调用方在进入新阶段前自行置 0。
+ *         对 EINTR 自动重试。poll 超时 100ms。
+ */
+int fsm_recv(int fd, void *dst, size_t total, size_t *nread) {
+    while (*nread < total) {
+        struct pollfd pfd = { fd, POLLIN, 0 };
+        int rc = poll(&pfd, 1, 100);
+        if (rc == 0) return -2; /* timeout */
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+
+        ssize_t n = read(fd, (char*)dst + *nread, total - *nread);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+            return -1;
+        }
+        if (n == 0) return -1; /* EOF */
+        *nread += (size_t)n;
+    }
+    return 0;
+}
+
+/**
+ * @brief  通过 FSM 安全读取 IPC 消息头部
+ * @param  fd   int         文件描述符
+ * @param  fsm  IpcReadFsm* 读取状态机
+ * @return int  返回 0 表示头部读取完成；返回 -2 表示需下次 epoll 续传；
+ *              返回 -1 表示错误或 EOF
+ *
+ * @note   首次调用时 fsm->state 应为 IPC_READ_HDR，fsm->nread 应为 0。
+ *         头部读取完成后 fsm->state 仍为 IPC_READ_HDR，调用方应自行转换。
+ */
+int safe_ipc_recv_header_fsm(int fd, IpcReadFsm *fsm) {
+    if (fsm->state != IPC_READ_HDR) return -1;
+    int rc = fsm_recv(fd, &fsm->hdr, sizeof(fsm->hdr), &fsm->nread);
+    if (rc == 0) {
+        /* Header complete — caller transitions state */
+    }
+    return rc;
+}
+
+/**
+ * @brief  通过 FSM 安全读取 IPC 消息负载
+ * @param  fd   int         文件描述符
+ * @param  fsm  IpcReadFsm* 读取状态机
+ * @return int  返回 0 表示负载读取完成；返回 -2 表示需下次 epoll 续传；
+ *              返回 -1 表示错误或 EOF；返回 -3 表示内存分配失败
+ *
+ * @note   首次进入本状态前，调用方应分配 fsm->buf = malloc(len) 并置 fsm->nread = 0。
+ */
+int safe_ipc_recv_payload_fsm(int fd, IpcReadFsm *fsm) {
+    if (fsm->state != IPC_READ_PAYLOAD) return -1;
+    if (!fsm->buf) return -3;
+    return fsm_recv(fd, fsm->buf, fsm->hdr.payload_len, &fsm->nread);
+}
+
+/**
+ * @brief  通过 FSM 读取 Footer 魔数并校验
+ * @param  fd        int         文件描述符
+ * @param  fsm       IpcReadFsm* 读取状态机
+ * @param  out_magic uint64_t*   输出读取到的魔数值
+ * @return int  返回 0 表示 Footer 读取完成且已校验（out_magic 有效）；
+ *              返回 -2 表示需下次 epoll 续传；返回 -1 表示错误或 EOF
+ *
+ * @note   首次进入本状态前，调用方应置 fsm->nread = 0。
+ *         成功读取后，调用方需自行比较 *out_magic == IPC_FOOTER_MAGIC。
+ */
+int safe_ipc_recv_footer_fsm(int fd, IpcReadFsm *fsm, uint64_t *out_magic) {
+    if (fsm->state != IPC_READ_FOOTER) return -1;
+    uint8_t buf[sizeof(uint64_t)];
+    int rc = fsm_recv(fd, buf, sizeof(buf), &fsm->nread);
+    if (rc == 0 && out_magic) {
+        memcpy(out_magic, buf, sizeof(*out_magic));
+    }
+    return rc;
+}
+
+/**
+ * @brief  校验 IPC 消息类型是否在白名单内
+ * @param  msg_type  uint32_t  消息类型值
+ * @return bool  true 表示合法类型；false 表示垃圾/未知类型
+ *
+ * @note   v15.4.0 防御性加固：Header 被污染时快速拒绝，避免无意义 malloc。
+ */
+bool ipc_msg_type_valid(uint32_t msg_type) {
+    switch (msg_type) {
+        case IPC_MSG_SCAN:
+        case IPC_MSG_BATCH:
+        case IPC_MSG_HEARTBEAT:
+        case IPC_MSG_ERROR:
+        case IPC_MSG_EXIT:
+        case IPC_MSG_STOP:
+        case IPC_MSG_DEV_TIMEOUT:
+        case IPC_MSG_READY:
+        case IPC_MSG_FINISH:
+            return true;
+        default:
+            return false;
+    }
+}
+
