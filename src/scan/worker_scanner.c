@@ -224,7 +224,7 @@ static void send_error_and_empty_batch(int fd_out, int err_code, const char *pat
  */
 static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
     (void)worker_id;
-    log_debug("[W%d-Scanner] scan_and_send entered: %s", worker_id, dir_path);
+    log_debug_v(202605181600, "[W%d-Scanner] scan_and_send entered: %s", worker_id, dir_path);
     struct stat dir_st;
     if (lstat(dir_path, &dir_st) != 0) {
         log_warn("[W%d-Scanner] lstat failed on %s: %s", worker_id, dir_path, strerror(errno));
@@ -247,7 +247,7 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
         send_error_and_empty_batch(fd_out, errno, dir_path);
         goto cleanup;
     }
-    log_debug("[W%d-Scanner] opendir success: %s", worker_id, dir_path);
+    log_debug_v(202605181600, "[W%d-Scanner] opendir success: %s", worker_id, dir_path);
 
     struct dirent *entry;
     int entry_count = 0;
@@ -290,16 +290,16 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
     }
 
     if (count > 0) {
-        log_debug("[W%d-Scanner] sending final batch (count=%d)", worker_id, count);
+        log_debug_v(202605181600, "[W%d-Scanner] sending final batch (count=%d)", worker_id, count);
         send_batch(fd_out, paths, stats, count);
         for (int i = 0; i < count; i++) free(paths[i]);
     } else {
         /* Empty directory: send empty batch so Master decrements pending_tasks */
-        log_debug("[W%d-Scanner] empty dir, sending empty batch", worker_id);
+        log_debug_v(202605181600, "[W%d-Scanner] empty dir, sending empty batch", worker_id);
         send_batch(fd_out, NULL, NULL, 0);
     }
 
-    log_debug("[W%d-Scanner] readdir loop done (entries=%d)", worker_id, entry_count);
+    log_debug_v(202605181600, "[W%d-Scanner] readdir loop done (entries=%d)", worker_id, entry_count);
     closedir(dir);
 cleanup:
     free(paths);
