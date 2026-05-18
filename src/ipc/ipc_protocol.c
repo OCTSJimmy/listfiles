@@ -31,7 +31,7 @@
  */
 int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_len) {
     size_t total_len = sizeof(IpcMessageHeader) + payload_len;
-    if (total_len > 4096) {
+    if (total_len > 4096 && msg_type != IPC_MSG_BATCH) {
         log_fatal("[ipc_send] total_len=%zu exceeds PIPE_BUF(4096), msg_type=%u payload_len=%u. "
                   "Ensure MAX_PATH_LENGTH <= 4088 to guarantee atomic pipe writes.",
                   total_len, msg_type, payload_len);
@@ -50,7 +50,7 @@ int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_le
 
     size_t written = 0;
     int partial_retry = 0;  /* v15.4.1: limit partial-write retries to prevent IPC thread hang */
-    log_debug_v(202605150000, "[ipc_send] fd=%d total=%zu msg_type=%u", fd, total_len, msg_type);
+    log_debug_v(202605181600UL, "[ipc_send] fd=%d total=%zu msg_type=%u", fd, total_len, msg_type);
     while (written < total_len) {
         ssize_t n = write(fd, buf + written, total_len - written);
         if (n == 0) {
@@ -60,7 +60,7 @@ int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_le
         }
         if (n < 0) {
             int saved_errno = errno;
-            log_debug_v(202605150000, "[ipc_send] write error fd=%d written=%zu n=%zd errno=%d (%s)",
+            log_debug_v(202605181600UL, "[ipc_send] write error fd=%d written=%zu n=%zd errno=%d (%s)",
                       fd, written, n, saved_errno, strerror(saved_errno));
             if (saved_errno == EINTR) continue;
             if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) {
@@ -79,9 +79,9 @@ int ipc_send(int fd, uint32_t msg_type, const void *payload, uint32_t payload_le
             return -1;
         }
         written += n;
-        log_debug_v(202605150000, "[ipc_send] write ok fd=%d written=%zu n=%zd", fd, written, n);
+        log_debug_v(202605181600UL, "[ipc_send] write ok fd=%d written=%zu n=%zd", fd, written, n);
     }
-    log_debug_v(202605150000, "[ipc_send] fd=%d total=%zu complete", fd, total_len);
+    log_debug_v(202605181600UL, "[ipc_send] fd=%d total=%zu complete", fd, total_len);
     free(buf);
     return 0;
 }

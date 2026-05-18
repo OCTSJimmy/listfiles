@@ -6,6 +6,18 @@
 
 ## [15.4.4] - 2026-05-18
 
+### Fixed：IPC BATCH 消息 PIPE_BUF 大小限制（P0）
+
+**问题背景**：`ipc_send()` 对所有消息类型强制执行 `total_len > 4096` 即返回致命错误。Worker 侧 `scan_and_send()` 按固定 1024 条记录 batch，遇到大目录时 BATCH payload 可达数百 KB，`ipc_send()` 直接拒绝发送，导致 Worker 数据丢失、Master 统计不完整，程序提前退出但标记 Success。
+
+**修复**：
+- `ipc_send()`：仅对非 `IPC_MSG_BATCH` 消息保留 `PIPE_BUF(4096)` 原子写检查；BATCH 消息允许超过 4096 bytes。
+- 理由：`fd_data` 为单 Writer（Worker Scanner 线程）单 Reader（Master IPC 线程），pipe 上不存在多写者交错风险；`write()` 循环 + `partial_retry` 机制已可安全处理大消息的非阻塞写入。
+- 同步更新 `ipc_send` 内部调试日志版本戳为 `202605181600UL`。
+
+**修改的文件**：
+- `src/ipc/ipc_protocol.c`
+
 ### Fixed：IPC FSM BATCH Footer 读取协议修复（P0）
 
 **问题背景**：v15.4.0 引入的 FSM 续传机制中，`read_data_message()` 的 PAYLOAD 阶段读取了包含 Footer 的全部 `payload_len` bytes，随后 FOOTER 阶段试图再读取 8 bytes Footer，导致管道已空、`poll(100ms)` 超时。BATCH 永远卡在 FOOTER 阶段，主线程收不到任何 BATCH，程序 0 秒退出、0 输出。
