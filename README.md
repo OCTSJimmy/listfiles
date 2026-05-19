@@ -138,16 +138,73 @@ make clean
 ### 进程模型
 
 ```
-+-------------+
-|   Master    |  <-- 消息总线，去重、分发、监控
-|  Process    |
-+--+-----+----+
-   |     |
-fd_in  fd_out   pipe(TLV IPC)
-   |     |
-+--+-----+----+
-|  Worker N   |  <-- fork() 子进程，独立执行 readdir + lstat
-+-------------+
++============================================================================================+
+|                                   MASTER PROCESS                                           |
+|                                                                                            |
+|   +----------------+    +----------------+    +----------------+    +------------------+   |
+|   |  Main Thread   |    | Monitor Thread |    | AsyncWorker    |    | CPU Dedup        |   |
+|   |  (Message Bus) |    | (Stats Panel + |    | Thread         |    | ThreadPool       |   |
+|   |                |    |  Probe Mgmt)   |    | (Format+Write) |    | (4 threads)      |   |
+|   | - dispatch_    |    |                |    |                |    |                  |   |
+|   |   lost_tasks() |    | - print_       |    | - print_to_    |    | - fp_compute     |   |
+|   | - process_     |    |   progress()   |    |   stream()     |    | - fp_set_insert  |   |
+|   |   completed_   |    | - dispatch_    |    | - write file   |    | - dev_mgr_       |   |
+|   |   batch()      |    |   probes()     |    |   / stdout     |    |   is_blacklisted |   |
+|   | - replace_     |    | - reap_probes()|    |                |    |                  |   |
+|   |   dead_worker()|    |                |    |                |    | - eventfd        |   |
+|   |                |    |                |    |                |    |   notify main    |   |
+|   +-------+--------+    +----------------+    +----------------+    +--------+---------+   |
+|           |                                                                  |             |
+|           |         cmd_queue (eventfd + mutex ring, 1024 slots)             |             |
+|           v                                                                  v             |
+|   +-------+--------+  +----------------+  +----------------+        +--------+---------+   |
+|   |  IPC Thread 0    |  |  IPC Thread 1  |  |  IPC Thread 2..|        |  completed queue   |   |
+|   |                  |  |                |  |     7          |        |  (mutex+cond)      |   |
+|   | - epoll_wait()   |  | - epoll_wait() |  | - epoll_wait() |        +--------+---------+   |
+|   | - fsm_recv()     |  | - fsm_recv()   |  | - fsm_recv()   |                 |             |
+|   |   HDR→PAYLOAD→   |  |   HDR→PAYLOAD→ |  |   HDR→PAYLOAD→ |                 |             |
+|   |   FOOTER         |  |   FOOTER       |  |   FOOTER       |                 |             |
+|   | - heartbeat check|  | - heartbeat chk|  | - heartbeat chk|                 |             |
+|   | - SIGKILL dead   |  | - SIGKILL dead |  | - SIGKILL dead |                 |             |
+|   |                  |  |                |  |                |                 |             |
+|   | ret_queue -------+--+-------+--------+--+-------+--------+                 |             |
+|   +---------------------------+----------+------------------+                  |             |
+|                               |                                                |             |
+|                               v                                                |             |
+|                        +------+------+                                         |             |
+|                        | lost_tasks  |                                         |             |
+|                        |  (queue)    |                                         |             |
+|                        +------+------+                                         |             |
+|                               ^                                                |             |
+|                               |                                                |             |
+|   fd_data fd_ctrl             |          (8 Worker processes via fork+pipe)    |             |
+|     |       |                 |                                                |             |
++=====|=======|=================|================================================|=============+
+      |       |                 |
+      |       |                 |
++=====|=======|=================|=============================================================+
+|     |       |                 |                                                            |
+|  +--+-------+--+  +-----------+-----------+  +----------------+                          |
+|  | Worker 0     |  | Worker 1..7           |  |  ...           |                          |
+|  | Process      |  | Process               |  |                |                          |
+|  |              |  |                       |  |                |                          |
+|  | +----------+ |  | +----------+          |  |                |                          |
+|  | | Scanner  | |  | | Scanner  |          |  |                |                          |
+|  | | Thread   | |  | | Thread   |          |  |                |                          |
+|  | |          | |  | |          |          |  |                |                          |
+|  | | - readdir| |  | | - readdir|          |  |                |                          |
+|  | | - lstat  | |  | | - lstat  |          |  |                |                          |
+|  | | - batch  | |  | | - batch  |          |  |                |                          |
+|  | | - ipc_send| |  | | - ipc_send|         |  |                |                          |
+|  | |   BATCH  | |  | |   BATCH  |          |  |                |                          |
+|  | +----------+ |  | +----------+          |  |                |                          |
+|  |              |  |                       |  |                |                          |
+|  | COW shared:  |  | COW shared:           |  |                |                          |
+|  | Config,      |  | Config,               |  |                |                          |
+|  | visited_set  |  | visited_set           |  |                |                          |
+|  | (read-only)  |  | (read-only)           |  |                |                          |
+|  +--------------+  +-----------------------+  +----------------+                          |
++============================================================================================+
 ```
 
 Master 进程通过消息总线机制管理所有 Worker：主线程不再直接操作 fd，而是通过 **8 个常驻 IPC 线程** 分别管理每个 Worker 的非阻塞 epoll + 心跳检测 + SIGKILL。主线程自身是纯粹的消息总线，只负责：收消息（从 8 个返回队列轮询）、处理消息（BATCH 去重写文件、DEAD 收尾替换、ERROR 记日志）、发消息（SCAN 任务分发给 IPC 线程）。
