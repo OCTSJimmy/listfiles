@@ -154,7 +154,11 @@ Master 进程通过消息总线机制管理所有 Worker：主线程不再直接
 
 故障隔离：一个 Worker 的 fd 出问题 → 只污染它自己的 IPC 线程 → IPC 线程发 DEAD 消息 → 主线程收到后优雅替换 Worker → 其他 7 路完全不受影响。彻底消除了 v12.x 单线程 epoll 架构中"一个 Worker 出问题导致整个 Master 事件循环 hang 死"的瓶颈。
 
-Master 向 Worker 发送 `IPC_MSG_SCAN` 时采用**非阻塞写 + 积压队列**机制：`fd_in` 管道容量被提升至 1MB（默认 64KB），写满时 `ipc_send()` 返回 `EAGAIN`，任务被缓存到对应 Worker 的 `backlog_paths` 动态数组中，由主循环后续轮次重试刷出。这避免了 Master 在管道满时阻塞等待，彻底消除了双向管道死锁风险。
+Master 向 Worker 发送 `IPC_MSG_SCAN` 时采用**非阻塞写 + lost_tasks 重试队列**机制：
+- `fd_in` 管道容量通过 `fcntl(F_SETPIPE_SZ)` 提升至 1MB（默认 64KB），减少写满概率。
+- 当 `send_scan_to_ipc()` 因 `msg_queue` 满而失败时，路径被 `strdup()` 后推入全局 `lost_tasks` 队列，由 `dispatch_lost_tasks()` 在后续轮次中重试派发。
+- Worker 死亡清理时，其 `backlog_paths` 中残留的路径会被迁移到 `lost_tasks`，避免任务丢失。
+- 这避免了 Master 在管道满时阻塞等待，彻底消除了双向管道死锁风险。
 
 Master 内部另设 **`ThreadPool`**（默认 4 线程），通过 `mutex + cond` 有界队列 + `eventfd` 通知，将 CPU 密集型的指纹计算与设备黑名单检查 offload 到工作线程，避免阻塞主循环。队列满时自动降级为同步处理。
 
@@ -185,9 +189,8 @@ while (running) {
 
 #### 消息队列
 
-- **eventfd + 无锁环形队列**（64 位原子 CAS head/tail）。
-- 默认容量 1024 条消息/队列，有界设计天然实现背压。
-- 零 mutex、零上下文切换开销、支持 64 位原子操作。
+- **eventfd + mutex 保护的有界环形队列**，容量固定为 1024 条消息/队列。
+- 有界设计天然实现背压：队列满时 `msg_queue_send()` 返回 `false`，调用方需自行处理溢出（如将任务加入 `lost_tasks` 重试队列）。
 
 #### 消息格式
 
@@ -212,7 +215,7 @@ while (running) {
 | `WorkerPool` | `fork()` + `pipe2(O_CLOEXEC)` 的进程池管理（spawn / replace / stop） |
 | `ProbeScheduler` | 基于小根堆的渐进探测调度器，指数退避：5s → 10s → 20s → ... → 300s |
 | `DeviceManager` | 设备状态机：`NORMAL` → `PROBING` → `DEAD` → `CONDEMNED` |
-| `MainLoop` | `epoll_wait` 循环：处理 `BATCH` / `HEARTBEAT` / `ERROR` / `EXIT` 消息 |
+| `MainLoop` | 消息总线循环：从 IPC 线程的返回队列轮询消息，处理 `BATCH`（去重+输出+子目录派发）/`DEAD`（清理+替换）/`ERROR`（熔断）/`FINISH`（任务完成） |
 | `ThreadPool` | Master 内嵌 CPU 去重线程池（`mutex + cond + eventfd`），处理指纹计算与黑名单检查。`poll_completed` 带自循环检测与遍历上限，`destroy` 清理带安全上限，防止 completed 链表循环导致主线程阻塞 |
 | `AsyncWorker` | 独立输出线程，接收主循环批量提交的任务，格式化并写入文件 |
 | `Monitor` | 独立监控线程：统计面板输出、Worker 心跳超时检查、敢死队探测调度与收割 |

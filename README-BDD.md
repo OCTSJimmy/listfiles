@@ -1,6 +1,6 @@
 # listfiles — 行为驱动开发 (BDD) 规格说明
 
-> 版本: 12.2.x  
+> 版本: 15.4.5  
 > 语言: C11 (GNU11)  
 > 平台: Linux (依赖 fork, epoll, pipe2, pthread)
 
@@ -191,7 +191,7 @@ Feature: Worker 耦合架构的合理性论证
     And 结论：分离 Worker 在当前需求下 ROI 为负
 ```
 
-### Feature: 进度持久化与恢复（当前实现的缺陷描述）
+### Feature: 进度持久化与恢复（已知限制）
 
 ```gherkin
 Feature: 进度持久化与恢复
@@ -200,8 +200,9 @@ Feature: 进度持久化与恢复
   So that 我能评估在关键场景下的恢复精度
 
   Background:
-    Given 当前实现仅使用单级 Persist Cursor（write_slice_index + line_count）
-    And process_slice_index 是 write_slice_index 的硬绑定镜像（僵尸字段）
+    Given 当前实现使用单级 Persist Cursor（write_slice_index + line_count）
+    And process_slice_index 字段仍存在但已失去独立语义，与 write_slice_index 硬绑定
+    And 以下限制在 v15.4.5 中仍然存在
 
   Scenario: 当前 .idx 更新频率极低
     Given 扫描一个 9 万文件的目录
@@ -411,21 +412,21 @@ Feature: Master-Worker 进程模型
     And 主循环读取 batch payload
     And 解析出 paths 和 stats 数组
 
-  Scenario: Master 非阻塞发送与积压队列
+  Scenario: Master 非阻塞发送与 lost_tasks 重试队列
     Given Master 正在向 Worker 发送 IPC_MSG_SCAN 任务
-    And fd_in 管道已达到容量上限（1MB，约 10,000 个任务）
-    When ipc_send() 返回 EAGAIN（-2）
-    Then 应该将该任务追加到对应 WorkerSlot 的 backlog_paths 数组
-    And backlog 数组支持动态扩容（初始 64，倍增）
-    And pending_tasks 计数保持不变（任务仍视为已分配）
+    And Worker 的 cmd_queue 已满（1024 条消息上限）
+    When send_scan_to_ipc() 返回 false（msg_queue_send 失败）
+    Then 应该将该任务 strdup() 后推入全局 lost_tasks 队列
+    And pending_tasks 计数先增后减（保持逻辑一致性）
+    And 主循环的 dispatch_lost_tasks() 会在后续轮次中重试派发
 
-  Scenario: 积压队列刷出
-    Given 某个 WorkerSlot 存在积压任务
-    When 主循环在 epoll_wait 后调用 flush_worker_backlogs()
-    Then 应该遍历该 Worker 的 backlog_paths
-    And 对每条路径重试 ipc_send()
-    And 发送成功则 free(path) 并从 backlog 移除
-    And 仍返回 EAGAIN 则保留至下一轮重试
+  Scenario: Worker 死亡时 backlog 迁移
+    Given 某个 WorkerSlot 存在 backlog_paths（历史残留）
+    When Worker 被判定死亡（心跳超时或 epoll error）
+    Then cleanup_dead_worker_slot() 应该将该 Worker 的 backlog_paths
+    And 通过 lost_tasks_push_backlog() 迁移到全局 lost_tasks 队列
+    And 释放 backlog_paths 数组本身
+    And 避免任务随 Worker 死亡而永久丢失
 
   Scenario: Worker 正常退出
     Given Worker 收到 IPC_MSG_STOP
@@ -603,9 +604,9 @@ Feature: 独立监控线程
     Given Monitor 线程正在运行
     When 每 500ms 触发一次循环
     Then 应该调用 print_progress() 输出统计面板
-    And 每秒触发一次 check_workers_health()
-    And 每秒触发一次 dispatch_probes()
-    And 每轮触发一次 reap_probes()
+    And 每秒触发一次 dispatch_probes()（调度设备探测任务）
+    And 每轮触发一次 reap_probes()（收割探测子进程）
+    And Worker 心跳超时检测已下沉到 IPC 线程，Monitor 不再负责
 
   Scenario: 静默模式下监控线程不输出面板
     Given 用户指定了 -M (--mute)
@@ -662,16 +663,17 @@ Feature: Worker 心跳监控
     When Worker 发送 IPC_MSG_HEARTBEAT
     Then Master 更新该 slot 的 last_heartbeat 时间戳
 
-  Scenario: Worker 心跳超时（Monitor 线程检测）
+  Scenario: Worker 心跳超时（IPC 线程检测）
     Given Worker 因 D-State 阻塞无法发送心跳
     And 当前时间 - last_heartbeat > heartbeat_timeout（默认30秒）
-    When Monitor 线程的 check_workers_health() 执行
+    When IPC 线程的 epoll_wait 超时后执行心跳检查
     Then 判定该 Worker 卡死
     And 发送 SIGKILL 强制终止
-    And 以 WNOHANG 方式 reap 僵尸进程
-    And 标记 slot->is_alive = false, slot->pid = -1
-    And WorkerPool->active_count 递减
-    And 主循环的 "Replace dead workers" 段检测到 pid=-1 后启动替换 Worker
+    And 向主线程发送 RET_DEAD 消息
+    And 标记 slot->is_alive = false
+    And 主线程收到 RET_DEAD 后调用 cleanup_dead_worker_slot
+    And 关闭 fd、将 backlog 迁移到 lost_tasks、递减 pending_tasks
+    And 随后主线程的 "Replace dead workers" 段启动替换 Worker
 ```
 
 ### Feature: 敢死队探测调度与收割
@@ -782,8 +784,13 @@ Feature: 响应系统信号
 | 模块 (文件) | BDD 领域 | 核心行为 |
 |------------|---------|---------|
 | `cmdline` | 配置解析 | Given 命令行参数，Then 填充 Config 结构体 |
-| `main_loop` | 事件循环 | Given epoll 事件，Then 分发到对应 Handler |
-| `worker_proc` | Worker 生命周期 | Given SCAN 消息，Then 执行目录遍历并返回 BATCH |
+| `main_loop` | 消息总线 | Given IPC 线程返回的消息，Then 分发到 BATCH/DEAD/ERROR/FINISH Handler |
+| `dispatch` | 任务分发 | Given 目录路径，Then 找到 IDLE Worker 并发送 CMD_SCAN |
+| `batch_processor` | Batch 处理 | Given Worker 返回的 BATCH，Then 提交到 ThreadPool 去重，完成后派发子目录 |
+| `worker_proc` | Worker 进程生命周期 | Given spawn/replace 指令，Then fork 子进程并建立 pipe |
+| `ipc_thread` | IPC 线程管理 | Given Worker fd，Then epoll_wait + FSM 续传读取 + 心跳检测 |
+| `ipc_protocol` | IPC 协议 | Given TLV 消息，Then 原子化 send/recv/drain |
+| `ipc_message_handler` | IPC 消息处理 | Given FSM 状态，Then 解析 Header/Payload/Footer 并转发 |
 | `fingerprint_set` | 去重 | Given 路径+dev+ino，Then 计算指纹并判断存在性 |
 | `reference_map` | 半增量索引 | Given 指纹，Then 返回历史 mtime/d_type |
 | `device_manager` | 设备状态机 | Given dev_t，Then 返回 NORMAL/DEAD/CONDEMNED |
@@ -801,10 +808,12 @@ Feature: 响应系统信号
 |---------|------|---------|
 | `IPC_MSG_SCAN` | Master → Worker | Given 目录路径，Then Worker 执行扫描 |
 | `IPC_MSG_BATCH` | Worker → Master | Given 扫描结果，Then Master 解析并去重 |
-| `IPC_MSG_HEARTBEAT` | Worker → Master | Given 时间戳，Then Master 更新存活状态 |
+| `IPC_MSG_HEARTBEAT` | Worker → Master | Given 时间戳，Then IPC 线程更新存活状态 |
 | `IPC_MSG_ERROR` | Worker → Master | Given errno+dev+path，Then Master 触发熔断 |
 | `IPC_MSG_EXIT` | Worker → Master | Given 退出信号，Then Master 回收 slot |
 | `IPC_MSG_STOP` | Master → Worker | Given 停止指令，Then Worker 优雅退出 |
+| `RET_READY` | Worker → IPC | Given Worker 初始化完成，Then IPC 线程转发给主线程 |
+| `RET_DEAD` | IPC → Master | Given 心跳超时或 epoll error，Then Master 清理并替换 Worker |
 
 ## 附录 C: 设备状态转换
 
