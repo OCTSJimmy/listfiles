@@ -196,6 +196,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
             if (!send_scan_to_ipc(ctx, wid, path, st->st_dev)) {
                 atomic_fetch_sub(&ctx->pending_tasks, 1);
                 atomic_store(&slot->state, WORKER_STATE_IDLE);
+                lost_tasks_push(&ctx->lost_tasks, strdup(path));
             }
 
             ctx->state.dir_count++;
