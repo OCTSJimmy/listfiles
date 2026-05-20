@@ -23,7 +23,7 @@ void send_stop_to_ipc(AppContext *ctx, int wid);
 int dispatch_find_idle_worker(AppContext *ctx);
 
 /* Dispatch lost tasks to available workers */
-void dispatch_lost_tasks(AppContext *ctx);
+void dispatch_from_queue(AppContext *ctx);
 
 /* Drain completed batches from thread pool */
 void drain_completed_batches(AppContext *ctx);

@@ -130,27 +130,6 @@ bool verify_pbin_footer(const PbinFooter *f) {
  * @note   先尝试读取分片末尾 Footer，校验通过则返回 footer.row_count。
  *         若 Footer 校验失败，则尝试读取按分片草稿 idx 文件中的行数。
  */
-unsigned long get_slice_row_count(const Config *cfg, unsigned long index) {
-    char *slice_path = get_slice_filename(cfg->progress_base, index);
-    PbinFooter f;
-    if (read_pbin_footer(slice_path, &f)) {
-        free(slice_path);
-        return (unsigned long)f.row_count;
-    }
-    free(slice_path);
-
-    /* Fallback: 读取按分片 idx */
-    char *idx_path = get_per_slice_index_filename(cfg->progress_base, index);
-    FILE *fp = fopen(idx_path, "r");
-    unsigned long row_count = 0;
-    if (fp) {
-        if (fscanf(fp, "%lu", &row_count) != 1) row_count = 0;
-        fclose(fp);
-    }
-    free(idx_path);
-    return row_count;
-}
-
 /* ================================================================
  * pbin / spbin 写入
  * ================================================================ */
@@ -201,28 +180,16 @@ void record_path(const Config *cfg, RuntimeState *state, const char *path, const
         char *p = get_slice_filename(cfg->progress_base, state->write_slice_index);
         state->write_slice_file = fopen(p, "wb");
         free(p);
-        if (state->write_slice_file) {
-            /* 创建活跃分片的草稿 idx */
-            char *idx = get_per_slice_index_filename(cfg->progress_base, state->write_slice_index);
-            FILE *ifp = fopen(idx, "w");
-            if (ifp) { fprintf(ifp, "0\n"); fclose(ifp); }
-            free(idx);
-        }
     }
     if (!state->write_slice_file) return;
     write_pbin_record(state->write_slice_file, path, info);
     state->line_count++;
     state->processed_count++;
     if (state->line_count >= cfg->progress_slice_lines) {
-        /* rotate slice: 先盖钢印(Footer)，再烧草稿(idx) */
+        /* rotate slice: 封口当前分片 */
         write_pbin_footer(state->write_slice_file, state->line_count);
         fclose(state->write_slice_file);
         state->write_slice_file = NULL;
-
-        /* 删除按分片草稿 idx */
-        char *old_idx = get_per_slice_index_filename(cfg->progress_base, state->write_slice_index);
-        unlink(old_idx);
-        free(old_idx);
 
         process_old_slice(cfg, state->write_slice_index);
         state->write_slice_index++;
@@ -230,13 +197,6 @@ void record_path(const Config *cfg, RuntimeState *state, const char *path, const
         char *p = get_slice_filename(cfg->progress_base, state->write_slice_index);
         state->write_slice_file = fopen(p, "wb");
         free(p);
-        if (state->write_slice_file) {
-            char *idx = get_per_slice_index_filename(cfg->progress_base, state->write_slice_index);
-            FILE *ifp = fopen(idx, "w");
-            if (ifp) { fprintf(ifp, "0\n"); fclose(ifp); }
-            free(idx);
-        }
-        atomic_update_index(cfg, state);
     }
 }
 
@@ -367,57 +327,6 @@ void record_skip(const Config *cfg, RuntimeState *state, const SpbinEntry *entry
  *         2. 按分片草稿索引（{base}_00000N.idx）：记录当前活跃分片的 line_count
  *         临时文件命名包含线程 ID 以避免多线程冲突。
  */
-void atomic_update_index(const Config *cfg, RuntimeState *state) {
-    char *idx_file = get_index_filename(cfg->progress_base);
-    char *tmp_file = safe_malloc(strlen(idx_file) + 64);
-    snprintf(tmp_file, strlen(idx_file) + 64, "%s.tmp.%lu", idx_file, (unsigned long)pthread_self());
-
-    FILE *tmp_fp = fopen(tmp_file, "w");
-    if (tmp_fp) {
-        fprintf(tmp_fp, "%lu %lu %lu %lu %lu\n",
-                state->write_slice_index,
-                state->line_count,
-                state->processed_count,
-                state->output_slice_num,
-                state->output_line_count);
-        fclose(tmp_fp);
-        if (rename(tmp_file, idx_file) != 0) unlink(tmp_file);
-    }
-    free(idx_file);
-    free(tmp_file);
-
-    /* 同步更新当前活跃分片的草稿 idx */
-    char *per_idx = get_per_slice_index_filename(cfg->progress_base, state->write_slice_index);
-    char *per_tmp = safe_malloc(strlen(per_idx) + 64);
-    snprintf(per_tmp, strlen(per_idx) + 64, "%s.tmp.%lu", per_idx, (unsigned long)pthread_self());
-    FILE *ptf = fopen(per_tmp, "w");
-    if (ptf) {
-        fprintf(ptf, "%lu\n", state->line_count);
-        fclose(ptf);
-        if (rename(per_tmp, per_idx) != 0) unlink(per_tmp);
-    }
-    free(per_idx);
-    free(per_tmp);
-}
-
-/**
- * @brief  从磁盘加载统一索引文件到运行时状态
- * @param  cfg    const Config*   全局配置指针，不能为空
- * @param  state  RuntimeState*   运行时状态指针，不能为空
- * @return bool  返回 true 表示成功加载 5 个字段；false 表示文件不存在或格式错误
- */
-bool load_progress_index(const Config *cfg, RuntimeState *state) {
-    char *idx_file = get_index_filename(cfg->progress_base);
-    FILE *fp = fopen(idx_file, "r");
-    if (!fp) { free(idx_file); return false; }
-    int matches = fscanf(fp, "%lu %lu %lu %lu %lu",
-            &state->write_slice_index, &state->line_count,
-            &state->processed_count, &state->output_slice_num, &state->output_line_count);
-    fclose(fp); free(idx_file);
-    state->process_slice_index = state->write_slice_index;
-    return matches == 5;
-}
-
 /* ================================================================
  * fpbin Cache (temporary buffer for new sub-dirs during pbin replay)
  * Uses flat array in memory + optional disk overflow file.
@@ -541,3 +450,179 @@ void fpbin_append(AppContext *ctx, const char *path, const struct stat *st) {
  * @param  ctx  AppContext*  应用上下文指针，不能为空
  * @return void
  */
+
+/* ================================================================
+ * dpbin 完成日志（本次会话临时，正常结束后删除）
+ * 格式与 pbin 同构：path | dev | ino | mtime | d_type
+ * ================================================================ */
+
+/**
+ * @brief  获取指定 dpbin 分片的文件路径
+ * @param  base   const char*    进度文件基础名（--progress-file 的值），不能为空
+ * @param  index  unsigned long  分片编号，取值范围: >= 0
+ * @return char*  动态分配的字符串，包含完整分片路径；调用者负责 free。
+ */
+char *get_dpbin_slice_filename(const char *base, unsigned long index) {
+    char *name = safe_malloc(strlen(base) + 32);
+    snprintf(name, strlen(base) + 32, "%s.dpbin_%06lu", base, index);
+    return name;
+}
+
+/**
+ * @brief  打开或创建新的 dpbin 活跃分片
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ */
+void dpbin_open_slice(AppContext *ctx) {
+    if (ctx->dpbin_slice_file) {
+        fclose(ctx->dpbin_slice_file);
+        ctx->dpbin_slice_file = NULL;
+    }
+    char *p = get_dpbin_slice_filename(ctx->cfg.progress_base, ctx->dpbin_write_slice_index);
+    ctx->dpbin_slice_file = fopen(p, "wb");
+    free(p);
+    ctx->dpbin_line_count = 0;
+}
+
+/**
+ * @brief  轮转 dpbin 分片（封口当前分片并创建新分片）
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ */
+static void dpbin_rotate_slice_internal(AppContext *ctx) {
+    if (ctx->dpbin_slice_file) {
+        write_pbin_footer(ctx->dpbin_slice_file, ctx->dpbin_line_count);
+        fclose(ctx->dpbin_slice_file);
+        ctx->dpbin_slice_file = NULL;
+    }
+    ctx->dpbin_write_slice_index++;
+    dpbin_open_slice(ctx);
+}
+
+/**
+ * @brief  向 dpbin 追加一条记录（目录完成时写入）
+ * @param  ctx   AppContext*         应用上下文指针，不能为空
+ * @param  path  const char*         目录路径，不能为空
+ * @param  st    const struct stat*  目录 stat 信息指针，允许为 NULL
+ * @return void
+ *
+ * @note   直接追加写入当前 dpbin 分片，无内存缓冲。
+ *         当分片行数达到 progress_slice_lines 时自动轮转。
+ */
+void dpbin_append(AppContext *ctx, const char *path, const struct stat *st) {
+    if (!ctx->dpbin_slice_file) {
+        dpbin_open_slice(ctx);
+    }
+    if (!ctx->dpbin_slice_file) return;
+
+    write_pbin_record(ctx->dpbin_slice_file, path, st);
+    ctx->dpbin_line_count++;
+
+    if (ctx->dpbin_line_count >= ctx->cfg.progress_slice_lines) {
+        dpbin_rotate_slice_internal(ctx);
+    }
+}
+
+/**
+ * @brief  删除所有 dpbin 文件（正常扫描结束后调用）
+ * @param  progress_base  const char*  进度文件基础名，不能为空
+ * @return void
+ *
+ * @note   扫描目录中所有匹配 dpbin_*. 的文件并删除。
+ *         若 dpbin 从未创建过（无文件），本函数为空操作。
+ */
+void dpbin_delete_all(const char *progress_base) {
+    char *dir = strdup(progress_base);
+    char *last_slash = strrchr(dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+    } else {
+        free(dir);
+        dir = strdup(".");
+    }
+
+    DIR *d = opendir(dir);
+    if (!d) {
+        free(dir);
+        return;
+    }
+
+    const char *base_name = last_slash ? last_slash + 1 : progress_base;
+    size_t prefix_len = strlen(base_name) + strlen(".dpbin_");
+    char *prefix = safe_malloc(prefix_len + 1);
+    snprintf(prefix, prefix_len + 1, "%s.dpbin_", base_name);
+
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        if (strncmp(entry->d_name, prefix, strlen(prefix)) == 0) {
+            char *full = safe_malloc(strlen(dir) + strlen(entry->d_name) + 2);
+            snprintf(full, strlen(dir) + strlen(entry->d_name) + 2, "%s/%s", dir, entry->d_name);
+            unlink(full);
+            free(full);
+        }
+    }
+
+    free(prefix);
+    closedir(d);
+    free(dir);
+}
+
+/**
+ * @brief  修复截断的 pbin 分片（ salvage 有效行，截断后重新封口）
+ * @param  path            const char*   分片文件路径，不能为空
+ * @param  out_valid_rows  uint64_t*     输出参数，返回 salvage 后的有效行数
+ * @return bool  返回 true 表示 salvage 成功（至少保留了一条记录并写入 Footer）；
+ *               false 表示整个分片损坏或为空，建议直接删除。
+ *
+ * @note   从文件开头顺序解析记录，遇到第一条不完整记录时停止。
+ *         截断到最后一条完整记录末尾，写入新的 Footer（row_count = 有效行数）。
+ *         各字段大小与 write_pbin_record 严格对应。
+ */
+bool pbin_salvage_truncated(const char *path, uint64_t *out_valid_rows) {
+    FILE *fp = fopen(path, "r+b");
+    if (!fp) return false;
+
+    uint64_t valid_offset = 0;
+    uint64_t valid_rows = 0;
+    char path_buf[MAX_PATH_LENGTH];
+
+    while (1) {
+        size_t path_len;
+        if (fread(&path_len, sizeof(size_t), 1, fp) != 1) break;
+        if (path_len == 0 || path_len >= MAX_PATH_LENGTH) break;
+
+        if (fread(path_buf, 1, path_len, fp) != path_len) break;
+        /* 可选：检查路径是否为合理字符串，但二进制数据可能恰好匹配，不强制校验 */
+
+        dev_t dev;
+        ino_t ino;
+        time_t mtime;
+        unsigned char d_type;
+        if (fread(&dev, sizeof(dev_t), 1, fp) != 1) break;
+        if (fread(&ino, sizeof(ino_t), 1, fp) != 1) break;
+        if (fread(&mtime, sizeof(time_t), 1, fp) != 1) break;
+        if (fread(&d_type, sizeof(unsigned char), 1, fp) != 1) break;
+
+        valid_offset = ftell(fp);
+        valid_rows++;
+    }
+
+    if (valid_rows == 0) {
+        fclose(fp);
+        return false;
+    }
+
+    /* 截断到最后一条完整记录末尾 */
+    if (ftruncate(fileno(fp), (off_t)valid_offset) != 0) {
+        fclose(fp);
+        return false;
+    }
+    fseek(fp, (long)valid_offset, SEEK_SET);
+
+    /* 重新写入 Footer */
+    bool ok = write_pbin_footer(fp, valid_rows);
+    fclose(fp);
+
+    if (ok && out_valid_rows) *out_valid_rows = valid_rows;
+    return ok;
+}

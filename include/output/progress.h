@@ -15,11 +15,7 @@ void record_path_batch_init(RecordBatch *batch);
 void record_path_batch_flush(const Config *cfg, RuntimeState *state, RecordBatch *batch);
 bool record_path_batch_append(const Config *cfg, RuntimeState *state, RecordBatch *batch, const char *path, const struct stat *info);
 
-/* 索引与游标 */
-void atomic_update_index(const Config *cfg, RuntimeState *state);
-bool load_progress_index(const Config *cfg, RuntimeState *state);
-
-/* 归档 */
+/* 归档与完成 */
 void process_old_slice(const Config *cfg, unsigned long index);
 void finalize_archive(const Config *cfg, RuntimeState *state);
 
@@ -39,16 +35,16 @@ int acquire_lock(const Config *cfg, RuntimeState *state);
 void release_lock(RuntimeState *state);
 
 /* 文件名辅助 */
-char *get_index_filename(const char *base);
 char *get_slice_filename(const char *base, unsigned long index);
 char *get_archive_filename(const char *base);
 char *get_spbin_filename(const char *base);
-char *get_per_slice_index_filename(const char *base, unsigned long index);
 char *get_fpbin_slice_filename(const char *base, unsigned long index);
 char *get_fpbin_index_filename(const char *base);
+char *get_dpbin_slice_filename(const char *base, unsigned long index);
 
 /* Footer 读写与校验 */
 bool write_pbin_footer(FILE *fp, uint64_t row_count);
+bool pbin_salvage_truncated(const char *path, uint64_t *out_valid_rows);
 bool read_pbin_footer(const char *path, PbinFooter *out);
 bool verify_pbin_footer(const PbinFooter *f);
 unsigned long get_slice_row_count(const Config *cfg, unsigned long index);
@@ -56,6 +52,12 @@ unsigned long get_slice_row_count(const Config *cfg, unsigned long index);
 /* pbin 底层写入（内部使用，跨文件可见） */
 void write_pbin_record(FILE *fp, const char *path, const struct stat *info);
 void fpbin_open_slice(AppContext *ctx);
+
+/* dpbin 完成日志（本次会话临时） */
+void dpbin_open_slice(AppContext *ctx);
+void dpbin_rotate_slice(AppContext *ctx);
+void dpbin_append(AppContext *ctx, const char *path, const struct stat *st);
+void dpbin_delete_all(const char *progress_base);
 
 /* Spbin memory cache */
 void spbin_append(AppContext *ctx, const SpbinEntry *entry);

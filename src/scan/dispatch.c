@@ -14,7 +14,7 @@
 #include "msg_format.h"
 #include "msg_queue.h"
 #include "ipc_thread.h"
-#include "lost_tasks.h"
+#include "dispatch_queue.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -110,10 +110,10 @@ int dispatch_find_idle_worker(AppContext *ctx) {
 }
 
 /* ================================================================
- * Dispatch lost tasks (v13.0.0: send via cmd_queue)
+ * Dispatch from queue (v15.5.0: Stage 4 consumes dispatch_queue)
  * ================================================================ */
 
-void dispatch_lost_tasks(AppContext *ctx) {
+void dispatch_from_queue(AppContext *ctx) {
     /* 短路：如果所有 Worker 都死了，直接返回 */
     bool any_alive = false;
     for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
@@ -124,32 +124,36 @@ void dispatch_lost_tasks(AppContext *ctx) {
     }
     if (!any_alive) return;
 
-    char *path;
-    while (lost_tasks_pop(&ctx->lost_tasks, &path)) {
-        if (!path) continue;
+    DispatchTask task;
+    while (dispatch_queue_pop(&ctx->dispatch_queue, &task)) {
+        if (!task.path) continue;
 
         int wid = dispatch_find_idle_worker(ctx);
         if (wid < 0) {
-            log_warn("[LostTasks] no IDLE worker available, requeue %s", path_log_mask(path));
-            lost_tasks_push(&ctx->lost_tasks, path);
+            log_warn("[DispatchQueue] no IDLE worker available, requeue %s", path_log_mask(task.path));
+            dispatch_queue_push(&ctx->dispatch_queue, task.path, &task.st);
             break; /* 停止继续尝试，等下一轮 */
         }
         WorkerSlot *slot = &ctx->worker_pool->slots[wid];
         atomic_store(&slot->state, WORKER_STATE_BUSY);
 
-        if (!send_scan_to_ipc(ctx, wid, path, 0)) {
+        if (!send_scan_to_ipc(ctx, wid, task.path, task.st.st_dev)) {
             atomic_store(&slot->state, WORKER_STATE_IDLE);
-            lost_tasks_push(&ctx->lost_tasks, path);
+            dispatch_queue_push(&ctx->dispatch_queue, task.path, &task.st);
             continue;
         }
+        /* v15.5.0: pending_tasks++ and dpbin_append only on successful dispatch */
         atomic_fetch_add(&ctx->pending_tasks, 1);
-        log_debug_v(202605150000, "[LostTasks] dispatched %s to worker %d, pending_tasks=%ld", path_log_mask(path), wid, atomic_load(&ctx->pending_tasks));
+        if (task.st.st_dev != 0) {
+            dpbin_append(ctx, task.path, &task.st);
+        }
+        log_debug_v(202605201600UL, "[DispatchQueue] dispatched %s to worker %d, pending_tasks=%ld", path_log_mask(task.path), wid, atomic_load(&ctx->pending_tasks));
 
-        slot->current_dev = 0;
-        safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
-        free(path);
+        slot->current_dev = task.st.st_dev;
+        safe_strcpy(slot->current_path, task.path, sizeof(slot->current_path));
+        free(task.path);
     }
-    lost_tasks_compact(&ctx->lost_tasks);
+    dispatch_queue_compact(&ctx->dispatch_queue);
 }
 
 /* ================================================================
@@ -174,8 +178,8 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
         slot->fd_cmd_rd = -1;
     }
 
-    /* Migrate backlog to lost_tasks */
-    lost_tasks_push_backlog(&ctx->lost_tasks, slot->backlog_paths, slot->backlog_count);
+    /* Migrate backlog to dispatch_queue (stats unknown, st_dev==0 marks re-dispatch) */
+    dispatch_queue_push_backlog(&ctx->dispatch_queue, slot->backlog_paths, NULL, slot->backlog_count);
     free(slot->backlog_paths);
     slot->backlog_paths = NULL;
     slot->backlog_count = 0;
@@ -197,7 +201,7 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
     atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
 
     if (redispatch_current && slot->current_path[0] != '\0') {
-        if (lost_tasks_push(&ctx->lost_tasks, strdup(slot->current_path))) {
+        if (dispatch_queue_push(&ctx->dispatch_queue, strdup(slot->current_path), NULL)) {
             atomic_fetch_add(&ctx->pending_tasks, 1);
         }
     }

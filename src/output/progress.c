@@ -3,18 +3,15 @@
  * @brief 进度文件（pbin/spbin/fpbin）的写入、归档、恢复与生命周期管理
  *
  * 核心设计哲学：
- * - 同构分片：pbin 与 fpbin 采用完全相同的物理格式
- * - 页脚自描述：已封口分片末尾自带 Footer（magic + row_count + crc），无需外部 idx 陪伴
- * - 两阶段提交：活跃分片使用轻量 .idx 作为临时草稿，封口时"先盖钢印、再烧草稿"
- * - 崩溃恢复：Footer 优先，idx 兜底
+ * - 同构分片：pbin、fpbin、dpbin 采用完全相同的物理格式
+ * - 页脚自描述：已封口分片末尾自带 Footer（magic + row_count + crc），无需外部索引
+ * - 崩溃恢复：Footer 优先，dpbin 提供差分集合用于续传
  *
  * 进度文件格式（以 --progress-file=task1 为例）：
- * - task1.idx          原子更新的统一游标索引
  * - task1_000000.pbin  已封口的已完成记录分片
- * - task1_00000N.idx   活跃分片的临时草稿索引
+ * - task1.dpbin_000000 本次会话的目录完成日志（临时，正常结束后删除）
  * - task1.spbin        跳过记录（熔断设备上的目录）
  * - task1.fpbin_000XXX 恢复期间隔离新发现子目录的临时分片
- * - task1.fpbin.idx    fpbin 分片的游标索引
  * - task1.archive      zlib 压缩的历史分片归档
  * - task1.config       会话配置快照
  */
@@ -40,17 +37,6 @@
 /* ================================================================
  * Filename helpers
  * ================================================================ */
-
-/**
- * @brief  生成统一索引文件名（{base}.idx）
- * @param  base  const char*  进度文件前缀，不能为空
- * @return char*  动态分配的字符串，调用方负责 free
- */
-char *get_index_filename(const char *base) {
-    char *name = safe_malloc(strlen(base) + 32);
-    sprintf(name, "%s.idx", base);
-    return name;
-}
 
 /**
  * @brief  生成 pbin 分片文件名（{base}_000000.pbin）
@@ -83,18 +69,6 @@ char *get_archive_filename(const char *base) {
 char *get_spbin_filename(const char *base) {
     char *name = safe_malloc(strlen(base) + 32);
     sprintf(name, "%s.spbin", base);
-    return name;
-}
-
-/**
- * @brief  生成按分片草稿索引文件名（{base}_000000.idx）
- * @param  base   const char*   进度文件前缀，不能为空
- * @param  index  unsigned long 分片编号，取值范围: >= 0
- * @return char*  动态分配的字符串，调用方负责 free
- */
-char *get_per_slice_index_filename(const char *base, unsigned long index) {
-    char *name = safe_malloc(strlen(base) + 32);
-    sprintf(name, "%s_%06lu.idx", base, index);
     return name;
 }
 
@@ -164,7 +138,7 @@ void save_config_to_disk(const Config* cfg) {
  *
  * @note   非 --clean 模式：
  *         1. 调用 finalize_archive 封口活跃分片并归档
- *         2. 原子更新统一索引
+ *         2. 删除本次会话的 dpbin 临时文件
  *         3. 追加状态行到 .config（Success/Incomplete + 结束时间）
  *         --clean 模式：
  *         关闭并删除活跃分片文件，不保留任何进度记录。
@@ -172,8 +146,8 @@ void save_config_to_disk(const Config* cfg) {
 void finalize_progress(const Config *cfg, RuntimeState *state) {
     if (!cfg->clean) {
         finalize_archive(cfg, state);
-        /* Ensure index is written so resume can locate the cursor */
-        atomic_update_index(cfg, state);
+        dpbin_delete_all(cfg->progress_base);
+        /* v15.5.0: idx abolished, no cursor to write */
         if (cfg->progress_base) {
             char config_path[1024];
             snprintf(config_path, sizeof(config_path), "%s.config", cfg->progress_base);
@@ -207,27 +181,21 @@ void finalize_progress(const Config *cfg, RuntimeState *state) {
  * @param  state  RuntimeState*   运行时状态指针，不能为空
  * @return void
  *
- * @note   删除：统一索引、所有分片文件、按分片草稿 idx、归档文件、spbin、
- *         错误日志、config、fpbin 索引和分片、以及兼容旧版本的 progress.fpbin。
- *         注意：仅删除到 write_slice_index + 200 为止的分片，保留可能更远的残留。
+ * @note   删除：所有分片文件、归档文件、spbin、dpbin、错误日志、config、
+ *         fpbin 索引和分片、以及兼容旧版本的 progress.fpbin。
+ *         注意：仅删除到 write_slice_index + 200 为止的 pbin 分片，保留可能更远的残留。
  */
 void cleanup_progress(const Config *cfg, RuntimeState *state) {
-    char *idx_path = get_index_filename(cfg->progress_base);
-    unlink(idx_path);
-    free(idx_path);
-
     /* Always clean up slice files on --clean; on --archive they were already archived */
     if (cfg->clean || cfg->archive) {
         for (unsigned long i = 0; i <= state->write_slice_index + 200; i++) {
             char *slice_path = get_slice_filename(cfg->progress_base, i);
             unlink(slice_path);
             free(slice_path);
-            /* 同时清理按分片草稿 idx */
-            char *per_idx = get_per_slice_index_filename(cfg->progress_base, i);
-            unlink(per_idx);
-            free(per_idx);
         }
     }
+    /* Clean up any dpbin slices (session temporary) */
+    dpbin_delete_all(cfg->progress_base);
 
     char *arch_path = get_archive_filename(cfg->progress_base);
     if (cfg->clean) unlink(arch_path);
@@ -342,7 +310,7 @@ void spbin_requeue_recovered(AppContext *ctx, dev_t dev) {
             if (!scan) {
                 log_warn("[SPBIN] malloc failed for CMD_SCAN, dropping %s", ctx->spbin_entries[i].path);
                 atomic_fetch_sub(&ctx->pending_tasks, 1);
-                lost_tasks_push(&ctx->lost_tasks, strdup(ctx->spbin_entries[i].path));
+                dispatch_queue_push(&ctx->dispatch_queue, strdup(ctx->spbin_entries[i].path), NULL);
             } else {
                 scan->path_len = plen;
                 scan->dev = ctx->spbin_entries[i].dev;
@@ -357,7 +325,7 @@ void spbin_requeue_recovered(AppContext *ctx, dev_t dev) {
                     free(scan);
                     log_warn("[SPBIN] cmd_queue full, dropping %s", ctx->spbin_entries[i].path);
                     atomic_fetch_sub(&ctx->pending_tasks, 1);
-                    lost_tasks_push(&ctx->lost_tasks, strdup(ctx->spbin_entries[i].path));
+                    dispatch_queue_push(&ctx->dispatch_queue, strdup(ctx->spbin_entries[i].path), NULL);
                 }
             }
         }

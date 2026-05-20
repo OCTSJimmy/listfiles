@@ -16,7 +16,7 @@
 #include "msg_format.h"
 #include "msg_queue.h"
 #include "ipc_thread.h"
-#include "lost_tasks.h"
+#include "dispatch_queue.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -95,7 +95,7 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
         case MSG_DROP: {
             if (msg->data_len >= sizeof(DropPayload)) {
                 DropPayload *drop = (DropPayload*)msg->data;
-                if (!lost_tasks_push(&ctx->lost_tasks, strdup(drop->path))) {
+                if (!dispatch_queue_push(&ctx->dispatch_queue, strdup(drop->path), NULL)) {
                     log_warn("[Bus] MSG_DROP requeue failed: %s", path_log_mask(drop->path));
                 }
             }
@@ -295,9 +295,9 @@ void main_loop_run(AppContext *ctx) {
         static int loop_counter = 0;
         if (++loop_counter >= 100) {
             loop_counter = 0;
-            log_info("[MainLoop] pending_tasks=%ld pending_batches=%ld hist_state=%d lost_tasks=%zu",
+            log_info("[MainLoop] pending_tasks=%ld pending_batches=%ld hist_state=%d dispatch_queue=%zu",
                      atomic_load(&ctx->pending_tasks), atomic_load(&ctx->pending_batches),
-                     ctx->hist_pump_state, ctx->lost_tasks.count);
+                     ctx->hist_pump_state, dispatch_queue_count(&ctx->dispatch_queue));
         }
 
         /* 2. Drain all IPC return queues */
@@ -349,8 +349,8 @@ void main_loop_run(AppContext *ctx) {
             }
         }
 
-        /* 7. Dispatch lost tasks */
-        dispatch_lost_tasks(ctx);
+        /* 7. Dispatch from queue */
+        dispatch_from_queue(ctx);
 
         /* 8. Termination check */
         if (atomic_load(&ctx->pending_tasks) == 0 && !ctx->resume_active

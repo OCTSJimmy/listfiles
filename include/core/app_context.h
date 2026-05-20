@@ -25,7 +25,7 @@ typedef struct {
 #include "spbin.h"
 #include "thread_pool.h"
 #include "monitor.h"
-#include "lost_tasks.h"
+#include "dispatch_queue.h"
 
 /* 恢复流程中的历史目录泵送状态 */
 typedef enum {
@@ -41,6 +41,7 @@ typedef struct AppContext {
 
     /* === 去重与参考索引(仅主进程访问) === */
     FingerprintSet *visited_set;      /* 本次任务防环 */
+    FingerprintSet *completed_set;    /* v15.5.0: dpbin 加载的已完成目录集合(恢复时) */
     FingerprintSet *reference_set;    /* 半增量:历史存在性(可能 NULL) */
     ReferenceMap   *reference_map;    /* 半增量:fingerprint -> (mtime, d_type) */
 
@@ -60,7 +61,7 @@ typedef struct AppContext {
     int             next_requeue_worker;
     int             next_dispatch_worker;   // [新增] 轮询分发 Worker 索引
 
-    LostTasksQueue  lost_tasks;
+    DispatchQueue   dispatch_queue;
     
     /* === v13.0.0 IPC Thread Isolation === */
     MsgQueue       **ipc_cmd_queues;    /* Master -> IPC threads */
@@ -104,6 +105,11 @@ typedef struct AppContext {
     struct stat    *fpbin_stats;        /* 对应的 stat 数组 */
     size_t          fpbin_count;        /* 当前内存中的条目数 */
     size_t          fpbin_capacity;     /* 内存数组容量 */
+
+    /* === dpbin 完成日志(本次会话临时) === */
+    FILE           *dpbin_slice_file;       /* 当前活跃 dpbin 分片文件指针 */
+    unsigned long   dpbin_write_slice_index;/* 当前 dpbin 分片号 */
+    unsigned long   dpbin_line_count;       /* 当前 dpbin 分片行数 */
 
 } AppContext;
 

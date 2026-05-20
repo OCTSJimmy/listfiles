@@ -97,6 +97,7 @@ static mode_t dt_to_mode(unsigned char d_type) {
 static bool try_blind_trust(const char *full_path, uint64_t dir_dev, uint64_t d_ino,
                             unsigned char d_type, struct stat *out_st) {
     if (!g_worker_ref_set || !g_worker_ref_map) return false;
+    if (d_type == DT_DIR) return false; /* v15.5.0: 目录始终不信任，避免 mtime 不可靠导致的遗漏 */
     if (d_type == DT_UNKNOWN || d_ino == 0) return false;
 
     uint8_t fp[FP_SIZE];

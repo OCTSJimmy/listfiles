@@ -178,26 +178,8 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                 /* v15.4.5: During resume pumping, re-scan discovered directories
                  * to recover sub-directories lost in the previous interrupted run. */
             }
-            /* Unified dispatch: send CMD_SCAN for all non-duplicate directories.
-             * In HIST_PUMP_OLD, batch_dedup_worker no longer skips directories,
-             * so they reach here and get re-dispatched. */
-            atomic_fetch_add(&ctx->pending_tasks, 1);
-            int wid = dispatch_find_idle_worker(ctx);
-            if (wid < 0) {
-                log_warn("[Dispatch] no IDLE worker available (path=%s), requeue to lost_tasks", path_log_mask(path));
-                atomic_fetch_sub(&ctx->pending_tasks, 1);
-                lost_tasks_push(&ctx->lost_tasks, strdup(path));
-                continue;
-            }
-            WorkerSlot *slot = &ctx->worker_pool->slots[wid];
-            atomic_store(&slot->state, WORKER_STATE_BUSY);
-            slot->current_dev = st->st_dev;
-            safe_strcpy(slot->current_path, path, sizeof(slot->current_path));
-            if (!send_scan_to_ipc(ctx, wid, path, st->st_dev)) {
-                atomic_fetch_sub(&ctx->pending_tasks, 1);
-                atomic_store(&slot->state, WORKER_STATE_IDLE);
-                lost_tasks_push(&ctx->lost_tasks, strdup(path));
-            }
+            /* v15.5.0: Stage 3 only pushes to dispatch_queue; Stage 4 consumes */
+            dispatch_queue_push(&ctx->dispatch_queue, strdup(path), st);
 
             ctx->state.dir_count++;
             if (ctx->cfg.include_dir) {

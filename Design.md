@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.4.5**（续传丢失子目录修复 + IPC BATCH PIPE_BUF 限制放宽 + IPC FSM Footer 读取协议修复 + 部分写入防御 + Shard 溢出修复 + 线程池安全上限）
+当前设计版本：**v15.5.0**（SEDA dispatch_queue + pbin/dpbin 差集恢复 + blind-trust 目录排除 + idx 废除）
 
 ---
 
@@ -53,6 +53,7 @@
 | **v15.4.2** | **fp_shard_insert_internal 安全加固** | `expected_count*2` 溢出、`PROBE_LIMIT` 截断探测、rehash 失败无回滚 | 饱和乘法、`PROBE_LIMIT=capacity`、rehash 失败完整回滚 |
 | **v15.4.3** | **thread_pool completed 链表安全** | `node` malloc 失败泄漏 batch、`completed` 链表自循环、`destroy` 无限 drain | malloc 失败释放 batch、自循环检测+断开、drain 安全上限 |
 | **v15.4.5** | **IPC FSM BATCH Footer 读取协议修复** | v15.4.0 FSM 中 PAYLOAD 阶段读完含 Footer 的全部 payload，FOOTER 阶段再读 8B 时管道已空超时 | PAYLOAD 只读 `payload_len-8` body；FOOTER 单独读 8B 验证后复制到 buf 末尾 |
+| **v15.5.0** | **SEDA dispatch_queue + pbin/dpbin 差集恢复** | `lost_tasks` 是溢出桶不是队列；idx 5 字段是 v12.x patchwork；pending_tasks 语义三处不一致；目录被盲信导致 mtime 不可靠 | `dispatch_queue` Stage 3→4 解耦；`dpbin` 差集恢复废除 idx；`pending_tasks` 统一为成功派发后；目录 `DT_DIR` 硬过滤不盲信 |
 ---
 
 ## v13.0.0：IPC 线程隔离

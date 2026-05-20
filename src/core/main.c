@@ -46,7 +46,7 @@ static void app_context_init(AppContext *ctx) {
     ctx->next_requeue_worker = 0;
     atomic_init(&ctx->pending_tasks, 0);
     atomic_init(&ctx->pending_batches, 0);
-    lost_tasks_init(&ctx->lost_tasks);
+    dispatch_queue_init(&ctx->dispatch_queue);
     record_path_batch_init(&ctx->record_batch);
 }
 
@@ -93,7 +93,11 @@ static void app_context_destroy(AppContext *ctx) {
         fp_set_destroy(ctx->visited_set);
         ctx->visited_set = NULL;
     }
-    lost_tasks_destroy(&ctx->lost_tasks);
+    if (ctx->completed_set) {
+        fp_set_destroy(ctx->completed_set);
+        ctx->completed_set = NULL;
+    }
+    dispatch_queue_destroy(&ctx->dispatch_queue);
     if (ctx->reference_set) {
         fp_set_destroy(ctx->reference_set);
         ctx->reference_set = NULL;
@@ -425,6 +429,10 @@ int main(int argc, char *argv[]) {
     }
 
     finalize_progress(&ctx.cfg, &ctx.state);
+    /* v15.5.0: Delete temporary dpbin after successful completion */
+    if (ctx.cfg.continue_mode && ctx.cfg.progress_base) {
+        dpbin_delete_all(ctx.cfg.progress_base);
+    }
     app_context_destroy(&ctx);
 
     /* 释放命令行参数分配的字符串内存 */

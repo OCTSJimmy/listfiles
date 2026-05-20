@@ -145,11 +145,6 @@ void finalize_archive(const Config *cfg, RuntimeState *state) {
         write_pbin_footer(state->write_slice_file, state->line_count);
         fclose(state->write_slice_file);
         state->write_slice_file = NULL;
-        /* 删除按分片草稿 idx */
-        char *per_idx = get_per_slice_index_filename(cfg->progress_base, state->write_slice_index);
-        unlink(per_idx);
-        free(per_idx);
-
         char *src_path = get_slice_filename(cfg->progress_base, state->write_slice_index);
         if (cfg->archive) {
             archive_slice_to_file(cfg, src_path, ARCHIVE_BLOCK_NORMAL);
@@ -373,6 +368,49 @@ static void iterate_pbin_slices(const Config *cfg, RuntimeState *state,
                 }
             }
             parse_pbin_buffer(buf, data_size, 0, visited_set, ref_set, ref_map);
+            free(buf);
+        }
+        fclose(slice_fp);
+        free(slice_path);
+    }
+}
+
+/**
+ * @brief  加载 dpbin 分片到 completed_set
+ * @param  cfg           const Config*  全局配置指针，不能为空
+ * @param  completed_set FingerprintSet*  已完成目录集合，不能为空
+ * @return void
+ *
+ * @note   遍历所有 dpbin_*. 分片，解析记录并计算 fingerprint 插入 completed_set。
+ *         dpbin 格式与 pbin 同构，复用 parse_pbin_buffer 解析。
+ */
+static void load_dpbin_to_completed_set(const Config *cfg, FingerprintSet *completed_set) {
+    int consecutive_missing = 0;
+    for (unsigned long s_idx = 0; ; ++s_idx) {
+        char *slice_path = get_dpbin_slice_filename(cfg->progress_base, s_idx);
+        FILE *slice_fp = fopen(slice_path, "rb");
+        if (!slice_fp) {
+            free(slice_path);
+            consecutive_missing++;
+            if (consecutive_missing > 50) break;
+            continue;
+        }
+        consecutive_missing = 0;
+
+        fseek(slice_fp, 0, SEEK_END);
+        long fsize = ftell(slice_fp);
+        fseek(slice_fp, 0, SEEK_SET);
+        if (fsize > 0) {
+            unsigned char *buf = safe_malloc(fsize);
+            fread(buf, 1, fsize, slice_fp);
+            long data_size = fsize;
+            if (fsize >= (long)sizeof(PbinFooter)) {
+                PbinFooter *f = (PbinFooter *)(buf + fsize - sizeof(PbinFooter));
+                if (verify_pbin_footer(f)) {
+                    data_size = fsize - (long)sizeof(PbinFooter);
+                }
+            }
+            parse_pbin_buffer(buf, data_size, 0, completed_set, NULL, NULL);
             free(buf);
         }
         fclose(slice_fp);
@@ -684,6 +722,11 @@ void pump_pbin_batch(AppContext *ctx, int batch_size) {
         fp_set_insert(ctx->visited_set, fp_all);
 
         if (d_type == DT_DIR) {
+            /* v15.5.0: Skip already-completed directories (differential resume) */
+            if (ctx->completed_set && fp_set_contains(ctx->completed_set, fp_all)) {
+                free(path);
+                continue;
+            }
             atomic_fetch_add(&ctx->pending_tasks, 1);
             uint32_t plen = (uint32_t)strlen(path);
             static int next_wid = 0;
@@ -698,7 +741,7 @@ void pump_pbin_batch(AppContext *ctx, int batch_size) {
             if (!scan) {
                 log_warn("[Pump] malloc failed for CMD_SCAN, dropping %s", path);
                 atomic_fetch_sub(&ctx->pending_tasks, 1);
-                lost_tasks_push(&ctx->lost_tasks, strdup(path));
+                dispatch_queue_push(&ctx->dispatch_queue, strdup(path), &st);
             } else {
                 scan->path_len = plen;
                 scan->dev = st.st_dev;
@@ -713,7 +756,7 @@ void pump_pbin_batch(AppContext *ctx, int batch_size) {
                     free(scan);
                     log_warn("[Pump] cmd_queue full, dropping %s", path);
                     atomic_fetch_sub(&ctx->pending_tasks, 1);
-                    lost_tasks_push(&ctx->lost_tasks, strdup(path));
+                    dispatch_queue_push(&ctx->dispatch_queue, strdup(path), &st);
                 }
             }
             sent++;
@@ -756,13 +799,11 @@ int restore_progress(const Config *cfg, AppContext *ctx) {
     ctx->hist_pump_slice_idx = 0;
     ctx->hist_pump_line_no = 0;
 
-    bool has_idx = load_progress_index(cfg, &ctx->state);
     unsigned long pbin_count  = count_pbin_slices(cfg);
     unsigned long archive_blk = count_archive_blocks(cfg);
     unsigned long total_blocks = pbin_count + archive_blk;
 
-    /* Sanity check: total_blocks should never exceed a reasonable limit.
-     * If it does, treat as corrupted state and force full rescan. */
+    /* Sanity check: total_blocks should never exceed a reasonable limit. */
     if (total_blocks > 1000000000UL) {
         log_warn("[restore] total_blocks=%lu exceeds sanity limit, forcing full rescan", total_blocks);
         total_blocks = 0;
@@ -773,42 +814,7 @@ int restore_progress(const Config *cfg, AppContext *ctx) {
     /* 2. Load archive (completed slices) into visited_set */
     iterate_archive(cfg, ctx, ctx->visited_set, NULL, NULL);
 
-    if (!has_idx) {
-        if (total_blocks > 1) {
-            verbose_printf(cfg, 1,
-                "无索引文件且历史块数 %lu (archive=%lu, pbin=%lu) 超过一个，"
-                "执行全量重扫...\n", total_blocks, archive_blk, pbin_count);
-            ctx->state.write_slice_index = 0;
-            ctx->state.line_count = 0;
-            ctx->state.process_slice_index = 0;
-            ctx->state.output_slice_num = 0;
-            ctx->state.output_line_count = 0;
-            /* Open first scattered slice for pumping */
-            char *first_slice = get_slice_filename(cfg->progress_base, 0);
-            ctx->hist_pump_fp = fopen(first_slice, "rb");
-            free(first_slice);
-            if (ctx->hist_pump_fp) {
-                ctx->hist_pump_state = HIST_PUMP_OLD;
-                ctx->hist_pump_slice_idx = 0;
-                ctx->hist_pump_line_no = 0;
-            }
-            return 0;
-        }
-        verbose_printf(cfg, 1, "无索引文件，历史块数 %lu，尝试恢复...\n", total_blocks);
-        ctx->state.write_slice_index = 0;
-        ctx->state.line_count = 0;
-        ctx->state.process_slice_index = 0;
-        ctx->state.output_slice_num = 0;
-        ctx->state.output_line_count = 0;
-        /* Single block: load scattered slices and done */
-        iterate_pbin_slices(cfg, &ctx->state, ctx->visited_set, NULL, NULL);
-        return 0;
-    }
-
-    verbose_printf(cfg, 1, "开始断点恢复 (slice=%lu, line=%lu)...\n",
-                   ctx->state.write_slice_index, ctx->state.line_count);
-
-    /* 3. Load scattered pbin slices with Footer-first recovery */
+    /* 3. Load scattered pbin slices with Footer-first recovery and salvage */
     int consecutive_missing = 0;
     for (unsigned long s_idx = 0; ; ++s_idx) {
         char *slice_path = get_slice_filename(cfg->progress_base, s_idx);
@@ -816,44 +822,42 @@ int restore_progress(const Config *cfg, AppContext *ctx) {
         if (!slice_fp) {
             free(slice_path);
             consecutive_missing++;
-            if (consecutive_missing > 50 && s_idx > ctx->state.write_slice_index) break;
+            if (consecutive_missing > 50) break;
             continue;
         }
         consecutive_missing = 0;
+
+        /* Check Footer, salvage if truncated */
+        PbinFooter footer;
+        bool footer_ok = read_pbin_footer(slice_path, &footer);
+        if (!footer_ok) {
+            uint64_t valid_rows;
+            if (pbin_salvage_truncated(slice_path, &valid_rows)) {
+                log_info("[restore] Salvaged pbin slice %lu, %lu valid rows", s_idx, valid_rows);
+                footer_ok = true;
+            } else {
+                log_warn("[restore] pbin slice %lu corrupted and unrecoverable, deleting", s_idx);
+                unlink(slice_path);
+                free(slice_path);
+                fclose(slice_fp);
+                continue;
+            }
+        }
+
         fseek(slice_fp, 0, SEEK_END);
         long fsize = ftell(slice_fp);
         fseek(slice_fp, 0, SEEK_SET);
         if (fsize > 0) {
             unsigned char *buf = safe_malloc(fsize);
             fread(buf, 1, fsize, slice_fp);
-
             long data_size = fsize;
-            uint64_t row_count = 0;
-            bool footer_ok = false;
             if (fsize >= (long)sizeof(PbinFooter)) {
                 PbinFooter *f = (PbinFooter *)(buf + fsize - sizeof(PbinFooter));
                 if (verify_pbin_footer(f)) {
                     data_size = fsize - (long)sizeof(PbinFooter);
-                    row_count = f->row_count;
-                    footer_ok = true;
-                    /* 钢印清晰则烧草稿: 删除残留按分片 idx */
-                    char *per_idx = get_per_slice_index_filename(cfg->progress_base, s_idx);
-                    unlink(per_idx);
-                    free(per_idx);
                 }
             }
-            if (!footer_ok) {
-                /* Fallback: 读取按分片 idx 或统一 idx */
-                row_count = get_slice_row_count(cfg, s_idx);
-            }
-
-            if (s_idx < ctx->state.write_slice_index) {
-                /* 已完成分片：解析 row_count 行 */
-                parse_pbin_buffer(buf, data_size, row_count, ctx->visited_set, NULL, NULL);
-            } else if (s_idx == ctx->state.write_slice_index) {
-                /* 活跃分片：只解析已处理的 line_count 行 */
-                parse_pbin_buffer(buf, data_size, ctx->state.line_count, ctx->visited_set, NULL, NULL);
-            }
+            parse_pbin_buffer(buf, data_size, 0, ctx->visited_set, NULL, NULL);
             free(buf);
         }
         fclose(slice_fp);
@@ -883,58 +887,42 @@ int restore_progress(const Config *cfg, AppContext *ctx) {
         promote_fpbin_to_pbin(ctx);
         free(fpbin_idx_path);
         verbose_printf(cfg, 1, "fpbin 转正恢复完成\n");
-        return 0;
-    }
-    /* 清理不匹配的残留 fpbin 文件 */
-    if (!has_fpbin_idx || !has_fpbin_slice) {
+        /* After promotion, load the newly promoted pbin slices into visited_set */
+        iterate_pbin_slices(cfg, &ctx->state, ctx->visited_set, NULL, NULL);
+    } else {
+        /* 清理不匹配的残留 fpbin 文件 */
         for (unsigned long i = 0; i < 1000; i++) {
             char *fp = get_fpbin_slice_filename(cfg->progress_base, i);
             unlink(fp);
             free(fp);
         }
         unlink(fpbin_idx_path);
+        free(fpbin_idx_path);
     }
-    free(fpbin_idx_path);
 
-    /* 5. Open current pbin slice for pumping (skip processed lines) */
-    char *cur_slice = get_slice_filename(cfg->progress_base, ctx->state.write_slice_index);
-    ctx->hist_pump_fp = fopen(cur_slice, "rb");
-    free(cur_slice);
+    /* 5. Load dpbin into completed_set (differential resume) */
+    ctx->completed_set = fp_set_create(cfg->estimated_files);
+    load_dpbin_to_completed_set(cfg, ctx->completed_set);
+
+    /* 6. Open new pbin slice for writing */
+    ctx->state.write_slice_index = find_max_pbin_index(cfg) + 1;
+    ctx->state.line_count = 0;
+    if (ctx->state.write_slice_file) {
+        fclose(ctx->state.write_slice_file);
+        ctx->state.write_slice_file = NULL;
+    }
+    char *new_slice = get_slice_filename(cfg->progress_base, ctx->state.write_slice_index);
+    ctx->state.write_slice_file = fopen(new_slice, "wb");
+    free(new_slice);
+
+    /* 7. Open first pbin slice for pumping (differential: skip completed in pump_pbin_batch) */
+    char *first_slice = get_slice_filename(cfg->progress_base, 0);
+    ctx->hist_pump_fp = fopen(first_slice, "rb");
+    free(first_slice);
     if (ctx->hist_pump_fp) {
-        /* Skip already-processed lines */
-        for (unsigned long i = 0; i < ctx->state.line_count; i++) {
-            char *path = NULL;
-            struct stat st;
-            unsigned char d_type;
-            if (!read_next_pbin_record(ctx->hist_pump_fp, &path, &st, &d_type)) break;
-            free(path);
-        }
-
-        /* 如果已到达文件末尾，说明该分片已完全处理，无需 pumping */
-        int c = fgetc(ctx->hist_pump_fp);
-        if (c == EOF) {
-            fclose(ctx->hist_pump_fp);
-            ctx->hist_pump_fp = NULL;
-            ctx->hist_pump_state = HIST_PUMP_DONE;
-        } else {
-            ungetc(c, ctx->hist_pump_fp);
-            ctx->hist_pump_state = HIST_PUMP_OLD;
-            ctx->hist_pump_slice_idx = ctx->state.write_slice_index;
-            ctx->hist_pump_line_no = ctx->state.line_count;
-        }
-    }
-
-    /* Fallback: if current slice is empty/missing, try pumping from slice 0
-     * to replay all scattered slices (needed after abnormal termination) */
-    if (ctx->hist_pump_state == HIST_PUMP_DONE) {
-        char *first_slice = get_slice_filename(cfg->progress_base, 0);
-        ctx->hist_pump_fp = fopen(first_slice, "rb");
-        free(first_slice);
-        if (ctx->hist_pump_fp) {
-            ctx->hist_pump_state = HIST_PUMP_OLD;
-            ctx->hist_pump_slice_idx = 0;
-            ctx->hist_pump_line_no = 0;
-        }
+        ctx->hist_pump_state = HIST_PUMP_OLD;
+        ctx->hist_pump_slice_idx = 0;
+        ctx->hist_pump_line_no = 0;
     }
 
     verbose_printf(cfg, 1, "进度加载完成\n");

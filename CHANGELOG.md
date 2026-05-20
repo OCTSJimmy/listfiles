@@ -4,6 +4,35 @@
 
 ---
 
+## [15.5.0] - 2026-05-20
+
+### Architecture: SEDA dispatch_queue + pbin/dpbin refactor + blind-trust directory exclusion
+
+**核心变更**：
+- **废除 idx 5 字段游标**：恢复为 pbin Footer 自描述 + dpbin 差集恢复模型。idx 文件不再被读取或写入。
+- **清理 deprecated idx 代码**：删除 `atomic_update_index`、`load_progress_index`、`get_index_filename`、`get_per_slice_index_filename` 及其所有调用；`cleanup_progress` 和 `finalize_archive` 不再操作 idx 文件；`record_path` 不再创建 per-slice idx 草稿。
+- **引入 dpbin（完成日志）**：目录在 `process_completed_batch` 成功派发后写入 dpbin。dpbin 只分片、不归档，正常扫描结束后删除。续传时 `pbin - dpbin = 差集`，只 pumping 未完成目录。
+- **引入 dispatch_queue（Stage 3→4 队列）**：`batch_processor` 只 push，`dispatch_from_queue` 只 consume。统一 `pending_tasks` 语义：仅在 `send_scan_to_ipc` 成功后 `++`。
+- **pbin salvage**：散落分片截断时，顺序解析保留有效行、重新封口，避免整片丢弃。
+- **盲信目录排除**：`try_blind_trust` 中 `DT_DIR` 直接返回 `false`，目录始终走 `lstat`，仅文件享受盲信跳过。
+
+**修改的文件**：
+- `include/core/config.h` — 版本号 15.5.0
+- `include/core/app_context.h` — `DispatchQueue` 替换 `LostTasksQueue`，新增 `completed_set`
+- `include/scan/dispatch_queue.h` / `src/scan/dispatch_queue.c` — 新增（替代 lost_tasks）
+- `src/scan/batch_processor.c` — Stage 3 只 push 到 dispatch_queue
+- `src/scan/dispatch.c` — `dispatch_from_queue` 消费 + dpbin_append
+- `src/scan/main_loop.c` — 调用 `dispatch_from_queue`
+- `src/scan/worker_scanner.c` — 目录盲信过滤
+- `src/output/progress_io.c` — dpbin 写入/删除 + pbin salvage
+- `src/output/progress_archive.c` — 差集恢复逻辑重写
+- `src/output/monitor.c` — 显示 dispatch_queue 计数
+- `src/output/progress.c` — `finalize_progress` 移除 idx 写入，正常结束时调用 `dpbin_delete_all`，`cleanup_progress` 清理 dpbin
+- `include/output/progress.h` / `src/output/progress.c` — 删除 idx 相关 helper 声明与定义
+- `src/core/main.c` — `dpbin_delete_all` 正常结束时调用
+
+---
+
 ## [15.4.5] - 2026-05-18
 
 ### Fixed：续传模式（--continue）丢失深层子目录（P0）
