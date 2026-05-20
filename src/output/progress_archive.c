@@ -771,16 +771,14 @@ void pump_pbin_batch(AppContext *ctx, int batch_size) {
  *
  * @note   恢复流程：
  *         1. 重置 fpbin 和 pump 状态
- *         2. 加载统一索引文件（idx）
- *         3. 统计归档块数和散落分片数
- *         4. 加载归档文件内容到 visited_set
- *         5. 若无索引且历史块数超过 1，执行全量重扫；否则加载散落分片
- *         6. 对有索引的情况，逐个加载散落 pbin 分片：
- *            - 已完成的旧分片（< write_slice_index）：完整解析
- *            - 活跃分片（== write_slice_index）：仅解析 line_count 行
- *            - Footer 有效时删除残留草稿 idx（"钢印清晰则烧草稿"）
- *         7. 处理残留 fpbin（上次转正中断）：重新执行 promote_fpbin_to_pbin
- *         8. 打开当前活跃分片，跳过已处理的 line_count 行，设置 pump 状态
+ *         2. 统计归档块数和散落分片数
+ *         3. 加载归档文件内容到 visited_set
+ *         4. 若无历史块且散落分片数为 0，执行全量重扫；否则加载散落分片
+ *         5. 对每个散落 pbin 分片：
+ *            - 读取 Footer 校验，通过则完整解析
+ *            - Footer 缺失或损坏时执行 salvage：顺序解析保留有效行，截断后重新封口
+ *         6. 处理残留 fpbin（上次转正中断）：重新执行 promote_fpbin_to_pbin
+ *         7. 打开当前活跃分片，设置 pump 状态（HIST_PUMP_OLD / HIST_PUMP_NEW）
  */
 int restore_progress(const Config *cfg, AppContext *ctx) {
     /* 1. Reset fpbin state (keep residual files for potential re-promotion) */

@@ -303,17 +303,6 @@ void record_skip(const Config *cfg, RuntimeState *state, const SpbinEntry *entry
  * 索引与游标
  * ================================================================ */
 
-/**
- * @brief  原子更新统一索引文件和按分片草稿索引
- * @param  cfg    const Config*   全局配置指针，不能为空
- * @param  state  RuntimeState*   运行时状态指针，不能为空
- * @return void
- *
- * @note   采用"写临时文件 + rename"的两阶段提交策略保证原子性：
- *         1. 统一索引（{base}.idx）：记录 write_slice_index、line_count、processed_count、output_slice_num、output_line_count
- *         2. 按分片草稿索引（{base}_00000N.idx）：记录当前活跃分片的 line_count
- *         临时文件命名包含线程 ID 以避免多线程冲突。
- */
 /* ================================================================
  * fpbin Cache (temporary buffer for new sub-dirs during pbin replay)
  * Uses flat array in memory + optional disk overflow file.
