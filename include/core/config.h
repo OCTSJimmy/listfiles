@@ -16,8 +16,8 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.5.0"
-#define VERSION_CODE 202605201550UL // v15.5.0: SEDA dispatch_queue + pbin/dpbin refactor + blind-trust directory exclusion
+#define VERSION "15.5.1"
+#define VERSION_CODE 202605201551UL // v15.5.1: P0/P1 audit fixes (dispatch_queue, pending_tasks, output resume, idx cleanup)
 #define MAX_PATH_LENGTH 4088 // v15.4.1: PIPE_BUF(4096) - sizeof(IpcMessageHeader)(8) = 4088, ensure atomic pipe writes
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
@@ -207,7 +207,7 @@ typedef struct {
     size_t uid_cache_count;
     GroupCacheEntry *gid_cache[GID_CACHE_SIZE];
     size_t gid_cache_count;
-    unsigned long write_slice_index, process_slice_index;
+    unsigned long write_slice_index;
     FILE *write_slice_file, *output_fp, *dir_info_fp;
     unsigned long output_line_count, output_slice_num;
     time_t start_time;

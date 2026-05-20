@@ -1,20 +1,17 @@
 /**
- * @file progress.c
- * @brief 进度文件（pbin/spbin/fpbin）的写入、归档、恢复与生命周期管理
+ * @file progress_archive.c
+ * @brief 归档、恢复与 fpbin 转正逻辑
  *
  * 核心设计哲学：
- * - 同构分片：pbin 与 fpbin 采用完全相同的物理格式
- * - 页脚自描述：已封口分片末尾自带 Footer（magic + row_count + crc），无需外部 idx 陪伴
- * - 两阶段提交：活跃分片使用轻量 .idx 作为临时草稿，封口时"先盖钢印、再烧草稿"
- * - 崩溃恢复：Footer 优先，idx 兜底
+ * - 同构分片：pbin、fpbin、dpbin 采用完全相同的物理格式
+ * - 页脚自描述：已封口分片末尾自带 Footer（magic + row_count + crc），无需外部索引
+ * - 崩溃恢复：Footer 优先，dpbin 提供差分集合用于续传
  *
  * 进度文件格式（以 --progress-file=task1 为例）：
- * - task1.idx          原子更新的统一游标索引
  * - task1_000000.pbin  已封口的已完成记录分片
- * - task1_00000N.idx   活跃分片的临时草稿索引
+ * - task1.dpbin_000000 本次会话的目录完成日志（临时，正常结束后删除）
  * - task1.spbin        跳过记录（熔断设备上的目录）
  * - task1.fpbin_000XXX 恢复期间隔离新发现子目录的临时分片
- * - task1.fpbin.idx    fpbin 分片的游标索引
  * - task1.archive      zlib 压缩的历史分片归档
  * - task1.config       会话配置快照
  */

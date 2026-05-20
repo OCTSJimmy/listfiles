@@ -1,20 +1,17 @@
 /**
- * @file progress.c
- * @brief 进度文件（pbin/spbin/fpbin）的写入、归档、恢复与生命周期管理
+ * @file progress_io.c
+ * @brief pbin 分片 I/O、dpbin 完成日志与 fpbin 临时缓存
  *
  * 核心设计哲学：
- * - 同构分片：pbin 与 fpbin 采用完全相同的物理格式
- * - 页脚自描述：已封口分片末尾自带 Footer（magic + row_count + crc），无需外部 idx 陪伴
- * - 两阶段提交：活跃分片使用轻量 .idx 作为临时草稿，封口时"先盖钢印、再烧草稿"
- * - 崩溃恢复：Footer 优先，idx 兜底
+ * - 同构分片：pbin、fpbin、dpbin 采用完全相同的物理格式
+ * - 页脚自描述：已封口分片末尾自带 Footer（magic + row_count + crc），无需外部索引
+ * - 崩溃恢复：Footer 优先，dpbin 提供差分集合用于续传
  *
  * 进度文件格式（以 --progress-file=task1 为例）：
- * - task1.idx          原子更新的统一游标索引
  * - task1_000000.pbin  已封口的已完成记录分片
- * - task1_00000N.idx   活跃分片的临时草稿索引
+ * - task1.dpbin_000000 本次会话的目录完成日志（临时，正常结束后删除）
  * - task1.spbin        跳过记录（熔断设备上的目录）
  * - task1.fpbin_000XXX 恢复期间隔离新发现子目录的临时分片
- * - task1.fpbin.idx    fpbin 分片的游标索引
  * - task1.archive      zlib 压缩的历史分片归档
  * - task1.config       会话配置快照
  */
@@ -121,15 +118,6 @@ bool verify_pbin_footer(const PbinFooter *f) {
     return f->footer_crc32 == expected;
 }
 
-/**
- * @brief  获取指定 pbin 分片的行数（Footer 优先，idx 兜底）
- * @param  cfg    const Config*   全局配置指针，不能为空
- * @param  index  unsigned long   分片编号，取值范围: >= 0
- * @return unsigned long  分片行数；无法确定时返回 0
- *
- * @note   先尝试读取分片末尾 Footer，校验通过则返回 footer.row_count。
- *         若 Footer 校验失败，则尝试读取按分片草稿 idx 文件中的行数。
- */
 /* ================================================================
  * pbin / spbin 写入
  * ================================================================ */
@@ -167,12 +155,11 @@ void write_pbin_record(FILE *fp, const char *path, const struct stat *info) {
  * @param  info  const struct stat*  文件 stat 信息指针，允许为 NULL
  * @return void
  *
- * @note   若当前无活跃分片，自动创建新的 pbin 文件和对应的 .idx 草稿。
+ * @note   若当前无活跃分片，自动创建新的 pbin 文件。
  *         当 line_count 达到 progress_slice_lines（默认 100000）时执行分片轮转：
  *         1. 写入 Footer 封口当前分片
- *         2. 删除草稿 idx（"烧草稿"）
- *         3. 调用 process_old_slice 处理旧分片（归档或删除）
- *         4. 创建新分片并更新统一索引
+ *         2. 调用 process_old_slice 处理旧分片（归档或删除）
+ *         3. 创建新分片继续写入
  */
 void record_path(const Config *cfg, RuntimeState *state, const char *path, const struct stat *info) {
     if (cfg->clean) return;  /* --clean 模式不保留任何进度文件 */

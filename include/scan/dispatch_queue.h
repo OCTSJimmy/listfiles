@@ -28,6 +28,7 @@ typedef struct {
     DispatchTask    *tasks;
     size_t           count;
     size_t           capacity;
+    size_t           head;          /* v15.5.1: ring buffer head index for O(1) pop */
     pthread_mutex_t  mutex;
 } DispatchQueue;
 

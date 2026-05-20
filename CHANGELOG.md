@@ -4,6 +4,35 @@
 
 ---
 
+## [15.5.1] - 2026-05-20
+
+### Fixed：v15.5.0 审计修复（P0/P1/P2）
+
+**P0 — Critical：**
+- **终止条件未检查 dispatch_queue 非空**：`main_loop.c` 终止条件追加 `dispatch_queue_count() == 0`，防止 dispatch_queue 中有待派发任务时程序过早终止导致目录丢失。
+- **cleanup_dead_worker_slot 导致 pending_tasks 双重计数**：redispatch 入队时不再 `++pending_tasks`，由 `dispatch_from_queue` 中 `send_scan_to_ipc` 成功路径统一计数，消除 Worker 死亡-替换循环中的计数漂移。
+
+**P1 — High：**
+- **dispatch_queue push 失败泄漏内存**：`MSG_DROP` requeue 失败时释放 `strdup` 的 path；`push_backlog` realloc 失败时释放所有未转移的 `backlog_paths[i]`。
+- **dispatch_queue pop O(n) memmove → O(1) 环形缓冲**：引入 `head` 索引实现环形缓冲区，pop 时不再 memmove 整个数组，积压数万级任务时主循环不再卡顿。
+- **输出恢复逻辑（--continue）**：`output_format.c` 新增 `scan_existing_output_slices` 和 `count_file_lines`，resume 时自动扫描 output_split_dir 找到最大分片号、恢复行数；单文件模式同样恢复行数，避免覆盖或重复输出。
+
+**P2 — Medium：**
+- **清理 idx 遗留代码与注释**：删除 `RuntimeState` 中死字段 `process_slice_index`；更新 `progress_archive.c`、`progress_io.c` 头部注释为 dpbin 模型；移除孤儿注释 `get_pbin_slice_line_count`。
+- **统一日志调试常量为 202605201600UL**：`cleanup_dead_worker_slot` 中使用 `202605150000` 的日志被版本过滤遮蔽，已统一。
+
+**修改的文件**：
+- `include/core/config.h` — 版本号 15.5.1，VERSION_CODE 202605201551UL
+- `include/core/config.h` — 删除 `process_slice_index`
+- `src/scan/main_loop.c` — 终止条件 + MSG_DROP 泄漏修复
+- `src/scan/dispatch.c` — cleanup redispatch 计数修复 + 日志常量统一
+- `src/scan/dispatch_queue.c` / `include/scan/dispatch_queue.h` — 环形缓冲重构
+- `src/output/output_format.c` — 输出恢复逻辑 + dirent.h
+- `src/output/progress_archive.c` — 头部注释更新
+- `src/output/progress_io.c` — 头部注释 + record_path 注释清理
+
+---
+
 ## [15.5.0] - 2026-05-20
 
 ### Architecture: SEDA dispatch_queue + pbin/dpbin refactor + blind-trust directory exclusion

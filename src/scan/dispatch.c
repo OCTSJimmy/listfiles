@@ -172,7 +172,7 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
     if (slot->fd_cmd_rd >= 0) {
         orphaned = ipc_drain_and_count_tasks(slot->fd_cmd_rd);
         if (orphaned > 0) {
-            log_debug_v(202605150000, "[Cleanup] Worker %d drained %d orphaned tasks from fd_cmd_rd", worker_id, orphaned);
+            log_debug_v(202605201600UL, "[Cleanup] Worker %d drained %d orphaned tasks from fd_cmd_rd", worker_id, orphaned);
         }
         close(slot->fd_cmd_rd);
         slot->fd_cmd_rd = -1;
@@ -202,7 +202,7 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
 
     if (redispatch_current && slot->current_path[0] != '\0') {
         if (dispatch_queue_push(&ctx->dispatch_queue, strdup(slot->current_path), NULL)) {
-            atomic_fetch_add(&ctx->pending_tasks, 1);
+            /* v15.5.1: pending_tasks++ deferred to dispatch_from_queue send_scan_to_ipc success path */
         }
     }
 

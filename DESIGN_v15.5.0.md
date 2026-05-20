@@ -1,6 +1,6 @@
-# listfiles v15.5.0 设计总结
+# listfiles v15.5.1 设计总结
 
-> 基于 SEDA 架构缺陷修复、进度系统简化、盲信机制明确的重构设计。
+> 基于 v15.5.0 SEDA 架构的审计修复：终止条件、pending_tasks 计数、dispatch_queue 性能、输出恢复、idx 清理。
 
 ---
 
@@ -60,8 +60,8 @@
 ```
 
 ### 输出恢复
-- `output_split_dir`：扫描目录取 `max(output_*.txt) + 1`，新建分片
-- 单文件输出：直接 `append`，无需恢复行数
+- `output_split_dir`：扫描目录找到最大分片号 `max(output_*.txt)`，恢复 `output_slice_num`；读取该分片行数恢复 `output_line_count`
+- 单文件输出：读取现有文件行数恢复 `output_line_count`，避免轮转过早触发或行数溢出
 
 ---
 
@@ -93,8 +93,8 @@
 
 | 字段 | 值 |
 |------|-----|
-| 版本号 | v15.5.0 |
-| VERSION_CODE | 202605201550UL |
+| 版本号 | v15.5.1 |
+| VERSION_CODE | 202605201551UL |
 | 调试日志常量 | 202605201600UL |
 
 ---
@@ -128,3 +128,18 @@
 - `src/scan/main_loop.c` — 差集 pumping、dpbin 删除
 - `src/scan/worker_scanner.c` — 目录盲信过滤
 - `CHANGELOG.md` / `Design.md` — 文档同步
+
+## 6. v15.5.1 审计修复
+
+### P0 — Critical
+1. **终止条件追加 dispatch_queue 检查**：`main_loop.c` 终止条件追加 `dispatch_queue_count() == 0`，防止 dispatch_queue 非空时程序过早终止导致任务丢失。
+2. **cleanup_dead_worker_slot pending_tasks 双重计数**：redispatch 入队时不预 +1，由 `dispatch_from_queue` 统一计数，消除 Worker 替换循环中的计数漂移。
+
+### P1 — High
+3. **dispatch_queue push 失败泄漏内存**：`MSG_DROP` requeue 失败释放 path；`push_backlog` realloc 失败释放 backlog_paths。
+4. **dispatch_queue O(n) pop → O(1) 环形缓冲**：引入 `head` 索引实现环形缓冲，pop 时不再 memmove 整个数组。
+5. **输出恢复逻辑**：`init_output_files` 在 `--continue` 时扫描 output_split_dir 恢复 `output_slice_num` 和 `output_line_count`；单文件模式恢复行数。
+
+### P2 — Medium
+6. **清理 idx 遗留代码**：删除 `RuntimeState.process_slice_index` 死字段；更新 `progress_archive.c`、`progress_io.c` 头部注释。
+7. **统一日志调试常量为 202605201600UL**：`cleanup_dead_worker_slot` 中使用 `202605150000` 的日志已统一。

@@ -95,8 +95,10 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
         case MSG_DROP: {
             if (msg->data_len >= sizeof(DropPayload)) {
                 DropPayload *drop = (DropPayload*)msg->data;
-                if (!dispatch_queue_push(&ctx->dispatch_queue, strdup(drop->path), NULL)) {
+                char *dup = strdup(drop->path);
+                if (!dispatch_queue_push(&ctx->dispatch_queue, dup, NULL)) {
                     log_warn("[Bus] MSG_DROP requeue failed: %s", path_log_mask(drop->path));
+                    free(dup);
                 }
             }
             break;
@@ -354,7 +356,8 @@ void main_loop_run(AppContext *ctx) {
 
         /* 8. Termination check */
         if (atomic_load(&ctx->pending_tasks) == 0 && !ctx->resume_active
-            && atomic_load(&ctx->pending_batches) == 0) {
+            && atomic_load(&ctx->pending_batches) == 0
+            && dispatch_queue_count(&ctx->dispatch_queue) == 0) {
             worker_pool_stop_all(ctx->worker_pool);
             stop_all_ipc_threads(ctx);
             ctx->running = false;

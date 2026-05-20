@@ -19,7 +19,48 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include "log.h"
+
+/**
+ * @brief  扫描分片目录，找到最大的已有分片编号
+ * @param  output_split_dir  const char*  分片输出目录
+ * @return unsigned long  最大分片编号；无分片时返回 0
+ */
+static unsigned long scan_existing_output_slices(const char *output_split_dir) {
+    DIR *d = opendir(output_split_dir);
+    if (!d) return 0;
+
+    unsigned long max_num = 0;
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        if (entry->d_type != DT_REG && entry->d_type != DT_UNKNOWN) continue;
+        unsigned long num;
+        if (sscanf(entry->d_name, "%lu.txt", &num) == 1) {
+            if (num > max_num) max_num = num;
+        }
+    }
+    closedir(d);
+    return max_num;
+}
+
+/**
+ * @brief  统计文本文件的行数（用于恢复 output_line_count）
+ * @param  path  const char*  文件路径
+ * @return unsigned long  文件行数
+ */
+static unsigned long count_file_lines(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+
+    unsigned long lines = 0;
+    char buf[8192];
+    while (fgets(buf, sizeof(buf), fp) != NULL) {
+        lines++;
+    }
+    fclose(fp);
+    return lines;
+}
 
 void cleanup_compiled_format(Config *cfg) {
     if (!cfg->compiled_format) return;
@@ -186,9 +227,31 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
     // 1. 初始化计数器和状态
     if (!cfg->continue_mode) {
         state->output_line_count = 0;
-    }
-    if (state->output_slice_num == 0) {
-        state->output_slice_num = 1;  /* 仅当未从索引恢复时才重置 */
+        state->output_slice_num = 1;
+    } else {
+        /* v15.5.1: recover output state from existing files (idx abolished) */
+        if (cfg->is_output_split_dir && cfg->output_split_dir) {
+            unsigned long max_slice = scan_existing_output_slices(cfg->output_split_dir);
+            if (max_slice > 0) {
+                state->output_slice_num = max_slice;
+                char slice_path[1024];
+                snprintf(slice_path, sizeof(slice_path), "%s/" OUTPUT_SLICE_FORMAT,
+                         cfg->output_split_dir, state->output_slice_num);
+                state->output_line_count = count_file_lines(slice_path);
+                verbose_printf(cfg, 1, "恢复输出分片: slice=%lu, lines=%lu\n",
+                               state->output_slice_num, state->output_line_count);
+            } else {
+                state->output_slice_num = 1;
+                state->output_line_count = 0;
+            }
+        } else if (cfg->is_output_file && cfg->output_file) {
+            state->output_slice_num = 1;
+            state->output_line_count = count_file_lines(cfg->output_file);
+            verbose_printf(cfg, 1, "恢复输出行数: %lu\n", state->output_line_count);
+        } else {
+            state->output_slice_num = 1;
+            state->output_line_count = 0;
+        }
     }
     state->start_time = time(NULL);
     state->completed_count = 0;
