@@ -17,6 +17,7 @@
 #include "utils.h"
 #include "worker_proc.h"
 #include "main_loop.h"
+#include "lost_tasks.h"
 #include "log.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -159,6 +160,7 @@ void print_progress(Monitor *mon) {
     fprintf(fp, "  Active: %d / %d\n", alive_workers, total_workers);
     fprintf(fp, "  Pending tasks: %ld\n", pending);
     fprintf(fp, "  Pending batches: %ld\n", pending_batches);
+    fprintf(fp, "  Lost tasks: %zu\n", lost_tasks_count(&ctx->lost_tasks));
 
     /* v15.1.1: 显示每个 Worker 的独立状态 */
     if (ctx->worker_pool) {
