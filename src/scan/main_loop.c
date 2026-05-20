@@ -37,7 +37,7 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
     log_debug("[Bus] received type=%u slot=%d len=%zu", msg->type, msg->slot_id, msg->data_len);
     switch (msg->type) {
         case RET_BATCH: {
-            log_debug_v(202605150000, "[Bus] Worker %d BATCH (len=%zu)", msg->slot_id, msg->data_len);
+            log_debug_v(202605150000UL, "[Bus] Worker %d BATCH (len=%zu)", msg->slot_id, msg->data_len);
             main_loop_handle_batch(ctx, msg->slot_id, msg->data, msg->data_len);
             break;
         }
@@ -66,7 +66,7 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             break;
         }
         case RET_FINISH: {
-            log_info_v(202605150000, "[Bus] Worker %d FINISH (pending_tasks=%ld)", msg->slot_id, atomic_load(&ctx->pending_tasks));
+            log_info_v(202605150000UL, "[Bus] Worker %d FINISH (pending_tasks=%ld)", msg->slot_id, atomic_load(&ctx->pending_tasks));
             atomic_fetch_sub(&ctx->pending_tasks, 1);
             atomic_store(&ctx->worker_pool->slots[msg->slot_id].state, WORKER_STATE_IDLE); /* v15.1.0 */
             /* Task completed, Worker is now IDLE */
@@ -357,7 +357,8 @@ void main_loop_run(AppContext *ctx) {
         /* 8. Termination check */
         if (atomic_load(&ctx->pending_tasks) == 0 && !ctx->resume_active
             && atomic_load(&ctx->pending_batches) == 0
-            && dispatch_queue_count(&ctx->dispatch_queue) == 0) {
+            && dispatch_queue_count(&ctx->dispatch_queue) == 0
+            && ctx->hist_pump_state == HIST_PUMP_DONE) {
             worker_pool_stop_all(ctx->worker_pool);
             stop_all_ipc_threads(ctx);
             ctx->running = false;
