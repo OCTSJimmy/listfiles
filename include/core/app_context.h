@@ -111,6 +111,12 @@ typedef struct AppContext {
     unsigned long   dpbin_write_slice_index;/* 当前 dpbin 分片号 */
     unsigned long   dpbin_line_count;       /* 当前 dpbin 分片行数 */
 
+    /* === v15.5.1: pbin sliding window loader for dispatch_queue backpressure === */
+    struct {
+        unsigned long slice;        /* 当前加载到哪个 pbin 切片 */
+        long          byte_offset;  /* 该切片中的字节偏移（fseek 直接定位） */
+    } pbin_queue_cursor;
+
 } AppContext;
 
 #endif

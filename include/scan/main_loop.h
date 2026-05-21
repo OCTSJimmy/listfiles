@@ -25,6 +25,9 @@ int dispatch_find_idle_worker(AppContext *ctx);
 /* Dispatch lost tasks to available workers */
 void dispatch_from_queue(AppContext *ctx);
 
+/* v15.5.1: pbin sliding window loader — backfill dispatch_queue from pbin */
+int load_dirs_from_pbin(AppContext *ctx, int target);
+
 /* Drain completed batches from thread pool */
 void drain_completed_batches(AppContext *ctx);
 

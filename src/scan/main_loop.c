@@ -354,6 +354,14 @@ void main_loop_run(AppContext *ctx) {
         /* 7. Dispatch from queue */
         dispatch_from_queue(ctx);
 
+        /* 7.5 v15.5.1: pbin sliding window loader — backfill dispatch_queue from pbin
+         * when queue drops below LOW_WATER. This allows batch_processor to stop
+         * pushing at HIGH_WATER without losing directories (they stay in pbin). */
+        if (dispatch_queue_count(&ctx->dispatch_queue) <= DISPATCH_QUEUE_LOW_WATER
+            && ctx->pbin_queue_cursor.slice <= ctx->state.write_slice_index) {
+            load_dirs_from_pbin(ctx, DISPATCH_QUEUE_LOAD_BATCH);
+        }
+
         /* 8. Termination check */
         if (atomic_load(&ctx->pending_tasks) == 0 && !ctx->resume_active
             && atomic_load(&ctx->pending_batches) == 0

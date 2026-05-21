@@ -1,6 +1,6 @@
-# listfiles v15.5.1 设计总结
+# listfiles v15.5.2 设计总结
 
-> 基于 v15.5.0 SEDA 架构的审计修复：终止条件、pending_tasks 计数、dispatch_queue 性能、输出恢复、idx 清理。
+> 基于 v15.5.0 SEDA 架构的审计修复与 v15.5.2 pbin 滑动窗口背压：终止条件、pending_tasks 计数、dispatch_queue 性能、输出恢复、idx 清理、内存有界化。
 
 ---
 
@@ -93,8 +93,8 @@
 
 | 字段 | 值 |
 |------|-----|
-| 版本号 | v15.5.1 |
-| VERSION_CODE | 202605201551UL |
+| 版本号 | v15.5.2 |
+| VERSION_CODE | 202605201552UL |
 | 调试日志常量 | 202605201600UL |
 
 ---
@@ -143,3 +143,25 @@
 ### P2 — Medium
 6. **清理 idx 遗留代码**：删除 `RuntimeState.process_slice_index` 死字段；更新 `progress_archive.c`、`progress_io.c` 头部注释。
 7. **统一日志调试常量为 202605201600UL**：`cleanup_dead_worker_slot` 中使用 `202605150000` 的日志已统一。
+
+## 7. v15.5.2 pbin 滑动窗口背压
+
+### 设计目标
+解决 dispatch_queue 无界增长导致的内存不可控问题，同时**保证一次运行完成**，不依赖用户手动 `--continue`。
+
+### 核心认知
+- `dispatch_queue` 与 `pbin` 存在内容冗余：所有进入 queue 的目录都已被 `record_path` 写入 pbin
+- `pbin` 是真相来源，`dispatch_queue` 只是运行时的消费窗口
+- 因此 queue 中的任务可以被安全丢弃（跳过 push），下次从 pbin 加载即可
+
+### 滑动窗口机制
+- **HIGH_WATER** = 100,000：queue 满，batch_processor 停止 `dispatch_queue_push`
+- **LOW_WATER** = 30,000：queue 降到此值，`main_loop` 触发 `load_dirs_from_pbin`
+- **LOAD_BATCH** = 50,000：每次从 pbin cursor 顺序读取目录回填 queue
+- pbin 消费游标：`{ slice, byte_offset }`，跨切片持久化
+
+### 活跃切片处理
+默认配置下（pbin 切片 10 万行），queue 满时 pbin 已写入约 10+ 个切片，`freeze_point` 所在切片大概率已封口。若真的需要读取活跃切片，直接 `fflush` + 独立 `fopen("rb")` 读取到 EOF 即可（低概率事件，性能代价可接受）。
+
+### `--progress-slice-lines` 参数
+允许用户自定义 pbin 切片大小。扩大切片（30 万乃至 100 万行）可减少切片切换频率，降低滑动窗口的脉冲读开销。

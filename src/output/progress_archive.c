@@ -649,7 +649,7 @@ static void on_pbin_slice_consumed(AppContext *ctx) {
  * @note   对 path_len 做防御性校验（> MAX_PATH_LENGTH 则视为损坏数据）。
  *         根据 d_type 填充 stat::st_mode 中的文件类型位。
  */
-static bool read_next_pbin_record(FILE *fp, char **out_path, struct stat *out_st, unsigned char *out_d_type) {
+bool read_next_pbin_record(FILE *fp, char **out_path, struct stat *out_st, unsigned char *out_d_type) {
     size_t path_len;
     if (fread(&path_len, sizeof(size_t), 1, fp) != 1) return false;
 
@@ -738,7 +738,10 @@ void pump_pbin_batch(AppContext *ctx, int batch_size) {
             if (!scan) {
                 log_warn("[Pump] malloc failed for CMD_SCAN, dropping %s", path);
                 atomic_fetch_sub(&ctx->pending_tasks, 1);
-                dispatch_queue_push(&ctx->dispatch_queue, strdup(path), &st);
+                char *dup = strdup(path);
+                if (!dispatch_queue_push(&ctx->dispatch_queue, dup, &st)) {
+                    free(dup);
+                }
             } else {
                 scan->path_len = plen;
                 scan->dev = st.st_dev;
@@ -753,7 +756,10 @@ void pump_pbin_batch(AppContext *ctx, int batch_size) {
                     free(scan);
                     log_warn("[Pump] cmd_queue full, dropping %s", path);
                     atomic_fetch_sub(&ctx->pending_tasks, 1);
-                    dispatch_queue_push(&ctx->dispatch_queue, strdup(path), &st);
+                    char *dup = strdup(path);
+                    if (!dispatch_queue_push(&ctx->dispatch_queue, dup, &st)) {
+                        free(dup);
+                    }
                 }
             }
             sent++;

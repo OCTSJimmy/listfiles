@@ -35,6 +35,8 @@ static unsigned long scan_existing_output_slices(const char *output_split_dir) {
     struct dirent *entry;
     while ((entry = readdir(d)) != NULL) {
         if (entry->d_type != DT_REG && entry->d_type != DT_UNKNOWN) continue;
+        size_t len = strlen(entry->d_name);
+        if (len <= 4 || strcmp(entry->d_name + len - 4, ".txt") != 0) continue;
         unsigned long num;
         if (sscanf(entry->d_name, "%lu.txt", &num) == 1) {
             if (num > max_num) max_num = num;

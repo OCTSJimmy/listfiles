@@ -179,7 +179,16 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                  * to recover sub-directories lost in the previous interrupted run. */
             }
             /* v15.5.0: Stage 3 only pushes to dispatch_queue; Stage 4 consumes */
-            dispatch_queue_push(&ctx->dispatch_queue, strdup(path), st);
+            /* v15.5.1: pbin sliding window — stop pushing when queue reaches HIGH_WATER */
+            if (dispatch_queue_count(&ctx->dispatch_queue) < DISPATCH_QUEUE_HIGH_WATER) {
+                char *dup = strdup(path);
+                if (!dispatch_queue_push(&ctx->dispatch_queue, dup, st)) {
+                    free(dup);
+                }
+            }
+            /* If queue is at HIGH_WATER, skip push. Directory is already in pbin via
+             * record_path_batch_append above, and will be loaded by load_dirs_from_pbin
+             * when queue drops to LOW_WATER. */
 
             ctx->state.dir_count++;
             if (ctx->cfg.include_dir) {

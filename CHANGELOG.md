@@ -4,6 +4,28 @@
 
 ---
 
+## [15.5.2] - 2026-05-20
+
+### Architecture: pbin sliding window backpressure + dispatch_queue leak fixes
+
+**核心变更**：
+- **pbin 滑动窗口背压**：dispatch_queue 内存 hard cap（10 万条）。batch_processor 在 queue 满时停止 push，目录仍通过 `record_path` 写入 pbin。当 queue 降到 3 万条时，`main_loop` 触发 `load_dirs_from_pbin` 从 pbin cursor 顺序加载 5 万条目录回填 queue。保证一次运行完成，不依赖 continue。
+- **dispatch_queue_push 失败后 strdup 泄漏修复**：统一 8 处调用点（batch_processor、dispatch.c、progress.c、progress_archive.c），push 失败时释放 path。
+- **scan_existing_output_slices 边缘匹配修复**：增加 `.txt` 后缀严格校验，防止 `123.txt.bak` 被误识别为输出分片。
+- **`--progress-slice-lines` 参数**：新增命令行参数，允许用户自定义 pbin 分片大小（默认 10 万），支持扩大切片以减少滑动窗口的脉冲读频率。
+
+**修改的文件**：
+- `include/core/config.h` — 版本号 15.5.2，VERSION_CODE 202605201552UL，新增 DISPATCH_QUEUE 水位常量
+- `include/core/app_context.h` — 新增 `pbin_queue_cursor`
+- `src/scan/batch_processor.c` — HIGH_WATER 背压守卫
+- `src/scan/dispatch.c` — 新增 `load_dirs_from_pbin`
+- `src/scan/main_loop.c` — 加载触发器
+- `src/core/cmdline.c` — 新增 `--progress-slice-lines` 参数与 help
+- `src/scan/batch_processor.c` / `src/scan/dispatch.c` / `src/output/progress.c` / `src/output/progress_archive.c` / `src/output/output_format.c` — 泄漏修复与边缘匹配修复
+- `include/output/progress.h` / `src/output/progress_archive.c` — `read_next_pbin_record` 跨文件可见
+
+---
+
 ## [15.5.1] - 2026-05-20
 
 ### Fixed：v15.5.0 审计修复（P0/P1/P2）

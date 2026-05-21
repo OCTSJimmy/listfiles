@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <dirent.h>
 
 /* ================================================================
  * IPC helper: send CMD_SCAN to IPC thread
@@ -131,7 +132,9 @@ void dispatch_from_queue(AppContext *ctx) {
         int wid = dispatch_find_idle_worker(ctx);
         if (wid < 0) {
             log_warn("[DispatchQueue] no IDLE worker available, requeue %s", path_log_mask(task.path));
-            dispatch_queue_push(&ctx->dispatch_queue, task.path, &task.st);
+            if (!dispatch_queue_push(&ctx->dispatch_queue, task.path, &task.st)) {
+                free(task.path);
+            }
             break; /* 停止继续尝试，等下一轮 */
         }
         WorkerSlot *slot = &ctx->worker_pool->slots[wid];
@@ -139,7 +142,9 @@ void dispatch_from_queue(AppContext *ctx) {
 
         if (!send_scan_to_ipc(ctx, wid, task.path, task.st.st_dev)) {
             atomic_store(&slot->state, WORKER_STATE_IDLE);
-            dispatch_queue_push(&ctx->dispatch_queue, task.path, &task.st);
+            if (!dispatch_queue_push(&ctx->dispatch_queue, task.path, &task.st)) {
+                free(task.path);
+            }
             continue;
         }
         /* v15.5.0: pending_tasks++ and dpbin_append only on successful dispatch */
@@ -201,8 +206,9 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
     atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
 
     if (redispatch_current && slot->current_path[0] != '\0') {
-        if (dispatch_queue_push(&ctx->dispatch_queue, strdup(slot->current_path), NULL)) {
-            /* v15.5.1: pending_tasks++ deferred to dispatch_from_queue send_scan_to_ipc success path */
+        char *dup = strdup(slot->current_path);
+        if (!dispatch_queue_push(&ctx->dispatch_queue, dup, NULL)) {
+            free(dup);
         }
     }
 
@@ -212,4 +218,85 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
     }
     atomic_store(&slot->state, WORKER_STATE_DEAD);  /* v15.1.0 */
     slot->pid = -1;
+}
+
+/* ================================================================
+ * v15.5.1: pbin sliding window loader for dispatch_queue backpressure
+ * ================================================================ */
+
+/**
+ * @brief  从 pbin 切片加载目录到 dispatch_queue（滑动窗口回填）
+ * @param  ctx    AppContext*  应用上下文指针
+ * @param  target int          目标加载的目录数量
+ * @return int    实际加载的目录数量
+ *
+ * @note   当 dispatch_queue 降到 LOW_WATER 时由 main_loop 触发。
+ *         从 pbin_queue_cursor 开始顺序读取 pbin 记录，仅加载 DT_DIR 条目。
+ *         已封口的切片读完后自动切换到下一切片；活跃切片读到 EOF 停止。
+ *         加载的目录已在 pbin 中存在，不会与 batch_processor 的 push 重复。
+ */
+int load_dirs_from_pbin(AppContext *ctx, int target) {
+    if (!ctx || target <= 0) return 0;
+    const Config *cfg = &ctx->cfg;
+    RuntimeState *state = &ctx->state;
+
+    int loaded = 0;
+    while (loaded < target) {
+        /* 如果 cursor 超过了活跃切片，说明 pbin 中暂无可加载的新记录 */
+        if (ctx->pbin_queue_cursor.slice > state->write_slice_index) {
+            break;
+        }
+
+        char *slice_path = get_slice_filename(cfg->progress_base, ctx->pbin_queue_cursor.slice);
+        FILE *fp = fopen(slice_path, "rb");
+        free(slice_path);
+        if (!fp) break;
+
+        if (fseek(fp, ctx->pbin_queue_cursor.byte_offset, SEEK_SET) != 0) {
+            fclose(fp);
+            break;
+        }
+
+        while (loaded < target) {
+            char *path = NULL;
+            struct stat st;
+            unsigned char d_type;
+
+            if (!read_next_pbin_record(fp, &path, &st, &d_type)) {
+                /* EOF 或格式错误（可能是 Footer 或不完整记录） */
+                break;
+            }
+
+            ctx->pbin_queue_cursor.byte_offset = ftell(fp);
+
+            if (d_type == DT_DIR) {
+                if (!dispatch_queue_push(&ctx->dispatch_queue, path, &st)) {
+                    free(path);
+                    break; /* queue 又满了 */
+                }
+                loaded++;
+            } else {
+                free(path); /* 跳过文件 */
+            }
+        }
+
+        /* 判断当前切片是否已读完（封口切片 vs 活跃切片） */
+        if (ctx->pbin_queue_cursor.slice < state->write_slice_index) {
+            /* 已封口切片：如果 read_next_pbin_record 返回 false，说明到 Footer 或 EOF */
+            ctx->pbin_queue_cursor.slice++;
+            ctx->pbin_queue_cursor.byte_offset = 0;
+        } else {
+            /* 活跃切片：读到 EOF 就停，下次继续从 byte_offset 读 */
+            fclose(fp);
+            break;
+        }
+
+        fclose(fp);
+    }
+
+    if (loaded > 0) {
+        log_info("[PbinLoader] loaded %d dirs from pbin slice %lu offset %ld into dispatch_queue",
+                 loaded, ctx->pbin_queue_cursor.slice, ctx->pbin_queue_cursor.byte_offset);
+    }
+    return loaded;
 }

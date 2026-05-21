@@ -15,7 +15,7 @@ static void dispatch_queue_linearize(DispatchQueue *q) {
         return;
     }
     if (q->head + q->count <= q->capacity) {
-        /* Contiguous wrapped segment: [head, head+count) → [0, count) */
+        /* Contiguous non-wrapped segment: [head, head+count) → [0, count) */
         memmove(&q->tasks[0], &q->tasks[q->head], q->count * sizeof(DispatchTask));
     } else {
         /* Split into two segments: [head, cap) and [0, tail) */
@@ -23,7 +23,7 @@ static void dispatch_queue_linearize(DispatchQueue *q) {
         size_t second_len = q->count - first_len;
         DispatchTask *tmp = malloc(q->count * sizeof(DispatchTask));
         if (!tmp) {
-            /* Fallback: keep ring as-is, next push may still work if count < capacity */
+            /* linearize failed — caller must abort push */
             return;
         }
         memcpy(tmp, &q->tasks[q->head], first_len * sizeof(DispatchTask));
@@ -64,6 +64,10 @@ bool dispatch_queue_push(DispatchQueue *q, char *path, const struct stat *st) {
     if (q->count >= q->capacity) {
         if (q->head > 0 && q->count > 0) {
             dispatch_queue_linearize(q);
+            if (q->head != 0) {
+                pthread_mutex_unlock(&q->mutex);
+                return false;
+            }
         }
         size_t new_cap = q->capacity ? q->capacity * 2 : INITIAL_CAPACITY;
         DispatchTask *new_tasks = realloc(q->tasks, new_cap * sizeof(DispatchTask));
@@ -97,6 +101,14 @@ void dispatch_queue_push_backlog(DispatchQueue *q, char **backlog_paths, struct 
     if (needed > q->capacity) {
         if (q->head > 0 && q->count > 0) {
             dispatch_queue_linearize(q);
+            if (q->head != 0) {
+                for (int i = 0; i < backlog_count; i++) {
+                    free(backlog_paths[i]);
+                    backlog_paths[i] = NULL;
+                }
+                pthread_mutex_unlock(&q->mutex);
+                return;
+            }
         }
         size_t new_cap = q->capacity ? q->capacity * 2 : INITIAL_CAPACITY;
         while (new_cap < needed) new_cap *= 2;

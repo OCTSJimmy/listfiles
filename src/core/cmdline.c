@@ -65,6 +65,7 @@ void show_help() {
     printf("  -C, --clean            删除已处理的进度分片\n");
     printf("  -R, --resume-from=文件 仅从指定的进度列表文件恢复 (预留，暂未实现)\n");
     printf("  --max-slice=行数       每个输出切片的最大行数\n");
+    printf("      --progress-slice-lines=行数  每个进度分片(pbin)的最大行数 (默认: %d)\n", DEFAULT_PROGRESS_SLICE_LINES);
     printf("  -v, --verbose          启用详细日志\n");
     printf("  --verbose-version=TIMESTAMP  只显示版本号>=TIMESTAMP的日志 (默认: 当前版本)\n");
     printf("  -h, --help             显示此帮助信息\n");
@@ -162,6 +163,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"timeout", required_argument, 0, 't'},
         {"help", no_argument, 0, 'h'},
         {"verbose-version", required_argument, 0, 27},
+        {"progress-slice-lines", required_argument, 0, 28},
         {0, 0, 0, 0}
     };
 
@@ -255,6 +257,13 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
                 break;
             case 27:
                 cfg->verbose_version = strtoul(optarg, NULL, 10);
+                break;
+            case 28:
+                cfg->progress_slice_lines = atol(optarg);
+                if (cfg->progress_slice_lines <= 0) {
+                    log_error("progress slice 大小必须大于零");
+                    exit(EXIT_FAILURE);
+                }
                 break;
             case 'h': show_help(); return 2;
             default:

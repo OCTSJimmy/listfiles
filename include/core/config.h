@@ -16,8 +16,8 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.5.1"
-#define VERSION_CODE 202605201551UL // v15.5.1: P0/P1 audit fixes (dispatch_queue, pending_tasks, output resume, idx cleanup)
+#define VERSION "15.5.2"
+#define VERSION_CODE 202605201552UL // v15.5.2: pbin sliding window backpressure + dispatch_queue leak fixes + --progress-slice-lines
 #define MAX_PATH_LENGTH 4088 // v15.4.1: PIPE_BUF(4096) - sizeof(IpcMessageHeader)(8) = 4088, ensure atomic pipe writes
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
@@ -28,6 +28,11 @@ struct DeviceManager;
 #define DEFAULT_OUTPUT_SPLIT_DIR "output_split/"
 #define DEFAULT_PROGRESS_SLICE_LINES 100000
 #define DEFAULT_OUTPUT_SLICE_LINES 100000
+
+/* v15.5.1: dispatch_queue pbin sliding window backpressure */
+#define DISPATCH_QUEUE_HIGH_WATER    100000  /* queue 满，batch_processor 停止 push */
+#define DISPATCH_QUEUE_LOW_WATER      30000  /* queue 降到此值，触发 pbin 加载 */
+#define DISPATCH_QUEUE_LOAD_BATCH     50000  /* 每次从 pbin 加载的目录数量 */
 #define PROGRESS_SLICE_FORMAT "%06lu"
 #define OUTPUT_SLICE_FORMAT "%06lu.txt"
 #define VERBOSE_TYPE_FULL 0

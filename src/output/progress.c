@@ -310,7 +310,10 @@ void spbin_requeue_recovered(AppContext *ctx, dev_t dev) {
             if (!scan) {
                 log_warn("[SPBIN] malloc failed for CMD_SCAN, dropping %s", ctx->spbin_entries[i].path);
                 atomic_fetch_sub(&ctx->pending_tasks, 1);
-                dispatch_queue_push(&ctx->dispatch_queue, strdup(ctx->spbin_entries[i].path), NULL);
+                char *dup = strdup(ctx->spbin_entries[i].path);
+                if (!dispatch_queue_push(&ctx->dispatch_queue, dup, NULL)) {
+                    free(dup);
+                }
             } else {
                 scan->path_len = plen;
                 scan->dev = ctx->spbin_entries[i].dev;
@@ -325,7 +328,10 @@ void spbin_requeue_recovered(AppContext *ctx, dev_t dev) {
                     free(scan);
                     log_warn("[SPBIN] cmd_queue full, dropping %s", ctx->spbin_entries[i].path);
                     atomic_fetch_sub(&ctx->pending_tasks, 1);
-                    dispatch_queue_push(&ctx->dispatch_queue, strdup(ctx->spbin_entries[i].path), NULL);
+                    char *dup = strdup(ctx->spbin_entries[i].path);
+                    if (!dispatch_queue_push(&ctx->dispatch_queue, dup, NULL)) {
+                        free(dup);
+                    }
                 }
             }
         }

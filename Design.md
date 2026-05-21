@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.5.0**（SEDA dispatch_queue + pbin/dpbin 差集恢复 + blind-trust 目录排除 + idx 废除）
+当前设计版本：**v15.5.2**（SEDA dispatch_queue + pbin/dpbin 差集恢复 + pbin 滑动窗口背压 + blind-trust 目录排除 + idx 废除）
 
 ---
 
