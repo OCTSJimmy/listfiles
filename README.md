@@ -146,7 +146,7 @@ make clean
 |   |  (Message Bus) |    | (Stats Panel + |    | Thread         |    | ThreadPool       |   |
 |   |                |    |  Probe Mgmt)   |    | (Format+Write) |    | (4 threads)      |   |
 |   | - dispatch_    |    |                |    |                |    |                  |   |
-|   |   lost_tasks() |    | - print_       |    | - print_to_    |    | - fp_compute     |   |
+|   |   from_queue() |    | - print_       |    | - print_to_    |    | - fp_compute     |   |
 |   | - process_     |    |   progress()   |    |   stream()     |    | - fp_set_insert  |   |
 |   |   completed_   |    | - dispatch_    |    | - write file   |    | - dev_mgr_       |   |
 |   |   batch()      |    |   probes()     |    |   / stdout     |    |   is_blacklisted |   |
@@ -172,8 +172,8 @@ make clean
 |                               |                                                |             |
 |                               v                                                |             |
 |                        +------+------+                                         |             |
-|                        | lost_tasks  |                                         |             |
-|                        |  (queue)    |                                         |             |
+|                        | dispatch_   |                                         |             |
+|                        |  queue      |                                         |             |
 |                        +------+------+                                         |             |
 |                               ^                                                |             |
 |                               |                                                |             |
@@ -211,10 +211,11 @@ Master 进程通过消息总线机制管理所有 Worker：主线程不再直接
 
 故障隔离：一个 Worker 的 fd 出问题 → 只污染它自己的 IPC 线程 → IPC 线程发 DEAD 消息 → 主线程收到后优雅替换 Worker → 其他 7 路完全不受影响。彻底消除了 v12.x 单线程 epoll 架构中"一个 Worker 出问题导致整个 Master 事件循环 hang 死"的瓶颈。
 
-Master 向 Worker 发送 `IPC_MSG_SCAN` 时采用**非阻塞写 + lost_tasks 重试队列**机制：
+Master 向 Worker 发送 `IPC_MSG_SCAN` 时采用**非阻塞写 + dispatch_queue 暂存**机制：
 - `fd_in` 管道容量通过 `fcntl(F_SETPIPE_SZ)` 提升至 1MB（默认 64KB），减少写满概率。
-- 当 `send_scan_to_ipc()` 因 `msg_queue` 满而失败时，路径被 `strdup()` 后推入全局 `lost_tasks` 队列，由 `dispatch_lost_tasks()` 在后续轮次中重试派发。
-- Worker 死亡清理时，其 `backlog_paths` 中残留的路径会被迁移到 `lost_tasks`，避免任务丢失。
+- 当 `send_scan_to_ipc()` 因 `msg_queue` 满而失败时，路径被 `strdup()` 后推入 `dispatch_queue`，由 `dispatch_from_queue()` 在后续轮次中重试派发。
+- Worker 死亡清理时，其 `backlog_paths` 中残留的路径会被迁移到 `dispatch_queue`，避免任务丢失。
+- 当 `dispatch_queue` 达到 `HIGH_WATER`（默认 10 万条）时，`batch_processor` 停止 push，新发现的目录仅通过 `record_path` 写入 pbin。`main_loop` 在 queue 降到 `LOW_WATER`（3 万条）时触发 `load_dirs_from_pbin`，从 pbin cursor 顺序加载目录回填 queue，实现**内存有界的滑动窗口**。
 - 这避免了 Master 在管道满时阻塞等待，彻底消除了双向管道死锁风险。
 
 Master 内部另设 **`ThreadPool`**（默认 4 线程），通过 `mutex + cond` 有界队列 + `eventfd` 通知，将 CPU 密集型的指纹计算与设备黑名单检查 offload 到工作线程，避免阻塞主循环。队列满时自动降级为同步处理。
@@ -247,7 +248,7 @@ while (running) {
 #### 消息队列
 
 - **eventfd + mutex 保护的有界环形队列**，容量固定为 1024 条消息/队列。
-- 有界设计天然实现背压：队列满时 `msg_queue_send()` 返回 `false`，调用方需自行处理溢出（如将任务加入 `lost_tasks` 重试队列）。
+- 有界设计天然实现背压：队列满时 `msg_queue_send()` 返回 `false`，调用方需自行处理溢出（如将任务加入 `dispatch_queue` 暂存）。
 
 #### 消息格式
 
@@ -303,15 +304,15 @@ while (running) {
 
 **关键约束**：
 - `Footer` 只在分片**封口（seal）**时一次性 `O_APPEND` 写入，不是持续追加。
-- 活跃分片**末尾没有有效 Footer**（或即使有残留也不可信），权威来源是配套的 `.idx`。
+- 活跃分片**末尾没有有效 Footer**（正在追加写入中），行数由内存中的 `state->line_count` 跟踪。
 
-#### idx 与 Footer 的职责边界
+#### Footer 自描述
 
 | 阶段 | 权威来源 | 作用 | 存在形式 |
 |------|---------|------|---------|
-| **活跃分片**（正在接收记录） | `{base}_00000N.idx` / `{base}.fpbin.idx` | 实时跟踪当前行数，支持原子 `rename` 更新 | 独立小文件 |
+| **活跃分片**（正在接收记录） | 内存状态 `state->line_count` | 实时跟踪当前行数 | 运行时计数器 |
 | **已封口分片**（历史/归档/转正） | `Footer`（文件末尾） | 自描述行数，随文件迁移、归档、复制 | 内嵌元数据 |
-| **崩溃恢复** | Footer 优先，idx 兜底 | Footer 校验通过 → 用 Footer；Footer 残缺 → 用残留 idx | 两者配合 |
+| **崩溃恢复** | Footer 优先，salvage 兜底 | Footer 校验通过 → 用 Footer；Footer 残缺 → 顺序解析保留有效行，截断后重新封口 | 自描述 + 修复 |
 
 #### 进度文件格式
 
@@ -323,7 +324,7 @@ while (running) {
 | `task1.dpbin_000000` | 本次会话的目录完成日志（临时，正常结束后删除） |
 | `task1.spbin` | 跳过记录（熔断设备上的目录），附在归档末尾 |
 | `task1.fpbin_000XXX` | 恢复期间隔离新发现子目录的临时分片（同构格式，支持多分片） |
-| `task1.fpbin.idx` | fpbin 分片的游标索引（记录当前 fpbin 分片号与行数） |
+
 | `task1.archive` | zlib 压缩的历史分片归档，块头含 `block_type` 与 `row_count` 元数据 |
 | `task1.config` | 会话配置快照，用于一致性校验 |
 
@@ -332,18 +333,18 @@ while (running) {
 **隔离阶段（HIST_PUMP_OLD）**：
 - Master 从历史 `pbin` 分片 pump 任务给 Worker。
 - Worker 返回的新发现子目录**不入队、不混写 pbin**，而是追加到 `task1.fpbin_000XXX` 分片。
-- `task1.fpbin.idx` 实时记录当前 fpbin 分片号与行数。
+- `fpbin` 采用与 `pbin` 完全相同的物理格式，末尾自带 Footer。
 
 **触发扫尾（到达截止游标）**：
 当最后一个历史 `pbin` 分片消费完毕：
 1. **冻结 fpbin**：不再接收新发现。
-2. **封口每个 fpbin 分片**：打开分片，`O_APPEND` 写入 `Footer`（行数来自 `fpbin.idx`）；`fsync` 确保落盘；关闭 fd。
+2. **封口每个 fpbin 分片**：打开分片，`O_APPEND` 写入 `Footer`；`fsync` 确保落盘；关闭 fd。
 3. `rename(task1.fpbin_000XXX → task1_00000N.pbin)`。
 4. **校验**：以 `O_RDONLY` 重新打开所有转正后的 `pbin`，`seek(EOF - sizeof(Footer))` 读取并校验 `magic + crc`。
-5. **回收**：全部校验通过后，删除 `task1.fpbin.idx`（以及可能的残留 fpbin 临时文件）。
+5. **回收**：全部校验通过后，删除残留 fpbin 临时文件。
 
 **后续阶段**：
-- 新发现直接写入新的 `pbin` 活跃分片（延续原有 `task1.idx` 逻辑）。
+- 新发现直接写入新的 `pbin` 活跃分片。
 - `fpbin` 机制关闭，直到下一次 `--continue` 恢复时按需重新创建。
 
 #### 崩溃恢复策略
@@ -353,26 +354,28 @@ restore_progress()
     │
     ├── 扫描目录，识别所有 *.pbin 与 *.fpbin_*
     │
-    ├── 对每个已完成的历史 pbin 分片：
+    ├── 加载 archive 到 visited_set（解压 → 读 Footer → 解析记录）
+    │
+    ├── 对每个散落的历史 pbin 分片：
     │      seek(EOF - sizeof(Footer))
     │      读取 Footer → 校验 magic + crc
-    │      ├─ 通过 → row_count = footer.row_count，加载到 visited_set
-    │      └─ 失败 → row_count = 残留 idx（如果有），加载到 visited_set
+    │      ├─ 通过 → row_count = footer.row_count，完整解析到 visited_set
+    │      └─ 失败 → pbin_salvage_truncated：顺序解析保留有效行，截断后重新封口
     │
-    ├── 识别当前活跃分片（匹配 task1.idx 中的 write_slice_index）
-    │      行数以 task1.idx 为准（活跃分片无有效 Footer）
+    ├── 加载 dpbin（本次会话目录完成日志）到 completed_set
+    │      dpbin 中的目录视为"已完成"，不参与后续 pumping
     │
-    └── 如果存在残留 fpbin 分片且 fpbin.idx 有效：
-           视为上次转正中断，重新执行封口 + rename + 校验
+    └── 差集恢复：pbin（发现集合） − dpbin（完成集合） = 未完成目录
+           仅对未完成目录执行 pump_pbin_batch，避免全量重扫
 ```
 
-**自动清理**：恢复时若发现某个 `pbin` 的 `Footer` 有效但旁边残留了同名 `.idx`，直接 `unlink` 该残留 idx（**钢印清晰则烧草稿**）。
+**自动清理**：恢复时若发现某个 `pbin` 的 `Footer` 有效，旁边残留的临时文件直接 `unlink`（**钢印清晰则烧草稿**）。
 
 #### 归档与读取
 
 - 压缩 `pbin` 分片前，先 `seek` 读 `Footer` 获取 `row_count`，写入 `ArchiveBlockHeader` 作为元数据。
 - 恢复归档时：解压后得到临时文件，再次读取 `Footer` 校验，双重确认。
-- 无硬算假设：彻底删除代码中所有 `slice_index * BATCH_SIZE` 或 `slice_index * SLICE_ROWS` 的推断逻辑。每个分片的行数必须来自其自身的 `Footer` 或 `idx`，绝不假设固定。
+- 无硬算假设：彻底删除代码中所有 `slice_index * BATCH_SIZE` 或 `slice_index * SLICE_ROWS` 的推断逻辑。每个分片的行数必须来自其自身的 `Footer`，绝不假设固定。
 
 ### 设备熔断与恢复流程
 
