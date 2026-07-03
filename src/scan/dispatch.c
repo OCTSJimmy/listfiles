@@ -43,7 +43,7 @@ bool send_scan_to_ipc(AppContext *ctx, int wid, const char *path, uint64_t dev) 
     };
 
     if (!msg_queue_send(ctx->ipc_cmd_queues[wid], &msg)) {
-        log_warn("[Dispatch] cmd_queue[%d] full, dropping %s", wid, path_log_mask(path));
+        log_warn_v(202607030000UL, "[Dispatch] cmd_queue[%d] full, dropping %s", wid, path_log_mask(path));
         free(scan);
         return false;
     }
@@ -131,7 +131,7 @@ void dispatch_from_queue(AppContext *ctx) {
 
         int wid = dispatch_find_idle_worker(ctx);
         if (wid < 0) {
-            log_warn("[DispatchQueue] no IDLE worker available, requeue %s", path_log_mask(task.path));
+            log_warn_v(202607030000UL, "[DispatchQueue] no IDLE worker available, requeue %s", path_log_mask(task.path));
             if (!dispatch_queue_push(&ctx->dispatch_queue, task.path, &task.st)) {
                 free(task.path);
             }
