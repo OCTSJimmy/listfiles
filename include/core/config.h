@@ -17,7 +17,7 @@ struct DeviceManager;
 // =======================================================
 
 #define VERSION "15.5.2"
-#define VERSION_CODE 202605201552UL // v15.5.2: pbin sliding window backpressure + dispatch_queue leak fixes + --progress-slice-lines
+#define VERSION_CODE 202607031430UL
 #define MAX_PATH_LENGTH 4088 // v15.4.1: PIPE_BUF(4096) - sizeof(IpcMessageHeader)(8) = 4088, ensure atomic pipe writes
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
