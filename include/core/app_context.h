@@ -8,6 +8,9 @@
 #define RECORD_BATCH_COUNT 4096
 #define RECORD_BATCH_BYTES (1 * 1024 * 1024)
 
+/* v15.5.3: 目录级熔断阈值——同一个路径连续 DEV_TIMEOUT 超过此次数后不再重试 */
+#define CIRCUIT_BREAKER_THRESHOLD 3
+
 typedef struct {
     char *paths[RECORD_BATCH_COUNT];
     struct stat stats[RECORD_BATCH_COUNT];
@@ -116,6 +119,10 @@ typedef struct AppContext {
         unsigned long slice;        /* 当前加载到哪个 pbin 切片 */
         long          byte_offset;  /* 该切片中的字节偏移（fseek 直接定位） */
     } pbin_queue_cursor;
+
+    /* === v15.5.3: per-slot DEV_TIMEOUT circuit breaker === */
+    char timeout_paths[8][4096];   /* 每个 Worker slot 最近 timeout 的路径 */
+    int  timeout_counts[8];        /* 该路径连续 timeout 次数 */
 
 } AppContext;
 
