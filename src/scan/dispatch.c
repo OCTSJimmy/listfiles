@@ -162,6 +162,39 @@ void dispatch_from_queue(AppContext *ctx) {
 }
 
 /* ================================================================
+ * v15.5.3: Circuit breaker for DEV_TIMEOUT redispatch loop
+ * ================================================================ */
+
+/**
+ * @brief  检查路径是否已被熔断（连续 DEV_TIMEOUT 超过阈值）
+ * @param  ctx      AppContext*  应用上下文
+ * @param  wid      int          Worker slot id
+ * @param  path     const char*  要检查的路径
+ * @return bool     true = 路径已熔断，不应再重试；false = 可以重试
+ *
+ * @note   同一个 Worker slot 上，如果连续 timeout 的路径相同且次数达到
+ *         CIRCUIT_BREAKER_THRESHOLD，则熔断该路径，不再 redispatch。
+ *         不同路径会重置计数器。熔断路径记录 WARN 日志。
+ */
+static bool circuit_breaker_check(AppContext *ctx, int wid, const char *path) {
+    if (wid < 0 || wid >= 8) return false;
+
+    if (strcmp(ctx->timeout_paths[wid], path) == 0) {
+        ctx->timeout_counts[wid]++;
+    } else {
+        safe_strcpy(ctx->timeout_paths[wid], path, sizeof(ctx->timeout_paths[wid]));
+        ctx->timeout_counts[wid] = 1;
+    }
+
+    if (ctx->timeout_counts[wid] >= CIRCUIT_BREAKER_THRESHOLD) {
+        log_warn_v(202607030000UL, "[CircuitBreaker] Path timed out %d times, skipping: %s",
+                   ctx->timeout_counts[wid], path_log_mask(path));
+        return true; /* 熔断：不再重试 */
+    }
+    return false; /* 未熔断：允许重试 */
+}
+
+/* ================================================================
  * Cleanup dead worker slot (v13.0.0: no epoll DEL, IPC thread handles fd)
  * ================================================================ */
 
@@ -205,11 +238,16 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
 
     atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
 
+    /* v15.5.3: Circuit breaker for DEV_TIMEOUT redispatch loop */
     if (redispatch_current && slot->current_path[0] != '\0') {
-        char *dup = strdup(slot->current_path);
-        if (!dispatch_queue_push(&ctx->dispatch_queue, dup, NULL)) {
-            free(dup);
+        bool tripped = circuit_breaker_check(ctx, worker_id, slot->current_path);
+        if (!tripped) {
+            char *dup = strdup(slot->current_path);
+            if (!dispatch_queue_push(&ctx->dispatch_queue, dup, NULL)) {
+                free(dup);
+            }
         }
+        /* If tripped: path is skipped, pending_tasks already decremented above */
     }
 
     if (atomic_load(&slot->is_alive)) {
