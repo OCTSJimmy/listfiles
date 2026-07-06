@@ -120,6 +120,41 @@ static bool try_blind_trust(const char *full_path, uint64_t dir_dev, uint64_t d_
     return true;
 }
 
+/* ================================================================
+ * Scanner progress heartbeat (v15.5.3)
+ * ================================================================ */
+
+/* Forward declaration: scanner heartbeat callback into IPC thread */
+extern void worker_scanner_progress(pthread_mutex_t *mutex, time_t *last_progress, int worker_id);
+
+/**
+ * @brief  定期更新 Scanner 进度时间戳，防止大目录 readdir 超时误判
+ * @param  entry_count  int*  条目计数器（输入输出，每调用自动递增）
+ * @param  interval     int   更新间隔（条目数），默认 1000
+ * @param  worker_id    int   Worker 编号
+ * @return void
+ *
+ * @note   在 scan_and_send 的 readdir 循环中调用。每处理 interval 个条目
+ *         更新一次 last_progress，让 IPC 线程的 stuck 检测知道 Scanner
+ *         仍在正常工作，避免对大目录（7万+ 文件）误判为 DEV_TIMEOUT。
+ */
+static void scanner_progress_tick(int *entry_count, int interval,
+                                  pthread_mutex_t *mutex, time_t *last_progress,
+                                  int worker_id) {
+    (*entry_count)++;
+    if (*entry_count % interval == 0) {
+        pthread_mutex_lock(mutex);
+        *last_progress = time(NULL);
+        pthread_mutex_unlock(mutex);
+        log_debug_v(202607030000UL, "[W%d-Scanner] progress tick (entries=%d)",
+                    worker_id, *entry_count);
+    }
+}
+
+/* ================================================================
+ * Batch send helpers
+ * ================================================================ */
+
 /**
  * @brief  向 Master 发送一批扫描结果
  * @param  fd_out  int            输出文件描述符（指向 Master 的 fd_out），取值范围: >= 0 的可写 fd
@@ -216,16 +251,17 @@ static void send_error_and_empty_batch(int fd_out, int err_code, const char *pat
  * @param  fd_out     int          输出文件描述符，取值范围: >= 0 的可写 fd
  * @param  dir_path   const char*  要扫描的目录路径，不能为空
  * @param  worker_id  int          Worker 编号（当前未使用，保留用于日志），取值范围: >= 0
+ * @param  task       WorkerThreadCtx*  线程上下文（用于进度心跳），不能为空
  * @return void
  *
  * @note   先对目录本身执行 lstat 获取设备号；然后 opendir/readdir 遍历条目。
  *         对每个条目：跳过 . 和 ..；尝试 blind-trust；失败则执行 lstat/stat；
  *         收集到 batch_size 条后发送批次；遍历结束后发送剩余批次（或空批次）。
  *         若 opendir 或 lstat 失败，发送错误通知和空批次。
+ *         v15.5.3: readdir 循环中每 1000 个条目更新一次 last_progress，
+ *         防止大目录（7万+ 文件）遍历被 IPC 线程误判为 stuck。
  */
-static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
-    (void)worker_id;
-    log_debug_v(202605181600UL, "[W%d-Scanner] scan_and_send entered: %s", worker_id, dir_path);
+static void scan_and_send(int fd_out, const char *dir_path, int worker_id, WorkerThreadCtx *task) {
     struct stat dir_st;
     if (lstat(dir_path, &dir_st) != 0) {
         log_warn("[W%d-Scanner] lstat failed on %s: %s", worker_id, dir_path, strerror(errno));
@@ -253,7 +289,11 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id) {
     struct dirent *entry;
     int entry_count = 0;
     while ((entry = readdir(dir)) != NULL) {
-        entry_count++;
+        /* v15.5.3: heartbeat tick every 1000 entries for large directories */
+        scanner_progress_tick(&entry_count, 1000,
+                              &task->progress_mutex, &task->last_progress,
+                              worker_id);
+
         if (entry->d_name[0] == '.' &&
             (entry->d_name[1] == '\0' || (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) {
             continue;
@@ -339,7 +379,7 @@ void *worker_scanner_thread(void *arg) {
         log_debug("[W%d-Scanner] start scanning: %s", ctx->worker_id, path);
 
         /* 扫描 — 结果通过 fd_data 发送 */
-        scan_and_send(ctx->fd_data, path, ctx->worker_id);
+        scan_and_send(ctx->fd_data, path, ctx->worker_id, ctx);
 
         log_debug("[W%d-Scanner] scan_and_send returned: %s", ctx->worker_id, path);
 
@@ -359,7 +399,7 @@ void *worker_scanner_thread(void *arg) {
                 usleep(1000);
                 retry++;
                 if (retry % 1000 == 0) {
-                    log_warn("[W%d-Scanner] IPC_MSG_FINISH EAGAIN retry %d", ctx->worker_id, retry);
+                    log_warn_v(202607030000UL, "[W%d-Scanner] IPC_MSG_FINISH EAGAIN retry %d", ctx->worker_id, retry);
                 }
             }
             log_debug("[W%d-Scanner] IPC_MSG_FINISH sent (rc=%d, path=%s, retries=%d)", ctx->worker_id, rc, path, retry);
