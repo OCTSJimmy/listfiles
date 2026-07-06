@@ -93,7 +93,7 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
         if (rc == 0 || elapsed >= 5) {
             heartbeat_count++;
             if (ctx.scanner_active) {
-                log_info("[Worker-%d] Scanner active (heartbeat %d)", worker_id, heartbeat_count);
+                log_info_v(202607030000UL, "[Worker-%d] Scanner active (heartbeat %d)", worker_id, heartbeat_count);
             }
             IpcHeartbeatPayload hb = { (uint64_t)time(NULL) };
             int rc_hb = ipc_send(fd_ctrl, IPC_MSG_HEARTBEAT, &hb, sizeof(hb));
@@ -170,7 +170,7 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
                               ? cfg->heartbeat_timeout
                               : HEARTBEAT_TIMEOUT_SEC;
             if (difftime(now, scanner_last) > timeout_sec) {
-                log_error("[Worker-%d] Scanner stuck for %ds on %s, reporting to master",
+                log_error_v(202607030000UL, "[Worker-%d] Scanner stuck for %ds on %s, reporting to master",
                           worker_id, timeout_sec, ctx.task_path);
                 IpcErrorHeader eh = { ETIMEDOUT, 0 };
                 char stuck_path[4096];
