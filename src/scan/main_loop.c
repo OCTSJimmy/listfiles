@@ -83,7 +83,7 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             break;
         }
         case RET_DEV_TIMEOUT: {
-            log_error("[Bus] Worker %d DEV_TIMEOUT (scanner stuck), replacing", msg->slot_id);
+            log_error_v(202607030000UL, "[Bus] Worker %d DEV_TIMEOUT (scanner stuck), replacing", msg->slot_id);
             cleanup_dead_worker_slot(ctx, msg->slot_id, true);
             break;
         }
