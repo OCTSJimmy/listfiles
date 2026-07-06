@@ -16,8 +16,8 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.5.2"
-#define VERSION_CODE 202607031430UL
+#define VERSION "15.5.3"
+#define VERSION_CODE 202607061400UL
 #define MAX_PATH_LENGTH 4088 // v15.4.1: PIPE_BUF(4096) - sizeof(IpcMessageHeader)(8) = 4088, ensure atomic pipe writes
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
@@ -64,6 +64,9 @@ struct DeviceManager;
 /* Pbin / fpbin Footer 常量 */
 #define PBIN_FOOTER_MAGIC   0xDEADBEEF66AAC0FFULL
 #define PBIN_FOOTER_SIZE    24  /* sizeof(PbinFooter) */
+
+/* v15.5.3: 目录级熔断阈值——同一个路径连续 DEV_TIMEOUT 超过此次数后不再重试 */
+#define CIRCUIT_BREAKER_THRESHOLD 3
 
 #define min_size(a, b) ((a) < (b) ? (a) : (b))
 #define max_size(a, b) ((a) > (b) ? (a) : (b))
