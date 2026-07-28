@@ -296,6 +296,7 @@ bool ipc_msg_type_valid(uint32_t msg_type) {
         case IPC_MSG_DEV_TIMEOUT:
         case IPC_MSG_READY:
         case IPC_MSG_FINISH:
+        case IPC_MSG_ENTRY_ERROR:
             return true;
         default:
             return false;

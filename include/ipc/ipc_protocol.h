@@ -15,6 +15,7 @@
 #define IPC_MSG_DEV_TIMEOUT 7  /* Scanner self-detected timeout */
 #define IPC_MSG_READY       8  /* Worker initialization complete */
 #define IPC_MSG_FINISH      9  /* Scanner task complete */
+#define IPC_MSG_ENTRY_ERROR 10 /* v15.5.7: entry-level stat failure (Worker -> Master, ctrl channel) */
 
 #define IPC_FOOTER_MAGIC  0xDEADBEEF66AAC0FFULL  /* v15.4.0: BATCH payload footer */
 

@@ -26,6 +26,7 @@
 #define RET_DEV_TIMEOUT 16  /* Worker scanner self-detected timeout */
 #define RET_READY      17  /* Worker initialization complete */
 #define RET_FINISH     18  /* Worker task complete */
+#define RET_ENTRY_ERROR 19 /* v15.5.7: entry-level error (stat failed / path truncated; no device penalty) */
 
 /**
  * @brief  Unified message structure for Master <-> IPC Thread queues

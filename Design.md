@@ -56,6 +56,7 @@
 | **v15.5.0** | **SEDA dispatch_queue + pbin/dpbin 差集恢复** | `lost_tasks` 是溢出桶不是队列；idx 5 字段是 v12.x patchwork；pending_tasks 语义三处不一致；目录被盲信导致 mtime 不可靠 | `dispatch_queue` Stage 3→4 解耦；`dpbin` 差集恢复废除 idx；`pending_tasks` 统一为成功派发后；目录 `DT_DIR` 硬过滤不盲信 |
 | **v15.5.4** | **熔断清单 + 探测指数退避判死** | 扫描严重不完整但退出码仍为 0；熔断/超时无独立审计记录；探测退避被重置为 0 永不判死；Monitor ANSI 刷屏 | 独立 `.circuit_breaker` 清单文件；`skipped_count` 触发非 0 退出；探针真正指数退避并在 `PROBE_MAX_RETRIES` 后判死；`TERM=dumb` 判断 |
 | **v15.5.6** | **dev=0 修复与单挂载保护** | `IpcErrorHeader.dev` 恒为 0，设备级熔断名存实亡；直接修复又会导致 NFS 单挂载被整体误伤 | `WorkerThreadCtx.current_dev` 记录真实 `st_dev`；`RuntimeState.root_dev` 保护根路径设备不被设备级跳过 |
+| **v15.5.7** | **扫描完整性加固：条目级/目录级错误全面可见** | `IPC_MSG_ERROR` 误发 `fd_data` 被 Master 当垃圾帧 drain，scanner 自检错误永远到不了熔断清单；目录级错误仅上报 ETIMEDOUT/EIO，EACCES 等静默丢失整棵子树；条目级 `lstat` 失败与 `readdir` 中途失败完全静默 | 错误上报改走 `fd_ctrl`；目录级错误除 ENOENT/ENOTDIR 竞态外全部上报并记录 `DIR_ERROR`；新增 `IPC_MSG_ENTRY_ERROR` 上报条目级失败记录 `ENTRY_ERROR`；`readdir` errno 检查；条目 stat EINTR 重试 |
 ---
 
 ## v13.0.0：IPC 线程隔离
@@ -648,7 +649,7 @@ FSM 永远卡在 `IPC_READ_FOOTER` 状态，BATCH 数据被锁死在 IPC 线程�
 
 - `include/core/circuit_breaker.h` — 新增
 - `src/core/circuit_breaker.c` — 新增
-- `include/core/config.h` — 版本号 15.5.4 / `LOG_VERSION_CODE` / `skipped_count`
+- `include/core/config.h` — 版本号 15.5.4 / `skipped_count`（新增日志使用字面量版本号 `202607280930UL`，未定义全局日志版本常量）
 - `include/core/app_context.h` — 增加 `circuit_breaker_fp` / `circuit_breaker_mutex`
 - `include/scan/probe_scheduler.h` — 增加 `PROBE_MAX_RETRIES`
 - `include/output/monitor.h` — 增加探测任务状态字段
@@ -697,6 +698,54 @@ v15.5.4 引入的熔断清单已能记录跳过路径，但 `IpcErrorHeader.dev`
 - `src/scan/worker_scanner.c` — `send_error_and_empty_batch()` 上报真实 dev；`scan_and_send()` 设置 `current_dev`
 - `src/core/main.c` — `root_dev` 记录
 - `src/scan/batch_processor.c` — `root_dev` 单挂载保护
+
+---
+
+## v15.5.7：扫描完整性加固——条目级/目录级错误全面可见
+
+### 问题背景
+
+对 v15.5.6 代码与《扫描完整性故障总结》逐条对账后，发现熔断清单 + 非 0 退出码机制仍存在四个"静默通道"，可绕开全部可见性机制：
+
+1. **错误上报发错通道**：`send_error_and_empty_batch()` 把 `IPC_MSG_ERROR` 写到 `fd_data`，而 Master 侧 `read_data_message()` 只接受 BATCH 帧，非 BATCH 帧按垃圾 `drain_fd()`——scanner 自检到的目录级错误**永远到不了** `circuit_breaker_record()`，且 drain 可能吞掉随后的空批次。
+2. **目录级 errno 白名单过窄**：仅 `ETIMEDOUT/EIO` 上报，`EACCES`（权限拒绝）等错误仅发空批次——整棵子树缺失但扫描以退出码 0 "成功"。
+3. **条目级 `lstat` 失败静默**（故障报告 §2.3.5）：`readdir` 成功但单条目 `lstat` 失败（`EACCES/ESTALE/EIO` 等）直接 `continue`，无记录。
+4. **`readdir` 中途失败静默**：未检查 `readdir` 返回 NULL 时的 `errno`，NFS readdir cookie 失效等会造成超大目录**部分条目**静默丢失。
+
+### 修复
+
+#### 1. 错误上报改走 `fd_ctrl`
+
+`send_error_and_empty_batch()` 拆分双通道：错误帧走 `fd_ctrl`（`read_ctrl_message()` 正常路由），空批次仍走 `fd_data`（保证 `pending_tasks` 计数平衡）。
+
+#### 2. 目录级错误全量上报（竞态除外）
+
+Worker 侧上报范围从仅 `ETIMEDOUT/EIO` 扩展到除 `ENOENT/ENOTDIR` 外的全部 errno（后两者为扫描期间目录被并发删除/替换的正常竞态）。Master 侧 `main_loop_handle_error()` 对非超时/IO 错误记录 `DIR_ERROR(errno=N)` 到熔断清单——**不触发**设备惩罚与探测。
+
+#### 3. 条目级错误上报 `IPC_MSG_ENTRY_ERROR`
+
+- 新增线协议消息 `IPC_MSG_ENTRY_ERROR(10)` 与返回类型 `RET_ENTRY_ERROR(19)`，payload 复用 `IpcErrorHeader + path` 格式。
+- 条目 `lstat/stat` 失败：`ENOENT/ENOTDIR` 竞态静默，其余 errno 上报，Master 记录 `ENTRY_ERROR(errno=N)`——不触发设备惩罚/探测/Worker 状态变更。
+- 路径截断（`snprintf ≥ 4096`）以 `ENAMETOOLONG` 上报（记录父目录路径）。
+- 条目 stat 带 `EINTR` 重试（≤3 次），避免信号中断慢速 NFS stat 被误判为条目失败。
+
+#### 4. `readdir` errno 检查
+
+`readdir` 循环每次调用前清零 `errno`，循环结束后检查；非 0 则先 flush 已收集的有效条目，再按目录级错误上报。
+
+### 与既有机制的关系
+
+所有记录经 `circuit_breaker_record()` → `skipped_count > 0` → `stderr` 输出 `[CRITICAL]` + `.config` 写 `Incomplete` + **退出码 1**。本版本未新增任何版本化日志；审计通道仍为独立熔断清单（非日志）。
+
+### 修改的文件
+
+- `include/ipc/ipc_protocol.h` — `IPC_MSG_ENTRY_ERROR(10)`
+- `src/ipc/ipc_protocol.c` — 消息类型白名单
+- `include/ipc/msg_format.h` — `RET_ENTRY_ERROR(19)`
+- `src/ipc/ipc_message_handler.c` — `IPC_MSG_ENTRY_ERROR` 转发 `RET_ENTRY_ERROR`
+- `src/scan/worker_scanner.c` — 双通道错误上报、`send_entry_error()`、`entry_stat()` EINTR 重试、`readdir` errno 检查
+- `src/scan/main_loop.c` — `RET_ENTRY_ERROR` 路由记录 `ENTRY_ERROR`；非超时目录错误记录 `DIR_ERROR`
+- `include/core/config.h` — 版本号 15.5.7 / VERSION_CODE 202607281100UL
 
 ---
 

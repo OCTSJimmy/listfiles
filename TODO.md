@@ -5,6 +5,13 @@
 
 ---
 
+## v15.5.7 已修复项（2026-07-28）
+
+- [x] **错误上报通道修复**：`IPC_MSG_ERROR` 从 `fd_data` 改到 `fd_ctrl`（此前被 Master 当垃圾帧 drain，scanner 自检的目录级错误永远到不了熔断清单）。
+- [x] **目录级错误全量上报**：除 ENOENT/ENOTDIR 竞态外的 errno 全部上报；Master 记录 `DIR_ERROR(errno=N)`，不触发设备惩罚。
+- [x] **条目级错误上报**：新增 `IPC_MSG_ENTRY_ERROR`/`RET_ENTRY_ERROR`；条目 `lstat/stat` 失败（非竞态）与路径截断记录 `ENTRY_ERROR(errno=N)`；条目 stat 带 EINTR 重试。
+- [x] **readdir 中途失败检测**：`readdir` errno 检查，中途失败按目录级错误上报（此前超大目录部分条目静默丢失）。
+
 ## v15.5.4 已修复项（2026-07-28）
 
 - [x] **熔断清单**：新增 `{progress_base}.circuit_breaker` 独立审计文件，记录所有 `BLACKLIST` / `DEV_TIMEOUT` / `EIO` / `PATH_TIMEOUT` / `CONDEMNED` 跳过路径。

@@ -59,6 +59,18 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             }
             break;
         }
+        case RET_ENTRY_ERROR: {
+            /* v15.5.7: 条目级错误（单条目 stat 失败、路径截断）——Worker 仍在正常扫描，
+             * 不触发设备惩罚/探测/Worker 状态变更，仅记入熔断清单并累加 skipped_count，
+             * 扫描结束时以非零退出码暴露不完整。 */
+            if (msg->data_len >= sizeof(RetErrorPayload)) {
+                RetErrorPayload *err = (RetErrorPayload*)msg->data;
+                char reason[64];
+                snprintf(reason, sizeof(reason), "ENTRY_ERROR(errno=%u)", err->errno_code);
+                circuit_breaker_record(ctx, reason, err->path, (dev_t)err->dev, 0);
+            }
+            break;
+        }
         case RET_READY: {
             log_info("[Bus] Worker %d READY", msg->slot_id);
             atomic_store(&ctx->worker_pool->slots[msg->slot_id].last_heartbeat, time(NULL));
@@ -156,6 +168,13 @@ void main_loop_handle_error(AppContext *ctx, int worker_id, const IpcErrorHeader
             task.s_status = SP_STATUS_PROBING;
             probe_scheduler_push(ctx->probe_scheduler, &task);
         }
+    } else {
+        /* v15.5.7: 目录级非超时/IO错误（如 EACCES 权限拒绝、ESTALE 等）此前完全静默——
+         * 目录（及其整棵子树）被跳过但扫描仍以成功退出。现记入熔断清单并累加
+         * skipped_count（不触发设备惩罚与探测）。 */
+        char reason[64];
+        snprintf(reason, sizeof(reason), "DIR_ERROR(errno=%u)", err->errno_code);
+        circuit_breaker_record(ctx, reason, path, (dev_t)err->dev, 0);
     }
 }
 

@@ -115,7 +115,8 @@ dispatch:
                 free(payload);
                 break;
             }
-            case IPC_MSG_ERROR: {
+            case IPC_MSG_ERROR:
+            case IPC_MSG_ENTRY_ERROR: {
                 if (hdr.payload_len >= sizeof(IpcErrorHeader)) {
                     IpcErrorHeader *eh = (IpcErrorHeader*)payload;
                     RetErrorPayload *ret = malloc(sizeof(RetErrorPayload));
@@ -131,7 +132,9 @@ dispatch:
                         } else {
                             ret->path[0] = '\0';
                         }
-                        send_return(ctx, RET_ERROR, ret, sizeof(*ret));
+                        send_return(ctx,
+                                    hdr.msg_type == IPC_MSG_ENTRY_ERROR ? RET_ENTRY_ERROR : RET_ERROR,
+                                    ret, sizeof(*ret));
                     }
                 }
                 free(payload);

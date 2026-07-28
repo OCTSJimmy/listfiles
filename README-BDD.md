@@ -1,6 +1,6 @@
 # listfiles — 行为驱动开发 (BDD) 规格说明
 
-> 版本: 15.5.6  
+> 版本: 15.5.7  
 > 语言: C11 (GNU11)  
 > 平台: Linux (依赖 fork, epoll, pipe2, pthread)
 
@@ -810,6 +810,27 @@ Feature: 熔断清单
     When Monitor 将该 dev 标记为 CONDEMNED
     Then task1.circuit_breaker 应记录一行 CONDEMNED
     And 对应 spbin_entries 状态更新为 SP_STATUS_CONDEMNED
+
+  Scenario: 条目级错误上报（v15.5.7）
+    Given Worker readdir 成功但单条目 lstat/stat 失败（非 ENOENT/ENOTDIR 竞态）
+    When Worker 经 fd_ctrl 发送 IPC_MSG_ENTRY_ERROR
+    Then task1.circuit_breaker 应记录一行 ENTRY_ERROR(errno=N)
+    And 不触发设备惩罚、探测与 Worker 状态变更
+    And 扫描结束时退出码应为 1
+
+  Scenario: 目录级非超时错误上报（v15.5.7）
+    Given Worker opendir/lstat 目录失败且 errno 非 ETIMEDOUT/EIO（如 EACCES）
+    When Worker 经 fd_ctrl 发送 IPC_MSG_ERROR
+    Then task1.circuit_breaker 应记录一行 DIR_ERROR(errno=N)
+    And 不触发设备惩罚与探测
+    And 扫描结束时退出码应为 1
+
+  Scenario: readdir 中途失败上报（v15.5.7）
+    Given Worker 正在遍历超大目录
+    When readdir 中途失败（errno 非 0，如 NFS readdir cookie 失效）
+    Then 已收集的有效条目正常发送
+    And 按目录级错误上报并记录到 task1.circuit_breaker
+    And 扫描结束时退出码应为 1
 ```
 
 ### Feature: 单挂载保护（v15.5.6）
@@ -895,7 +916,8 @@ Feature: 退出码与失败可见性
 | `IPC_MSG_SCAN` | Master → Worker | Given 目录路径，Then Worker 执行扫描 |
 | `IPC_MSG_BATCH` | Worker → Master | Given 扫描结果，Then Master 解析并去重 |
 | `IPC_MSG_HEARTBEAT` | Worker → Master | Given 时间戳，Then IPC 线程更新存活状态 |
-| `IPC_MSG_ERROR` | Worker → Master | Given errno+dev+path，Then Master 触发熔断 |
+| `IPC_MSG_ERROR` | Worker → Master | Given errno+dev+path（fd_ctrl），Then Master 触发熔断或记录 DIR_ERROR |
+| `IPC_MSG_ENTRY_ERROR` | Worker → Master | Given 条目级 errno+dev+path（fd_ctrl，v15.5.7），Then Master 记录 ENTRY_ERROR（不触发熔断） |
 | `IPC_MSG_EXIT` | Worker → Master | Given 退出信号，Then Master 回收 slot |
 | `IPC_MSG_STOP` | Master → Worker | Given 停止指令，Then Worker 优雅退出 |
 | `RET_READY` | Worker → IPC | Given Worker 初始化完成，Then IPC 线程转发给主线程 |

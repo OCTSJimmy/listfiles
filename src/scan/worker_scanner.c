@@ -221,19 +221,25 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
 }
 
 /**
- * @brief  发送设备级错误通知并追加空批次
- * @param  fd_out    int          输出文件描述符，取值范围: >= 0 的可写 fd
- * @param  err_code  int          错误码，取值范围: ETIMEDOUT(110)、EIO(5) 等系统 errno
+ * @brief  发送目录级错误通知并追加空批次
+ * @param  fd_data   int          数据通道 fd（空批次走这里），取值范围: >= 0 的可写 fd
+ * @param  fd_ctrl   int          控制通道 fd（错误上报走这里），取值范围: >= 0 的可写 fd
+ * @param  err_code  int          错误码，取值范围: ETIMEDOUT(110)、EIO(5)、EACCES(13) 等系统 errno
  * @param  dev       dev_t        当前任务所在设备号
  * @param  path      const char*  发生错误的文件/目录路径，不能为空
  * @return void
  *
- * @note   仅在 err_code 为 ETIMEDOUT 或 EIO 时发送 IPC_MSG_ERROR，
- *         其他错误码仅发送空批次。空批次确保 Master 正确递减 pending_tasks。
+ * @note   空批次确保 Master 正确递减 pending_tasks。
  *         v15.5.6: 填充真实 st_dev，修复之前硬编码 dev=0 的问题。
+ *         v15.5.7: 错误上报从 fd_data 改到 fd_ctrl——此前误用 fd_data，Master 侧
+ *         read_data_message 只接受 BATCH，非 BATCH 帧会被当作垃圾 drain 掉，
+ *         导致 scanner 自检到的目录级错误永远到不了熔断清单；
+ *         上报范围从仅 ETIMEDOUT/EIO 扩展到除 ENOENT/ENOTDIR 外的全部 errno
+ *         （ENOENT/ENOTDIR 为扫描期间目录被并发删除/替换的正常竞态，不上报；
+ *         EACCES 等此前静默丢失，会导致整棵子树缺失但扫描"成功"）。
  */
-static void send_error_and_empty_batch(int fd_out, int err_code, dev_t dev, const char *path) {
-    if (err_code == ETIMEDOUT || err_code == EIO) {
+static void send_error_and_empty_batch(int fd_data, int fd_ctrl, int err_code, dev_t dev, const char *path) {
+    if (err_code != ENOENT && err_code != ENOTDIR) {
         IpcErrorHeader eh = { (uint32_t)err_code, (uint64_t)dev };
         uint32_t plen = (uint32_t)strlen(path);
         uint8_t *buf = malloc(sizeof(eh) + sizeof(plen) + plen);
@@ -241,11 +247,62 @@ static void send_error_and_empty_batch(int fd_out, int err_code, dev_t dev, cons
             memcpy(buf, &eh, sizeof(eh));
             memcpy(buf + sizeof(eh), &plen, sizeof(plen));
             memcpy(buf + sizeof(eh) + sizeof(plen), path, plen);
-            ipc_send(fd_out, IPC_MSG_ERROR, buf, (uint32_t)(sizeof(eh) + sizeof(plen) + plen));
+            int rc = ipc_send(fd_ctrl, IPC_MSG_ERROR, buf, (uint32_t)(sizeof(eh) + sizeof(plen) + plen));
+            if (rc != 0)
+                log_error("[Worker] send IPC_MSG_ERROR FAILED (rc=%d, path=%s)", rc, path);
             free(buf);
         }
     }
-    send_batch(fd_out, NULL, NULL, 0);
+    send_batch(fd_data, NULL, NULL, 0);
+}
+
+/**
+ * @brief  条目级错误上报（v15.5.7）
+ * @param  fd_ctrl   int          控制通道 fd，取值范围: >= 0 的可写 fd
+ * @param  err_code  int          错误码（lstat/stat 失败的 errno，或 ENAMETOOLONG 表示路径截断）
+ * @param  dev       dev_t        条目所在设备号
+ * @param  path      const char*  失败条目路径（截断时为父目录路径），不能为空
+ * @return void
+ *
+ * @note   不排空批量、不触发设备惩罚/探测，仅通知 Master 将条目记入熔断清单
+ *         并累加 skipped_count（扫描将以非零退出码结束）。
+ */
+static void send_entry_error(int fd_ctrl, int err_code, dev_t dev, const char *path) {
+    if (fd_ctrl < 0) return;
+    IpcErrorHeader eh = { (uint32_t)err_code, (uint64_t)dev };
+    uint32_t plen = (uint32_t)strlen(path);
+    uint8_t *buf = malloc(sizeof(eh) + sizeof(plen) + plen);
+    if (!buf) return;
+    memcpy(buf, &eh, sizeof(eh));
+    memcpy(buf + sizeof(eh), &plen, sizeof(plen));
+    memcpy(buf + sizeof(eh) + sizeof(plen), path, plen);
+    int rc;
+    while ((rc = ipc_send(fd_ctrl, IPC_MSG_ENTRY_ERROR, buf, (uint32_t)(sizeof(eh) + sizeof(plen) + plen))) == -2) {
+        usleep(1000); /* 1ms */
+    }
+    if (rc != 0)
+        log_error("[Worker] send_entry_error FAILED (rc=%d, path=%s)", rc, path);
+    free(buf);
+}
+
+/**
+ * @brief  条目级 stat（v15.5.7），带 EINTR 重试
+ * @param  path  const char*  条目路径，不能为空
+ * @param  st    struct stat* 输出缓冲区，不能为空
+ * @return int  同 lstat/stat 返回值
+ *
+ * @note   信号（如 SIGALRM 探测计时器）可能中断慢速 NFS stat 返回 EINTR，
+ *         若不重试会把信号中断误判为条目失败。最多重试 3 次。
+ *         依配置 follow_symlinks 选择 stat 或 lstat。
+ */
+static int entry_stat(const char *path, struct stat *st) {
+    int attempts = 0;
+    int rc;
+    do {
+        rc = (g_worker_cfg && g_worker_cfg->follow_symlinks) ? stat(path, st) : lstat(path, st);
+        attempts++;
+    } while (rc != 0 && errno == EINTR && attempts < 3);
+    return rc;
 }
 
 /**
@@ -262,12 +319,20 @@ static void send_error_and_empty_batch(int fd_out, int err_code, dev_t dev, cons
  *         若 opendir 或 lstat 失败，发送错误通知和空批次。
  *         v15.5.3: readdir 循环中每 1000 个条目更新一次 last_progress，
  *         防止大目录（7万+ 文件）遍历被 IPC 线程误判为 stuck。
+ *         v15.5.7: 完整性加固——
+ *         (1) 条目级 lstat/stat 失败不再静默跳过：ENOENT/ENOTDIR 视为并发删除
+ *             竞态静默，其余 errno 经 IPC_MSG_ENTRY_ERROR 上报熔断清单；
+ *         (2) 路径截断（>4096）以 ENAMETOOLONG 上报；
+ *         (3) readdir 循环每次调用前清零 errno，循环结束后检查——readdir 中途
+ *             失败（NFS readdir cookie 失效等）此前完全静默，会造成超大目录
+ *             部分条目丢失，现按目录级错误上报；
+ *         (4) 条目 stat 带 EINTR 重试（最多 3 次）。
  */
 static void scan_and_send(int fd_out, const char *dir_path, int worker_id, WorkerThreadCtx *task) {
     struct stat dir_st;
     if (lstat(dir_path, &dir_st) != 0) {
         log_warn("[W%d-Scanner] lstat failed on %s: %s", worker_id, dir_path, strerror(errno));
-        send_error_and_empty_batch(fd_out, errno, task->current_dev, dir_path);
+        send_error_and_empty_batch(fd_out, task->fd_ctrl, errno, task->current_dev, dir_path);
         return;
     }
 
@@ -286,14 +351,21 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
     DIR *dir = opendir(dir_path);
     if (!dir) {
         log_warn("[W%d-Scanner] opendir failed on %s: %s", worker_id, dir_path, strerror(errno));
-        send_error_and_empty_batch(fd_out, errno, dir_dev, dir_path);
+        send_error_and_empty_batch(fd_out, task->fd_ctrl, errno, dir_dev, dir_path);
         goto cleanup;
     }
     log_debug_v(202605181600UL, "[W%d-Scanner] opendir success: %s", worker_id, dir_path);
 
     struct dirent *entry;
     int entry_count = 0;
-    while ((entry = readdir(dir)) != NULL) {
+    int readdir_err = 0;
+    for (;;) {
+        errno = 0; /* v15.5.7: 区分 readdir 正常结束与中途出错 */
+        entry = readdir(dir);
+        if (!entry) {
+            readdir_err = errno;
+            break;
+        }
         /* v15.5.3: heartbeat tick every 1000 entries for large directories */
         scanner_progress_tick(&entry_count, 1000,
                               &task->progress_mutex, &task->last_progress,
@@ -306,7 +378,11 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
 
         char full_path[4096];
         int n = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, entry->d_name);
-        if (n >= (int)sizeof(full_path)) continue;
+        if (n >= (int)sizeof(full_path)) {
+            /* v15.5.7: 路径截断不再静默跳过，上报熔断清单 */
+            send_entry_error(task->fd_ctrl, ENAMETOOLONG, dir_dev, dir_path);
+            continue;
+        }
 
         struct stat st;
         bool got = false;
@@ -314,10 +390,14 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
         if (try_blind_trust(full_path, dir_dev, entry->d_ino, entry->d_type, &st)) {
             got = true;
         } else {
-            if (g_worker_cfg && g_worker_cfg->follow_symlinks) {
-                if (stat(full_path, &st) != 0) continue;
-            } else {
-                if (lstat(full_path, &st) != 0) continue;
+            if (entry_stat(full_path, &st) != 0) {
+                /* v15.5.7: 条目级 stat 失败不再静默跳过。
+                 * ENOENT/ENOTDIR 为 readdir 后条目被并发删除/替换的正常竞态，静默；
+                 * 其余 errno（EACCES/EIO/ETIMEDOUT/ESTALE 等）意味着真实存在的条目
+                 * 被遗漏，上报 Master 记入熔断清单并累加 skipped_count。 */
+                if (errno != ENOENT && errno != ENOTDIR)
+                    send_entry_error(task->fd_ctrl, errno, dir_dev, full_path);
+                continue;
             }
             got = true;
         }
@@ -333,6 +413,20 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
             for (int i = 0; i < count; i++) free(paths[i]);
             count = 0;
         }
+    }
+
+    if (readdir_err != 0) {
+        /* v15.5.7: readdir 中途失败——目录部分条目可能已丢失。
+         * 先 flush 已收集的有效条目，再按目录级错误上报（空批次保证计数平衡）。 */
+        log_warn("[W%d-Scanner] readdir failed mid-way on %s: %s", worker_id, dir_path, strerror(readdir_err));
+        if (count > 0) {
+            send_batch(fd_out, paths, stats, count);
+            for (int i = 0; i < count; i++) free(paths[i]);
+            count = 0;
+        }
+        closedir(dir);
+        send_error_and_empty_batch(fd_out, task->fd_ctrl, readdir_err, dir_dev, dir_path);
+        goto cleanup;
     }
 
     if (count > 0) {
