@@ -30,7 +30,7 @@ errlogs*.err
 *.log
 
 # Debug / profiling
-core
+/core
 core.*
 gmon.out
 valgrind.out

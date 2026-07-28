@@ -19,6 +19,7 @@
 #include "main_loop.h"
 #include "dispatch_queue.h"
 #include "log.h"
+#include "circuit_breaker.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -149,7 +150,8 @@ void print_progress(Monitor *mon) {
     long pending = atomic_load(&ctx->pending_tasks);
     long pending_batches = atomic_load(&ctx->pending_batches);
 
-    if (isatty(fileno(fp))) {
+    const char *term = getenv("TERM");
+    if (isatty(fileno(fp)) && term && strcmp(term, "dumb") != 0) {
         fprintf(fp, "\033[2J\033[H");
     }
 
@@ -260,15 +262,23 @@ static void dispatch_probes(Monitor *mon) {
 
     probe_scheduler_remove_dev(ctx->probe_scheduler, task.dev);
 
+    /* 最后两次重试使用更长的探测超时，降低元数据风暴期间的误判 */
+    int timeout_sec = PROBE_TIMEOUT_SEC;
+    if (task.retry_count + 1 >= PROBE_MAX_RETRIES - 1) {
+        timeout_sec = PROBE_TIMEOUT_SEC * 3;
+    }
+
     pid_t pid = fork();
     if (pid == 0) {
-        alarm(PROBE_TIMEOUT_SEC);
+        alarm(timeout_sec);
         struct stat st;
         (void)lstat(task.probe_path, &st);
         _exit(0);
     } else if (pid > 0) {
         mon->active_probe_pid = pid;
         mon->active_probe_dev = task.dev;
+        mon->active_probe_retry_count = task.retry_count;
+        mon->active_probe_interval = task.probe_interval;
     }
 }
 
@@ -295,25 +305,58 @@ static void reap_probes(Monitor *mon) {
             dev_mgr_mark_alive(ctx->dev_mgr, mon->active_probe_dev);
             spbin_requeue_recovered(ctx, mon->active_probe_dev);
         } else {
-            ProbeTask task = {0};
-            task.dev = mon->active_probe_dev;
-            task.probe_interval = PROBE_INTERVAL_INITIAL;
-            task.next_probe_time = time(NULL) + PROBE_INTERVAL_INITIAL;
-            task.retry_count = 0;
-            task.s_status = SP_STATUS_PROBING;
+            /* 真正指数退避：保留并递增 retry_count，翻倍 probe_interval */
+            uint32_t next_retry = mon->active_probe_retry_count + 1;
+            uint32_t next_interval = mon->active_probe_interval * 2;
+            if (next_interval > PROBE_INTERVAL_MAX)
+                next_interval = PROBE_INTERVAL_MAX;
 
-            for (size_t i = 0; i < ctx->spbin_count; i++) {
-                if (ctx->spbin_entries[i].dev == mon->active_probe_dev) {
-                    safe_strcpy(task.probe_path, ctx->spbin_entries[i].path, sizeof(task.probe_path));
-                    break;
+            if (next_retry >= PROBE_MAX_RETRIES) {
+                /* 达到最大重试次数，判死 */
+                dev_mgr_mark_condemned(ctx->dev_mgr, mon->active_probe_dev);
+                for (size_t i = 0; i < ctx->spbin_count; i++) {
+                    if (ctx->spbin_entries[i].dev == mon->active_probe_dev) {
+                        ctx->spbin_entries[i].s_status = SP_STATUS_CONDEMNED;
+                    }
                 }
+                log_error("[Probe] dev %lu condemned after %u retries",
+                          (unsigned long)mon->active_probe_dev, next_retry);
+
+                /* 任选一条路径记录到熔断清单 */
+                for (size_t i = 0; i < ctx->spbin_count; i++) {
+                    if (ctx->spbin_entries[i].dev == mon->active_probe_dev) {
+                        circuit_breaker_record(ctx, "CONDEMNED",
+                                               ctx->spbin_entries[i].path,
+                                               mon->active_probe_dev,
+                                               (int)next_retry);
+                        break;
+                    }
+                }
+            } else {
+                ProbeTask task = {0};
+                task.dev = mon->active_probe_dev;
+                task.probe_interval = next_interval;
+                task.next_probe_time = time(NULL) + next_interval;
+                task.retry_count = next_retry;
+                task.s_status = SP_STATUS_PROBING;
+
+                for (size_t i = 0; i < ctx->spbin_count; i++) {
+                    if (ctx->spbin_entries[i].dev == mon->active_probe_dev) {
+                        safe_strcpy(task.probe_path, ctx->spbin_entries[i].path, sizeof(task.probe_path));
+                        break;
+                    }
+                }
+                probe_scheduler_push(ctx->probe_scheduler, &task);
+                log_warn_v(202607280930UL, "[Probe] dev %lu retry %u scheduled after %us",
+                           (unsigned long)mon->active_probe_dev, next_retry, next_interval);
             }
-            probe_scheduler_push(ctx->probe_scheduler, &task);
         }
     }
 
     mon->active_probe_pid = -1;
     mon->active_probe_dev = 0;
+    mon->active_probe_retry_count = 0;
+    mon->active_probe_interval = 0;
 }
 
 /* ================================================================

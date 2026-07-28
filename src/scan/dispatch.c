@@ -15,6 +15,7 @@
 #include "msg_queue.h"
 #include "ipc_thread.h"
 #include "dispatch_queue.h"
+#include "circuit_breaker.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -189,6 +190,7 @@ static bool circuit_breaker_check(AppContext *ctx, int wid, const char *path) {
     if (ctx->timeout_counts[wid] >= CIRCUIT_BREAKER_THRESHOLD) {
         log_warn_v(202607030000UL, "[CircuitBreaker] Path timed out %d times, skipping: %s",
                    ctx->timeout_counts[wid], path_log_mask(path));
+        circuit_breaker_record(ctx, "PATH_TIMEOUT", path, 0, ctx->timeout_counts[wid]);
         return true; /* 熔断：不再重试 */
     }
     return false; /* 未熔断：允许重试 */

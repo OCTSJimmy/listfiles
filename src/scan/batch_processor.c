@@ -14,6 +14,7 @@
 #include "msg_format.h"
 #include "msg_queue.h"
 #include "ipc_thread.h"
+#include "circuit_breaker.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -123,8 +124,12 @@ void batch_dedup_worker(TPBatch *batch, void *user_data) {
                 result |= 1; /* duplicate */
             }
         }
-        if (dev_mgr_is_blacklisted(ctx->dev_mgr, st->st_dev)) {
-            result |= 2; /* blacklisted */
+        /* v15.5.6: 单挂载保护——与根路径同设备时禁用设备级跳过，
+         * 防止 NFS 单挂载点因个别目录超时被整体熔断。 */
+        if (st->st_dev != ctx->state.root_dev) {
+            if (dev_mgr_is_blacklisted(ctx->dev_mgr, st->st_dev)) {
+                result |= 2; /* blacklisted */
+            }
         }
         batch->results[i] = result;
     }
@@ -169,6 +174,7 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
         if (result & 1) continue; /* duplicate */
         if (result & 2) {
             ctx->state.has_error = true;
+            circuit_breaker_record(ctx, "BLACKLIST", path, st->st_dev, 0);
             continue; /* blacklisted */
         }
 

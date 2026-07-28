@@ -6,7 +6,7 @@
 
 ## 版本
 
-当前设计版本：**v15.5.2**（SEDA dispatch_queue + pbin/dpbin 差集恢复 + pbin 滑动窗口背压 + blind-trust 目录排除 + idx 废除）
+当前设计版本：**v15.5.6**（SEDA dispatch_queue + pbin/dpbin 差集恢复 + pbin 滑动窗口背压 + blind-trust 目录排除 + idx 废除 + 熔断清单 + 探测指数退避判死 + dev=0 修复与单挂载保护）
 
 ---
 
@@ -54,6 +54,8 @@
 | **v15.4.3** | **thread_pool completed 链表安全** | `node` malloc 失败泄漏 batch、`completed` 链表自循环、`destroy` 无限 drain | malloc 失败释放 batch、自循环检测+断开、drain 安全上限 |
 | **v15.4.5** | **IPC FSM BATCH Footer 读取协议修复** | v15.4.0 FSM 中 PAYLOAD 阶段读完含 Footer 的全部 payload，FOOTER 阶段再读 8B 时管道已空超时 | PAYLOAD 只读 `payload_len-8` body；FOOTER 单独读 8B 验证后复制到 buf 末尾 |
 | **v15.5.0** | **SEDA dispatch_queue + pbin/dpbin 差集恢复** | `lost_tasks` 是溢出桶不是队列；idx 5 字段是 v12.x patchwork；pending_tasks 语义三处不一致；目录被盲信导致 mtime 不可靠 | `dispatch_queue` Stage 3→4 解耦；`dpbin` 差集恢复废除 idx；`pending_tasks` 统一为成功派发后；目录 `DT_DIR` 硬过滤不盲信 |
+| **v15.5.4** | **熔断清单 + 探测指数退避判死** | 扫描严重不完整但退出码仍为 0；熔断/超时无独立审计记录；探测退避被重置为 0 永不判死；Monitor ANSI 刷屏 | 独立 `.circuit_breaker` 清单文件；`skipped_count` 触发非 0 退出；探针真正指数退避并在 `PROBE_MAX_RETRIES` 后判死；`TERM=dumb` 判断 |
+| **v15.5.6** | **dev=0 修复与单挂载保护** | `IpcErrorHeader.dev` 恒为 0，设备级熔断名存实亡；直接修复又会导致 NFS 单挂载被整体误伤 | `WorkerThreadCtx.current_dev` 记录真实 `st_dev`；`RuntimeState.root_dev` 保护根路径设备不被设备级跳过 |
 ---
 
 ## v13.0.0：IPC 线程隔离
@@ -599,6 +601,102 @@ FSM 永远卡在 `IPC_READ_FOOTER` 状态，BATCH 数据被锁死在 IPC 线程�
 
 - `src/ipc/ipc_message_handler.c` — `read_data_message()` PAYLOAD/FOOTER 阶段边界修正
 - `include/core/config.h` — 版本号 15.4.5
+
+---
+
+## v15.5.4：熔断清单 + 探测指数退避判死
+
+### 问题背景
+
+生产环境（NFS hard 挂载 + 高元数据负载）多次观察到扫描覆盖率剧烈波动（47% → 14%），但工具仍返回退出码 0、生成 `SCAN_COMPLETE.flag`、chunk 校验 PASS。根因是多层静默失败叠加：
+
+1. **熔断/超时无独立审计记录**：`ETIMEDOUT/EIO`、黑名单命中、路径级熔断跳过均只依赖日志，且部分日志被版本化阈值默认静默。
+2. **探测退避被重置**：`reap_probes()` 每次探测失败后把 `retry_count` 重置为 0、`probe_interval` 重置为 5s，导致永远无法到达判死条件。
+3. **Monitor 刷屏**：`\033[2J\033[H` 在 `TERM=dumb` 或日志重定向场景下无限滚动。
+
+### 修复
+
+#### 1. 独立熔断清单 `{progress_base}.circuit_breaker`
+
+- 新增 `circuit_breaker_init/record/close` 模块，以追加模式打开 `{progress_base}.circuit_breaker`。
+- 每次因 `BLACKLIST` / `DEV_TIMEOUT` / `EIO` / `PATH_TIMEOUT` / `CONDEMNED` 跳过路径时，写入一行 TSV：`timestamp\treason\tpath\tdev\tretry_count`，立即 `fflush`。
+- 即使文件无法打开，也原子累加 `RuntimeState.skipped_count`，保证退出码非 0。
+
+#### 2. 退出码与退出警示
+
+- `main()` 结束阶段检查 `skipped_count > 0`：
+  - 向 `stderr` 输出 `[CRITICAL] 扫描不完整：已跳过 N 个路径。详见 {progress_base}.circuit_breaker`
+  - 设置 `state.has_error = true`，`finalize_progress()` 写入 `status=Incomplete`、`error=DeviceMeltdown`
+  - 返回退出码 1
+
+#### 3. 探测真正指数退避 + 判死
+
+- `dispatch_probes()` 保存当前探测任务的 `retry_count` / `probe_interval`。
+- `reap_probes()` 探测失败后：
+  - `retry_count++`
+  - `probe_interval *= 2`（上限 `PROBE_INTERVAL_MAX=300s`）
+  - `retry_count >= PROBE_MAX_RETRIES`（默认 6）时调用 `dev_mgr_mark_condemned()`，并将对应 `spbin_entries` 状态置为 `SP_STATUS_CONDEMNED`
+  - 最后两次重试使用 `PROBE_TIMEOUT_SEC * 3`（15s）超时，降低元数据风暴期间的误判
+- 判死事件同步写入 `.circuit_breaker`。
+
+#### 4. Monitor 刷屏最小修复
+
+- 仅在 `isatty(stdout) && TERM != dumb` 时发送 `\033[2J\033[H`。
+- 管道/日志场景用户自行使用 `--mute`。
+
+### 修改的文件
+
+- `include/core/circuit_breaker.h` — 新增
+- `src/core/circuit_breaker.c` — 新增
+- `include/core/config.h` — 版本号 15.5.4 / `LOG_VERSION_CODE` / `skipped_count`
+- `include/core/app_context.h` — 增加 `circuit_breaker_fp` / `circuit_breaker_mutex`
+- `include/scan/probe_scheduler.h` — 增加 `PROBE_MAX_RETRIES`
+- `include/output/monitor.h` — 增加探测任务状态字段
+- `src/scan/batch_processor.c` — 黑名单命中时记录清单
+- `src/scan/main_loop.c` — `ETIMEDOUT/EIO` 时记录清单
+- `src/scan/dispatch.c` — 路径级熔断触发时记录清单
+- `src/output/monitor.c` — `TERM` 判断 + 指数退避 + 判死
+- `src/core/main.c` — 清单初始化/关闭、退出警示、退出码
+
+---
+
+## v15.5.6：dev=0 修复与单挂载保护
+
+### 问题背景
+
+v15.5.4 引入的熔断清单已能记录跳过路径，但 `IpcErrorHeader.dev` 仍被硬编码为 0，导致：
+
+- 清单中 `dev` 列无审计价值；
+- 设备级熔断逻辑名存实亡（标记的是 dev=0，而非真实 `st_dev`）。
+
+若直接修复 dev=0，NFS 单挂载点下一旦有一个目录超时，整个挂载点会被 `dev_mgr_is_blacklisted()` 跳过，覆盖率可能直接归零。因此必须同时做单挂载保护。
+
+### 修复
+
+#### 1. 正确上报真实 `st_dev`
+
+- `include/scan/worker_scanner.h`：`WorkerThreadCtx` 增加 `current_dev` 字段
+- `src/ipc/worker_proc.c`：收到 SCAN 任务时初始化 `current_dev`；DEV_TIMEOUT 上报时使用 `ctx.current_dev`
+- `src/scan/worker_scanner.c`：`scan_and_send()` 中 `lstat` 成功后设置 `task->current_dev = dir_st.st_dev`；`send_error_and_empty_batch()` 填充真实 `st_dev`
+
+#### 2. 单挂载保护
+
+- `include/core/config.h`：`RuntimeState` 增加 `root_dev`
+- `src/core/main.c`：扫描根路径后记录 `ctx.state.root_dev = root_info.st_dev`
+- `src/scan/batch_processor.c`：仅当 `st->st_dev != ctx->state.root_dev` 时才调用 `dev_mgr_is_blacklisted()`；与根路径同设备时跳过设备级熔断检查
+
+#### 3. 熔断清单 dev 列恢复真实值
+
+修复后 `.circuit_breaker` 中的 `dev` 列记录真实 `st_dev`，便于多设备场景定位问题。
+
+### 修改的文件
+
+- `include/core/config.h` — 版本号 15.5.6 / `root_dev`
+- `include/scan/worker_scanner.h` — `WorkerThreadCtx.current_dev`
+- `src/ipc/worker_proc.c` — `current_dev` 初始化与 DEV_TIMEOUT 上报
+- `src/scan/worker_scanner.c` — `send_error_and_empty_batch()` 上报真实 dev；`scan_and_send()` 设置 `current_dev`
+- `src/core/main.c` — `root_dev` 记录
+- `src/scan/batch_processor.c` — `root_dev` 单挂载保护
 
 ---
 

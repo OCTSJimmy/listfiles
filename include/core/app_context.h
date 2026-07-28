@@ -124,6 +124,10 @@ typedef struct AppContext {
     char timeout_paths[8][4096];   /* 每个 Worker slot 最近 timeout 的路径 */
     int  timeout_counts[8];        /* 该路径连续 timeout 次数 */
 
+    /* === 熔断清单 === */
+    FILE           *circuit_breaker_fp;
+    pthread_mutex_t circuit_breaker_mutex;
+
 } AppContext;
 
 #endif

@@ -3,6 +3,23 @@
 > 目标：为所有 .c 文件添加简体中文注释，包括文件头注释和函数注释（参数类型、作用、取值范围、返回值类型、作用、取值范围）。
 > 忽略：.git/ 目录、.gitignore 中列出的目录/文件。
 
+---
+
+## v15.5.4 已修复项（2026-07-28）
+
+- [x] **熔断清单**：新增 `{progress_base}.circuit_breaker` 独立审计文件，记录所有 `BLACKLIST` / `DEV_TIMEOUT` / `EIO` / `PATH_TIMEOUT` / `CONDEMNED` 跳过路径。
+- [x] **退出码与警示**：只要 `skipped_count > 0`，程序返回退出码 1，`stderr` 输出 `[CRITICAL] 扫描不完整...`，`.config` 写入 `Incomplete`。
+- [x] **探测指数退避判死**：修复 `reap_probes()` 每次失败后重置 `retry_count` 的问题；`probe_interval` 真正翻倍（上限 300s），达到 `PROBE_MAX_RETRIES`（6 次）后判死 `CONDEMNED`；最后两次重试使用 15s 超时。
+- [x] **Monitor 刷屏**：`TERM=dumb` 或非 tty 时不再发送 `\033[2J\033[H`。
+
+## v15.5.4 待办项
+
+- [x] **DEV_TIMEOUT/EIO 上报 dev=0 修复**：Worker/IPC 层正确传递当前任务的 `st_dev` 到 `IpcErrorHeader.dev`（v15.5.6 完成）。
+- [x] **单挂载 NFS 设备熔断保护**：`RuntimeState.root_dev` 记录根路径设备号，`batch_processor` 中与根路径同设备时禁用设备级跳过（v15.5.6 完成）。
+- [ ] **熔断清单入仓**：把 `.circuit_breaker` 结构化导入 CK 元表，供运维分析（路线 C3）。
+
+---
+
 ## 模块划分与进度
 
 ### 1. 工具与杂项模块 ✅

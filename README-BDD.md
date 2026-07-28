@@ -1,6 +1,6 @@
 # listfiles — 行为驱动开发 (BDD) 规格说明
 
-> 版本: 15.4.5  
+> 版本: 15.5.6  
 > 语言: C11 (GNU11)  
 > 平台: Linux (依赖 fork, epoll, pipe2, pthread)
 
@@ -779,6 +779,91 @@ Feature: 响应系统信号
 
 ---
 
+## 9. 熔断审计与失败可见性（v15.5.4）
+
+### Feature: 熔断清单
+
+```gherkin
+Feature: 熔断清单
+  As a 系统管理员
+  I want 所有因熔断/超时/EIO 被跳过的路径写入独立清单文件
+  So that 我可以事后审计扫描完整性
+
+  Background:
+    Given 用户指定了 --progress-file=task1
+    And 程序创建了 task1.circuit_breaker 清单文件
+
+  Scenario: 设备黑名单跳过
+    Given Worker 在 dev 上遇到 ETIMEDOUT/EIO
+    When Master 收到 IPC_MSG_ERROR 并标记 dev 为 DEAD
+    Then task1.circuit_breaker 应记录一行 DEV_TIMEOUT/EIO
+    And 后续命中 dev_mgr_is_blacklisted() 的路径应记录 BLACKLIST
+
+  Scenario: 路径级熔断跳过
+    Given 同一个 Worker slot 连续超时同一目录 3 次
+    When circuit_breaker_check() 触发熔断
+    Then task1.circuit_breaker 应记录一行 PATH_TIMEOUT
+    And 该路径不再重新入队
+
+  Scenario: 设备判死
+    Given 探测指数退避达到 PROBE_MAX_RETRIES
+    When Monitor 将该 dev 标记为 CONDEMNED
+    Then task1.circuit_breaker 应记录一行 CONDEMNED
+    And 对应 spbin_entries 状态更新为 SP_STATUS_CONDEMNED
+```
+
+### Feature: 单挂载保护（v15.5.6）
+
+```gherkin
+Feature: 单挂载保护
+  As a 系统管理员
+  I want NFS 单挂载点扫描时不因个别目录超时而整体跳过
+  So that 扫描覆盖率不会因设备级熔断误伤而崩溃
+
+  Background:
+    Given 用户指定了扫描目标路径
+    And 程序记录 root_dev 为该路径所在设备号
+
+  Scenario: 与根路径同设备时禁用设备级熔断
+    Given 扫描目标为 NFS 单挂载点
+    And 某个目录触发 ETIMEDOUT/EIO
+    When Master 收到 IPC_MSG_ERROR 并标记真实 st_dev 为 DEAD
+    Then 后续与根路径同设备的文件/目录不应被 dev_mgr_is_blacklisted() 跳过
+    And 这些路径应正常输出到 chunk 清单
+    And 但超时目录仍受路径级熔断保护（连续 3 次后跳过）
+
+  Scenario: 多设备场景保留设备级熔断
+    Given 扫描目标跨越多个 st_dev
+    And 某个非根设备触发 ETIMEDOUT/EIO
+    When Master 标记该设备为 DEAD
+    Then 后续该设备上的文件/目录应被设备级熔断跳过
+    And 根设备上的路径不受影响
+```
+
+### Feature: 退出码与失败可见性
+
+```gherkin
+Feature: 退出码与失败可见性
+  As a 系统管理员
+  I want 扫描不完整时程序返回非 0 退出码并输出警示
+  So that 下游管线不会误把不完整清单当作全量清单消费
+
+  Scenario: 有跳过记录时返回非 0
+    Given 扫描过程中产生了任意 .circuit_breaker 记录
+    When 程序结束
+    Then stderr 应输出 [CRITICAL] 扫描不完整：已跳过 N 个路径。详见 {progress_base}.circuit_breaker
+    And 退出码应为 1
+    And {progress_base}.config 应写入 status=Incomplete
+
+  Scenario: 无跳过记录时正常退出
+    Given 扫描过程中未产生任何 .circuit_breaker 记录
+    When 程序结束
+    Then 退出码应为 0
+    And {progress_base}.config 应写入 status=Success
+```
+
+---
+
 ## 附录 A: 核心模块职责映射
 
 | 模块 (文件) | BDD 领域 | 核心行为 |
@@ -798,6 +883,7 @@ Feature: 响应系统信号
 | `thread_pool` | CPU 去重 | Given batch，Then 异步计算指纹和黑名单检查 |
 | `async_worker` | 输出流水线 | Given OutputBatch，Then 批量入队、异步格式化写入 |
 | `progress` | 进度持久化 | Given 记录，Then 写入 pbin/spbin 并更新 idx |
+| `circuit_breaker` | 熔断审计 | Given 跳过事件，Then 写入 .circuit_breaker 清单并累加 skipped_count |
 | `output` | 格式化引擎 | Given 路径+stat+格式模板，Then 输出到流 |
 | `signals` | 信号处理 | Given SIGINT/SIGTERM，Then 设置退出标志 |
 | `utils` | 基础设施 | Given 内存请求，Then 安全分配或 fatal 退出 |
@@ -820,7 +906,9 @@ Feature: 响应系统信号
 ```
 [NORMAL] --(ETIMEDOUT/EIO)--> [DEAD] --(probe success)--> [NORMAL]
                                     |
-                                    +--(probe fail xN)--> [CONDEMNED]
+                                    +--(probe fail, retry_count++,
+                                        interval *= 2 up to 300s,
+                                        retry_count >= 6)--> [CONDEMNED]
 ```
 
 ---

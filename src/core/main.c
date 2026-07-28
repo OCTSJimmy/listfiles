@@ -19,6 +19,7 @@
 #include "log.h"
 #include "msg_format.h"
 #include "msg_queue.h"
+#include "circuit_breaker.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +90,7 @@ static void app_context_destroy(AppContext *ctx) {
         dev_mgr_destroy(ctx->dev_mgr);
         ctx->dev_mgr = NULL;
     }
+    circuit_breaker_close(ctx);
     if (ctx->visited_set) {
         fp_set_destroy(ctx->visited_set);
         ctx->visited_set = NULL;
@@ -370,10 +372,12 @@ int main(int argc, char *argv[]) {
     init_output_files(&ctx.cfg, &ctx.state);
     init_output_buffers(&ctx);
     ctx.async_writer = async_worker_init(&ctx.cfg, &ctx.state);
+    circuit_breaker_init(&ctx);
 
     /* Seed root task */
     struct stat root_info;
     if (lstat(ctx.cfg.target_path, &root_info) == 0) {
+        ctx.state.root_dev = root_info.st_dev;  /* v15.5.6: 单挂载保护基准 */
         if (S_ISDIR(root_info.st_mode)) {
             atomic_fetch_add(&ctx.pending_tasks, 1);
             WorkerSlot *slot = ctx.worker_pool->slots;
@@ -426,6 +430,13 @@ int main(int argc, char *argv[]) {
 
     if (!ctx.cfg.mute) {
         log_info("任务完成。耗时: %ld 秒", time(NULL) - ctx.state.start_time);
+    }
+
+    if (ctx.state.skipped_count > 0) {
+        fprintf(stderr,
+                "[CRITICAL] 扫描不完整：已跳过 %lu 个路径。详见 %s.circuit_breaker\n",
+                ctx.state.skipped_count, ctx.cfg.progress_base);
+        ctx.state.has_error = true;
     }
 
     finalize_progress(&ctx.cfg, &ctx.state);

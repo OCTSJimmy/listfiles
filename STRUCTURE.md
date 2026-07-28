@@ -16,6 +16,7 @@ listfiles/
 ├── include/                # Header files (grouped by module)
 │   ├── core/               # Core framework
 │   │   ├── app_context.h
+│   │   ├── circuit_breaker.h
 │   │   ├── cmdline.h
 │   │   ├── config.h
 │   │   ├── signals.h
@@ -52,6 +53,7 @@ listfiles/
 ├── src/                    # Source files (mirrors include/ structure)
 │   ├── core/
 │   │   ├── main.c
+│   │   ├── circuit_breaker.c
 │   │   ├── cmdline.c
 │   │   ├── signals.c
 │   │   └── utils.c

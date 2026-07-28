@@ -17,6 +17,7 @@
 #include "msg_queue.h"
 #include "ipc_thread.h"
 #include "dispatch_queue.h"
+#include "circuit_breaker.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -128,6 +129,9 @@ void main_loop_handle_error(AppContext *ctx, int worker_id, const IpcErrorHeader
         dev_t dev = (dev_t)err->dev;
         log_error("[Monitor] Worker error on dev %lu: %s (errno=%d)",
                 (unsigned long)dev, path, err->errno_code);
+
+        const char *reason = (err->errno_code == ETIMEDOUT) ? "DEV_TIMEOUT" : "EIO";
+        circuit_breaker_record(ctx, reason, path, dev, 0);
 
         if (dev_mgr_get_state(ctx->dev_mgr, dev) != DEV_STATE_DEAD) {
             dev_mgr_mark_dead(ctx->dev_mgr, dev);

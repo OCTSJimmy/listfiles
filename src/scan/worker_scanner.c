@@ -224,15 +224,17 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
  * @brief  发送设备级错误通知并追加空批次
  * @param  fd_out    int          输出文件描述符，取值范围: >= 0 的可写 fd
  * @param  err_code  int          错误码，取值范围: ETIMEDOUT(110)、EIO(5) 等系统 errno
+ * @param  dev       dev_t        当前任务所在设备号
  * @param  path      const char*  发生错误的文件/目录路径，不能为空
  * @return void
  *
  * @note   仅在 err_code 为 ETIMEDOUT 或 EIO 时发送 IPC_MSG_ERROR，
  *         其他错误码仅发送空批次。空批次确保 Master 正确递减 pending_tasks。
+ *         v15.5.6: 填充真实 st_dev，修复之前硬编码 dev=0 的问题。
  */
-static void send_error_and_empty_batch(int fd_out, int err_code, const char *path) {
+static void send_error_and_empty_batch(int fd_out, int err_code, dev_t dev, const char *path) {
     if (err_code == ETIMEDOUT || err_code == EIO) {
-        IpcErrorHeader eh = { (uint32_t)err_code, 0 };
+        IpcErrorHeader eh = { (uint32_t)err_code, (uint64_t)dev };
         uint32_t plen = (uint32_t)strlen(path);
         uint8_t *buf = malloc(sizeof(eh) + sizeof(plen) + plen);
         if (buf) {
@@ -265,11 +267,14 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
     struct stat dir_st;
     if (lstat(dir_path, &dir_st) != 0) {
         log_warn("[W%d-Scanner] lstat failed on %s: %s", worker_id, dir_path, strerror(errno));
-        send_error_and_empty_batch(fd_out, errno, dir_path);
+        send_error_and_empty_batch(fd_out, errno, task->current_dev, dir_path);
         return;
     }
 
     uint64_t dir_dev = dir_st.st_dev;
+    /* v15.5.6: 记录当前任务真实设备号，供 DEV_TIMEOUT 准确上报 */
+    task->current_dev = dir_st.st_dev;
+
     int batch_size = 1024;
     if (g_worker_cfg && g_worker_cfg->batch_size > 0)
         batch_size = g_worker_cfg->batch_size;
@@ -281,7 +286,7 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
     DIR *dir = opendir(dir_path);
     if (!dir) {
         log_warn("[W%d-Scanner] opendir failed on %s: %s", worker_id, dir_path, strerror(errno));
-        send_error_and_empty_batch(fd_out, errno, dir_path);
+        send_error_and_empty_batch(fd_out, errno, dir_dev, dir_path);
         goto cleanup;
     }
     log_debug_v(202605181600UL, "[W%d-Scanner] opendir success: %s", worker_id, dir_path);

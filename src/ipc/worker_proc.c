@@ -54,6 +54,7 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
         .stop_flag = false,
         .last_progress = time(NULL),
         .scanner_active = false,
+        .current_dev = 0,
     };
     pthread_mutex_init(&ctx.task_mutex, NULL);
     pthread_cond_init(&ctx.task_cond, NULL);
@@ -172,7 +173,7 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
             if (difftime(now, scanner_last) > timeout_sec) {
                 log_error_v(202607030000UL, "[Worker-%d] Scanner stuck for %ds on %s, reporting to master",
                           worker_id, timeout_sec, ctx.task_path);
-                IpcErrorHeader eh = { ETIMEDOUT, 0 };
+                IpcErrorHeader eh = { ETIMEDOUT, (uint64_t)ctx.current_dev };
                 char stuck_path[4096];
                 pthread_mutex_lock(&ctx.task_mutex);
                 strncpy(stuck_path, ctx.task_path, sizeof(stuck_path) - 1);

@@ -10,6 +10,7 @@
 #define PROBE_TIMEOUT_SEC       5
 #define PROBE_INTERVAL_INITIAL  5
 #define PROBE_INTERVAL_MAX      300
+#define PROBE_MAX_RETRIES       6   /* 指数退避最大重试次数，之后判死 */
 
 typedef struct {
     dev_t    dev;

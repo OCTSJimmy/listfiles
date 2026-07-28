@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <time.h>
 #include <pthread.h>
+#include <sys/types.h>
 #include "config.h"
 #include "fingerprint_set.h"
 #include "reference_map.h"
@@ -26,6 +27,9 @@ typedef struct {
     pthread_mutex_t progress_mutex;
     time_t last_progress;
     bool   scanner_active;
+
+    /* v15.5.6: 当前任务所在设备号，用于 DEV_TIMEOUT/EIO 准确上报 */
+    dev_t  current_dev;
 } WorkerThreadCtx;
 
 /* 设置 Worker 只读上下文（fork 前由主进程调用） */

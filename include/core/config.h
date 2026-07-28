@@ -16,8 +16,8 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.5.3"
-#define VERSION_CODE 202607061400UL
+#define VERSION "15.5.6"
+#define VERSION_CODE 202607281000UL
 #define MAX_PATH_LENGTH 4088 // v15.4.1: PIPE_BUF(4096) - sizeof(IpcMessageHeader)(8) = 4088, ensure atomic pipe writes
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
@@ -211,6 +211,8 @@ typedef struct {
     FILE *progress_file, *index_file;
     int lock_fd;
     unsigned long line_count, processed_count, dir_count, file_count, total_dequeued_count;
+    unsigned long skipped_count;  /* 因熔断/超时/EIO 被跳过的路径总数 */
+    dev_t root_dev;               /* 扫描根路径所在设备号，用于单挂载保护 */
     UserCacheEntry *uid_cache[UID_CACHE_SIZE];
     size_t uid_cache_count;
     GroupCacheEntry *gid_cache[GID_CACHE_SIZE];
