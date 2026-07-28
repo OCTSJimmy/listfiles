@@ -185,16 +185,19 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                  * to recover sub-directories lost in the previous interrupted run. */
             }
             /* v15.5.0: Stage 3 only pushes to dispatch_queue; Stage 4 consumes */
-            /* v15.5.1: pbin sliding window — stop pushing when queue reaches HIGH_WATER */
-            if (dispatch_queue_count(&ctx->dispatch_queue) < DISPATCH_QUEUE_HIGH_WATER) {
+            /* v15.5.8: HIGH_WATER 跳推改投 dspill 兜底文件（原 pbin 滑动窗口已废——
+             * 已封口 pbin 分片会被 process_old_slice 轮转删除，加载器游标追到被删
+             * 分片后永久卡死，跳推目录随之静默丢失）。无 progress_base 时无兜底
+             * 通道，宁可队列膨胀也不丢目录。 */
+            if (dispatch_queue_count(&ctx->dispatch_queue) < DISPATCH_QUEUE_HIGH_WATER
+                || !ctx->cfg.progress_base) {
                 char *dup = strdup(path);
                 if (!dispatch_queue_push(&ctx->dispatch_queue, dup, st)) {
                     free(dup);
                 }
+            } else {
+                dspill_append(ctx, path, st);
             }
-            /* If queue is at HIGH_WATER, skip push. Directory is already in pbin via
-             * record_path_batch_append above, and will be loaded by load_dirs_from_pbin
-             * when queue drops to LOW_WATER. */
 
             ctx->state.dir_count++;
             if (ctx->cfg.include_dir) {

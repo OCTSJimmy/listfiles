@@ -66,6 +66,8 @@ void show_help() {
     printf("  -R, --resume-from=文件 仅从指定的进度列表文件恢复 (预留，暂未实现)\n");
     printf("  --max-slice=行数       每个输出切片的最大行数\n");
     printf("      --progress-slice-lines=行数  每个进度分片(pbin)的最大行数 (默认: %d)\n", DEFAULT_PROGRESS_SLICE_LINES);
+    printf("      --strict-nlink     目录完备性校验: readdir 子目录数必须等于 st_nlink-2,\n");
+    printf("                         失配记入熔断清单并非零退出 (v15.5.8, 检测 NFS 无 errno 假空目录)\n");
     printf("  -v, --verbose          启用详细日志\n");
     printf("  --verbose-version=TIMESTAMP  只显示版本号>=TIMESTAMP的日志 (默认: 当前版本)\n");
     printf("  -h, --help             显示此帮助信息\n");
@@ -164,6 +166,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"help", no_argument, 0, 'h'},
         {"verbose-version", required_argument, 0, 27},
         {"progress-slice-lines", required_argument, 0, 28},
+        {"strict-nlink", no_argument, 0, 29},
         {0, 0, 0, 0}
     };
 
@@ -264,6 +267,9 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
                     log_error("progress slice 大小必须大于零");
                     exit(EXIT_FAILURE);
                 }
+                break;
+            case 29: /* v15.5.8: --strict-nlink 目录完备性 oracle */
+                cfg->strict_nlink = true;
                 break;
             case 'h': show_help(); return 2;
             default:

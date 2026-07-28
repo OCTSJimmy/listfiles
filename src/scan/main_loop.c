@@ -66,7 +66,11 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             if (msg->data_len >= sizeof(RetErrorPayload)) {
                 RetErrorPayload *err = (RetErrorPayload*)msg->data;
                 char reason[64];
-                snprintf(reason, sizeof(reason), "ENTRY_ERROR(errno=%u)", err->errno_code);
+                /* v15.5.8: errno_code==0 为 nlink oracle 失配（无 errno 的假空/假 EOF 旁证） */
+                if (err->errno_code == 0)
+                    snprintf(reason, sizeof(reason), "NLINK_MISMATCH");
+                else
+                    snprintf(reason, sizeof(reason), "ENTRY_ERROR(errno=%u)", err->errno_code);
                 circuit_breaker_record(ctx, reason, err->path, (dev_t)err->dev, 0);
             }
             break;
@@ -109,8 +113,14 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             if (msg->data_len >= sizeof(DropPayload)) {
                 DropPayload *drop = (DropPayload*)msg->data;
                 char *dup = strdup(drop->path);
+                /* v15.5.8: 任务派发时已 pending_tasks+1，Worker 拒收（Replacement 窗口）
+                 * 退回队列后将由 dispatch 重新 +1，此处必须销账，否则计数永久泄漏
+                 * （R3 完结面板 pending=4 即此泄漏），完结检查永远无法通过或误判。 */
+                atomic_fetch_sub(&ctx->pending_tasks, 1);
                 if (!dispatch_queue_push(&ctx->dispatch_queue, dup, NULL)) {
-                    log_warn("[Bus] MSG_DROP requeue failed: %s", path_log_mask(drop->path));
+                    /* 队列满/OOM 导致任务真正丢失——记入熔断清单，非零退出码暴露 */
+                    log_error("[Bus] MSG_DROP requeue failed, task LOST: %s", path_log_mask(drop->path));
+                    circuit_breaker_record(ctx, "TASK_DROP_LOST", drop->path, 0, 0);
                     free(dup);
                 }
             }
@@ -377,12 +387,11 @@ void main_loop_run(AppContext *ctx) {
         /* 7. Dispatch from queue */
         dispatch_from_queue(ctx);
 
-        /* 7.5 v15.5.1: pbin sliding window loader — backfill dispatch_queue from pbin
-         * when queue drops below LOW_WATER. This allows batch_processor to stop
-         * pushing at HIGH_WATER without losing directories (they stay in pbin). */
+        /* 7.5 v15.5.8: dspill loader — 队列降到 LOW_WATER 时从兜底文件回填
+         * （替代已废的 pbin 滑动窗口；dspill 仅含 HIGH_WATER 跳推目录） */
         if (dispatch_queue_count(&ctx->dispatch_queue) <= DISPATCH_QUEUE_LOW_WATER
-            && ctx->pbin_queue_cursor.slice <= ctx->state.write_slice_index) {
-            load_dirs_from_pbin(ctx, DISPATCH_QUEUE_LOAD_BATCH);
+            && ctx->dspill_fp) {
+            load_dirs_from_dspill(ctx, DISPATCH_QUEUE_LOAD_BATCH);
         }
 
         /* 8. Termination check */
@@ -390,6 +399,26 @@ void main_loop_run(AppContext *ctx) {
             && atomic_load(&ctx->pending_batches) == 0
             && dispatch_queue_count(&ctx->dispatch_queue) == 0
             && ctx->hist_pump_state == HIST_PUMP_DONE) {
+            /* v15.5.8 完结硬性断言：dspill 兜底文件必须先排空到 EOF。
+             * 游标未到 EOF 说明仍有 HIGH_WATER 跳推目录未回填——回填后继续扫描，
+             * 不得完结；回填无法推进（记录损坏/持续 push 失败）则残留即丢失，
+             * 记熔断清单（skipped_count>0 → 非零退出码），不允许静默成功。 */
+            if (ctx->dspill_fp) {
+                int loaded = load_dirs_from_dspill(ctx, DISPATCH_QUEUE_LOAD_BATCH);
+                if (loaded > 0 || dispatch_queue_count(&ctx->dispatch_queue) > 0)
+                    continue;
+                char *spill_path = get_dspill_filename(ctx->cfg.progress_base);
+                if (spill_path) {
+                    struct stat st;
+                    if (stat(spill_path, &st) == 0 && st.st_size > (off_t)ctx->dspill_read_offset) {
+                        long residue = (long)(st.st_size - (off_t)ctx->dspill_read_offset);
+                        log_error("[MainLoop] DSPILL_RESIDUE: %ld unread bytes in %s — 跳推目录丢失",
+                                  residue, spill_path);
+                        circuit_breaker_record(ctx, "DSPILL_RESIDUE", ctx->cfg.target_path, 0, (int)residue);
+                    }
+                    free(spill_path);
+                }
+            }
             worker_pool_stop_all(ctx->worker_pool);
             stop_all_ipc_threads(ctx);
             ctx->running = false;

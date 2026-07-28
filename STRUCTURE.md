@@ -50,6 +50,10 @@ listfiles/
 │   └── zlib/
 │       ├── zconf.h
 │       └── zlib.h
+├── tests/                  # 回归测试集 (v15.5.8)
+│   ├── inject_readdir.c    # LD_PRELOAD 无 errno 假空/假 EOF 注入 shim
+│   ├── gen_fixture.py      # 已知真值 fixture 生成器（7万条目/深路径/GBK/软链/并发删除）
+│   └── run_regression.sh   # 10 用例回归脚本
 ├── src/                    # Source files (mirrors include/ structure)
 │   ├── core/
 │   │   ├── main.c

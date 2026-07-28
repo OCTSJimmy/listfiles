@@ -25,8 +25,9 @@ int dispatch_find_idle_worker(AppContext *ctx);
 /* Dispatch lost tasks to available workers */
 void dispatch_from_queue(AppContext *ctx);
 
-/* v15.5.1: pbin sliding window loader — backfill dispatch_queue from pbin */
-int load_dirs_from_pbin(AppContext *ctx, int target);
+/* v15.5.8: dspill 派发兜底 — HIGH_WATER 跳推目录追加 / 回填 */
+void dspill_append(AppContext *ctx, const char *path, const struct stat *st);
+int load_dirs_from_dspill(AppContext *ctx, int target);
 
 /* Drain completed batches from thread pool */
 void drain_completed_batches(AppContext *ctx);

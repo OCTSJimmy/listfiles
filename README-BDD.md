@@ -1,6 +1,6 @@
 # listfiles — 行为驱动开发 (BDD) 规格说明
 
-> 版本: 15.5.7  
+> 版本: 15.5.8  
 > 语言: C11 (GNU11)  
 > 平台: Linux (依赖 fork, epoll, pipe2, pthread)
 
@@ -831,6 +831,47 @@ Feature: 熔断清单
     Then 已收集的有效条目正常发送
     And 按目录级错误上报并记录到 task1.circuit_breaker
     And 扫描结束时退出码应为 1
+```
+
+### Feature: dspill 派发兜底与完结断言（v15.5.8）
+
+```gherkin
+Feature: dspill 派发兜底与完结断言
+  As a 系统管理员
+  I want HIGH_WATER 跳推目录有不可删除的兜底通道，且扫描完结前必须排空
+  So that 不再出现"列而未派"的整子树静默丢失
+
+  Scenario: HIGH_WATER 跳推目录经 dspill 兜底
+    Given dispatch_queue 深度达到 DISPATCH_QUEUE_HIGH_WATER
+    When batch_processor 发现新子目录
+    Then 该目录被追加到 {progress_base}.dspill（而非仅写 pbin 进度分片）
+    And 队列降到 DISPATCH_QUEUE_LOW_WATER 时按字节游标从 dspill 回填派发
+
+  Scenario: 完结硬性断言
+    Given 扫描主循环的所有静默完结条件已满足
+    When dspill 文件存在且游标未抵 EOF
+    Then 主循环必须先回填派发，不得完结
+    And 游标无法推进时记录 DSPILL_RESIDUE 到熔断清单
+    And 扫描结束时退出码应为 1
+
+  Scenario: MSG_DROP 回队销账
+    Given Worker 在 Replacement 窗口期拒收任务并回送 MSG_DROP
+    When Master 将任务重新入队
+    Then pending_tasks 应递减 1（重派发时重新递增）
+    And 回队失败（队列满/OOM）时记录 TASK_DROP_LOST 到熔断清单
+
+  Scenario: nlink oracle 捕获无 errno 假空目录（--strict-nlink）
+    Given 用户指定了 --strict-nlink
+    And 某目录 st_nlink-2 为 8 个子目录
+    When readdir 无 errno 假空/假 EOF 导致只读到 0 个子目录
+    Then task1.circuit_breaker 应记录一行 NLINK_MISMATCH
+    And 扫描结束时退出码应为 1
+
+  Scenario: nlink oracle 默认关闭且不误报
+    Given 用户未指定 --strict-nlink
+    When 扫描任意目录树
+    Then 不产生 NLINK_MISMATCH 记录
+    And 纯文件目录的无 errno 截断为已知原理性盲区（须跨运行对账）
 ```
 
 ### Feature: 单挂载保护（v15.5.6）

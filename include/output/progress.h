@@ -41,6 +41,7 @@ char *get_spbin_filename(const char *base);
 char *get_fpbin_slice_filename(const char *base, unsigned long index);
 char *get_fpbin_index_filename(const char *base);
 char *get_dpbin_slice_filename(const char *base, unsigned long index);
+char *get_dspill_filename(const char *base); /* v15.5.8: dspill 派发兜底文件 */
 
 /* Footer 读写与校验 */
 bool write_pbin_footer(FILE *fp, uint64_t row_count);

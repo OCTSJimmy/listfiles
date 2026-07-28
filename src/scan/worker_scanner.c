@@ -327,6 +327,9 @@ static int entry_stat(const char *path, struct stat *st) {
  *             失败（NFS readdir cookie 失效等）此前完全静默，会造成超大目录
  *             部分条目丢失，现按目录级错误上报；
  *         (4) 条目 stat 带 EINTR 重试（最多 3 次）。
+ *         v15.5.8: nlink oracle（--strict-nlink 门控）——readdir 无 errno 假空/假 EOF
+ *         的唯一客户端可检旁证：st_nlink-2 与实际子目录计数不符时以
+ *         errno_code=0 的 ENTRY_ERROR 上报（NLINK_MISMATCH）。
  */
 static void scan_and_send(int fd_out, const char *dir_path, int worker_id, WorkerThreadCtx *task) {
     struct stat dir_st;
@@ -359,6 +362,8 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
     struct dirent *entry;
     int entry_count = 0;
     int readdir_err = 0;
+    unsigned long subdir_count = 0; /* v15.5.8: nlink oracle 直接子目录计数 */
+    int entry_anomalies = 0;        /* v15.5.8: 条目级异常计数（非零时禁用 nlink oracle 防误报） */
     for (;;) {
         errno = 0; /* v15.5.7: 区分 readdir 正常结束与中途出错 */
         entry = readdir(dir);
@@ -397,12 +402,14 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
                  * 被遗漏，上报 Master 记入熔断清单并累加 skipped_count。 */
                 if (errno != ENOENT && errno != ENOTDIR)
                     send_entry_error(task->fd_ctrl, errno, dir_dev, full_path);
+                entry_anomalies++; /* v15.5.8: 条目异常时禁用 nlink oracle，防并发删除误报 */
                 continue;
             }
             got = true;
         }
 
         if (got) {
+            if (S_ISDIR(st.st_mode)) subdir_count++; /* v15.5.8: nlink oracle */
             paths[count] = strdup(full_path);
             stats[count] = st;
             count++;
@@ -427,6 +434,22 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
         closedir(dir);
         send_error_and_empty_batch(fd_out, task->fd_ctrl, readdir_err, dir_dev, dir_path);
         goto cleanup;
+    }
+
+    /* v15.5.8: nlink oracle（--strict-nlink 门控，默认关）。
+     * POSIX: 非空目录的 st_nlink = 2 + 直接子目录数。readdir 全程无 errno 的
+     * "假空/假 EOF"（NFS 协议层静默截断）不产生任何错误码，唯一可客户端观测的
+     * 旁证就是子目录计数与 st_nlink-2 不符。捕获后以 errno_code=0 的
+     * ENTRY_ERROR 上报（Master 侧显示 NLINK_MISMATCH）。
+     * 默认关闭的原因：NFS/btrfs 等文件系统 nlink 语义不可靠，且扫描期间目录
+     * 被并发增删子目录会造成误报；entry_anomalies/readdir_err 非零时同样禁用。 */
+    if (g_worker_cfg && g_worker_cfg->strict_nlink && entry_anomalies == 0
+        && dir_st.st_nlink >= 2
+        && (unsigned long)(dir_st.st_nlink - 2) != subdir_count) {
+        log_warn("[W%d-Scanner] NLINK_MISMATCH on %s: st_nlink=%lu (expect %lu subdirs) but readdir saw %lu",
+                 worker_id, dir_path, (unsigned long)dir_st.st_nlink,
+                 (unsigned long)(dir_st.st_nlink - 2), subdir_count);
+        send_entry_error(task->fd_ctrl, 0 /* NLINK_MISMATCH */, dir_dev, dir_path);
     }
 
     if (count > 0) {

@@ -261,82 +261,112 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
 }
 
 /* ================================================================
- * v15.5.1: pbin sliding window loader for dispatch_queue backpressure
+ * v15.5.8: dspill 派发兜底（运行级追加文件，替代 pbin 滑动窗口）
  * ================================================================ */
 
 /**
- * @brief  从 pbin 切片加载目录到 dispatch_queue（滑动窗口回填）
- * @param  ctx    AppContext*  应用上下文指针
- * @param  target int          目标加载的目录数量
- * @return int    实际加载的目录数量
+ * @brief  将 HIGH_WATER 跳推的目录追加到 dspill 兜底文件
+ * @param  ctx   AppContext*        应用上下文
+ * @param  path  const char*        目录路径，不能为空
+ * @param  st    const struct stat* 目录 stat，允许为 NULL
+ * @return void
  *
- * @note   当 dispatch_queue 降到 LOW_WATER 时由 main_loop 触发。
- *         从 pbin_queue_cursor 开始顺序读取 pbin 记录，仅加载 DT_DIR 条目。
- *         已封口的切片读完后自动切换到下一切片；活跃切片读到 EOF 停止。
- *         加载的目录已在 pbin 中存在，不会与 batch_processor 的 push 重复。
+ * @note   懒打开 {base}.dspill（"ab"），复用 pbin 记录格式；每条追加后 fflush
+ *         （write 页缓存，非 fsync），保证加载器立即可见。
+ *         兜底文件不可用时记入熔断清单并强行入队——宁可队列膨胀也不丢目录。
+ *         由 batch_processor（线程池线程）调用，与主线程的加载器经 dspill_mutex 互斥。
  */
-int load_dirs_from_pbin(AppContext *ctx, int target) {
+void dspill_append(AppContext *ctx, const char *path, const struct stat *st) {
+    if (!ctx || !path || !ctx->cfg.progress_base) return;
+
+    pthread_mutex_lock(&ctx->dspill_mutex);
+    if (!ctx->dspill_fp) {
+        char *spill_path = get_dspill_filename(ctx->cfg.progress_base);
+        ctx->dspill_fp = fopen(spill_path, "ab");
+        free(spill_path);
+        if (!ctx->dspill_fp) {
+            circuit_breaker_record(ctx, "DSPILL_IO", path, st ? st->st_dev : 0, 0);
+            char *dup = strdup(path);
+            if (!dispatch_queue_push(&ctx->dispatch_queue, dup, st)) {
+                free(dup);
+            }
+            pthread_mutex_unlock(&ctx->dspill_mutex);
+            return;
+        }
+        setvbuf(ctx->dspill_fp, NULL, _IOFBF, 64 * 1024);
+    }
+
+    write_pbin_record(ctx->dspill_fp, path, st);
+    fflush(ctx->dspill_fp);
+    ctx->dspill_appended++;
+    pthread_mutex_unlock(&ctx->dspill_mutex);
+}
+
+/**
+ * @brief  从 dspill 兜底文件回填目录到 dispatch_queue
+ * @param  ctx     AppContext*  应用上下文
+ * @param  target  int          本次最多回填的目录数量
+ * @return int     实际回填的目录数量；0 表示已消费到 EOF
+ *
+ * @note   按 dspill_read_offset 字节游标顺序读取；游标只在记录成功入队后前进，
+ *         入队失败（队列满）时回退游标，记录不得丢失（v15.5.1 游标越记丢失教训）。
+ *         dspill 为运行级追加文件，无分片轮转、无删除竞争。
+ */
+int load_dirs_from_dspill(AppContext *ctx, int target) {
     if (!ctx || target <= 0) return 0;
-    const Config *cfg = &ctx->cfg;
-    RuntimeState *state = &ctx->state;
+
+    pthread_mutex_lock(&ctx->dspill_mutex);
+    if (!ctx->dspill_fp) {
+        pthread_mutex_unlock(&ctx->dspill_mutex);
+        return 0;
+    }
+
+    fflush(ctx->dspill_fp); /* 确保写缓冲对读端可见 */
+
+    char *spill_path = get_dspill_filename(ctx->cfg.progress_base);
+    FILE *fp = fopen(spill_path, "rb");
+    free(spill_path);
+    if (!fp) {
+        pthread_mutex_unlock(&ctx->dspill_mutex);
+        return 0;
+    }
+
+    if (fseek(fp, ctx->dspill_read_offset, SEEK_SET) != 0) {
+        fclose(fp);
+        pthread_mutex_unlock(&ctx->dspill_mutex);
+        return 0;
+    }
 
     int loaded = 0;
     while (loaded < target) {
-        /* 如果 cursor 超过了活跃切片，说明 pbin 中暂无可加载的新记录 */
-        if (ctx->pbin_queue_cursor.slice > state->write_slice_index) {
-            break;
+        long rec_start = ftell(fp);
+        char *path = NULL;
+        struct stat st;
+        unsigned char d_type;
+
+        if (!read_next_pbin_record(fp, &path, &st, &d_type)) {
+            break; /* EOF 或尾部不完整记录（追加中） */
         }
+        ctx->dspill_read_offset = ftell(fp);
 
-        char *slice_path = get_slice_filename(cfg->progress_base, ctx->pbin_queue_cursor.slice);
-        FILE *fp = fopen(slice_path, "rb");
-        free(slice_path);
-        if (!fp) break;
-
-        if (fseek(fp, ctx->pbin_queue_cursor.byte_offset, SEEK_SET) != 0) {
-            fclose(fp);
-            break;
-        }
-
-        while (loaded < target) {
-            char *path = NULL;
-            struct stat st;
-            unsigned char d_type;
-
-            if (!read_next_pbin_record(fp, &path, &st, &d_type)) {
-                /* EOF 或格式错误（可能是 Footer 或不完整记录） */
+        if (d_type == DT_DIR) {
+            if (!dispatch_queue_push(&ctx->dispatch_queue, path, &st)) {
+                free(path);
+                ctx->dspill_read_offset = rec_start; /* 回退游标，下轮重试 */
                 break;
             }
-
-            ctx->pbin_queue_cursor.byte_offset = ftell(fp);
-
-            if (d_type == DT_DIR) {
-                if (!dispatch_queue_push(&ctx->dispatch_queue, path, &st)) {
-                    free(path);
-                    break; /* queue 又满了 */
-                }
-                loaded++;
-            } else {
-                free(path); /* 跳过文件 */
-            }
-        }
-
-        /* 判断当前切片是否已读完（封口切片 vs 活跃切片） */
-        if (ctx->pbin_queue_cursor.slice < state->write_slice_index) {
-            /* 已封口切片：如果 read_next_pbin_record 返回 false，说明到 Footer 或 EOF */
-            ctx->pbin_queue_cursor.slice++;
-            ctx->pbin_queue_cursor.byte_offset = 0;
+            loaded++;
         } else {
-            /* 活跃切片：读到 EOF 就停，下次继续从 byte_offset 读 */
-            fclose(fp);
-            break;
+            free(path); /* dspill 只应含目录；防御性跳过 */
         }
-
-        fclose(fp);
     }
 
+    fclose(fp);
     if (loaded > 0) {
-        log_info("[PbinLoader] loaded %d dirs from pbin slice %lu offset %ld into dispatch_queue",
-                 loaded, ctx->pbin_queue_cursor.slice, ctx->pbin_queue_cursor.byte_offset);
+        ctx->dspill_loaded += (unsigned long)loaded;
+        log_info("[DspillLoader] loaded %d dirs from dspill (offset=%ld)",
+                 loaded, ctx->dspill_read_offset);
     }
+    pthread_mutex_unlock(&ctx->dspill_mutex);
     return loaded;
 }

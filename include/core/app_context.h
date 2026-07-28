@@ -114,11 +114,15 @@ typedef struct AppContext {
     unsigned long   dpbin_write_slice_index;/* 当前 dpbin 分片号 */
     unsigned long   dpbin_line_count;       /* 当前 dpbin 分片行数 */
 
-    /* === v15.5.1: pbin sliding window loader for dispatch_queue backpressure === */
-    struct {
-        unsigned long slice;        /* 当前加载到哪个 pbin 切片 */
-        long          byte_offset;  /* 该切片中的字节偏移（fseek 直接定位） */
-    } pbin_queue_cursor;
+    /* === v15.5.8: dspill 派发兜底（运行级追加文件，替代 pbin 滑动窗口） ===
+     * 队列达到 HIGH_WATER 时被跳推的目录追加写入 {base}.dspill；
+     * 加载器按字节游标回填。无分片轮转、无删除竞争、只含跳推目录。
+     * 写端为 batch_processor（线程池线程），读端为主线程，须持 dspill_mutex。 */
+    FILE           *dspill_fp;          /* 追加写句柄（懒打开） */
+    long            dspill_read_offset; /* 加载游标（字节偏移） */
+    unsigned long   dspill_appended;    /* 累计跳推（溢出）目录数 */
+    unsigned long   dspill_loaded;      /* 累计从 dspill 回填目录数 */
+    pthread_mutex_t dspill_mutex;       /* 写端/读端互斥 */
 
     /* === v15.5.3: per-slot DEV_TIMEOUT circuit breaker === */
     char timeout_paths[8][4096];   /* 每个 Worker slot 最近 timeout 的路径 */

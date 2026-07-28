@@ -16,8 +16,8 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.5.7"
-#define VERSION_CODE 202607281100UL
+#define VERSION "15.5.8"
+#define VERSION_CODE 202607290900UL
 #define MAX_PATH_LENGTH 4088 // v15.4.1: PIPE_BUF(4096) - sizeof(IpcMessageHeader)(8) = 4088, ensure atomic pipe writes
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
@@ -177,6 +177,7 @@ typedef struct {
     bool xattr;
     bool follow_symlinks;
     bool include_dir;       // -D
+    bool strict_nlink;      /* v15.5.8: --strict-nlink 目录完备性 oracle（st_nlink-2 对账，默认关闭） */
     
     // === 其他 ===
     bool print_dir;

@@ -5,6 +5,14 @@
 
 ---
 
+## v15.5.8 已修复项（2026-07-29）
+
+- [x] **pbin 滑动窗口兜底卡死（R3 漏采主谋）**：`load_dirs_from_pbin()` 游标追到被 `process_old_slice()` 轮转删除的分片后永久卡死，HIGH_WATER 跳推目录整子树静默丢失。改用运行级追加文件 `.dspill`（无轮转、无删除竞争、字节游标、只含跳推目录）。
+- [x] **完结硬性断言**：终止前 dspill 必须排空到 EOF——有产出先回填派发，残留记 `DSPILL_RESIDUE` 熔断清单并非零退出（R3 "pending=4 仍 SUCCESS" 类路径封死）。
+- [x] **MSG_DROP 销账**：Worker 拒收回队时 `pending_tasks-1`；回队失败记 `TASK_DROP_LOST`。
+- [x] **nlink oracle（`--strict-nlink`，默认关）**：`st_nlink-2` vs readdir 子目录计数，失配记 `NLINK_MISMATCH`——捕获 NFS 无 errno 假空/假 EOF（errno 检测族原理性盲区，纯文件目录除外）。
+- [x] **回归测试集**：`tests/` 新增 LD_PRELOAD 无 errno 注入 shim、已知真值 fixture 生成器（7 万条目/深路径/GBK/软链/并发删除）、10 用例回归脚本（全绿）。
+
 ## v15.5.7 已修复项（2026-07-28）
 
 - [x] **错误上报通道修复**：`IPC_MSG_ERROR` 从 `fd_data` 改到 `fd_ctrl`（此前被 Master 当垃圾帧 drain，scanner 自检的目录级错误永远到不了熔断清单）。

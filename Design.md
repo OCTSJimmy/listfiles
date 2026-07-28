@@ -57,6 +57,7 @@
 | **v15.5.4** | **熔断清单 + 探测指数退避判死** | 扫描严重不完整但退出码仍为 0；熔断/超时无独立审计记录；探测退避被重置为 0 永不判死；Monitor ANSI 刷屏 | 独立 `.circuit_breaker` 清单文件；`skipped_count` 触发非 0 退出；探针真正指数退避并在 `PROBE_MAX_RETRIES` 后判死；`TERM=dumb` 判断 |
 | **v15.5.6** | **dev=0 修复与单挂载保护** | `IpcErrorHeader.dev` 恒为 0，设备级熔断名存实亡；直接修复又会导致 NFS 单挂载被整体误伤 | `WorkerThreadCtx.current_dev` 记录真实 `st_dev`；`RuntimeState.root_dev` 保护根路径设备不被设备级跳过 |
 | **v15.5.7** | **扫描完整性加固：条目级/目录级错误全面可见** | `IPC_MSG_ERROR` 误发 `fd_data` 被 Master 当垃圾帧 drain，scanner 自检错误永远到不了熔断清单；目录级错误仅上报 ETIMEDOUT/EIO，EACCES 等静默丢失整棵子树；条目级 `lstat` 失败与 `readdir` 中途失败完全静默 | 错误上报改走 `fd_ctrl`；目录级错误除 ENOENT/ENOTDIR 竞态外全部上报并记录 `DIR_ERROR`；新增 `IPC_MSG_ENTRY_ERROR` 上报条目级失败记录 `ENTRY_ERROR`；`readdir` errno 检查；条目 stat EINTR 重试 |
+| **v15.5.8** | **dspill 派发兜底 + 完结硬性断言 + nlink oracle** | v15.5.7 全 errno 监控下 R3 仍 25.28% 覆盖率、熔断清单空、退出码 0——丢失在无错误通道：pbin 滑动窗口的唯一兜底加载器游标追到被 `process_old_slice` 轮转删除的分片后永久卡死，HIGH_WATER 跳推目录整子树静默丢失（"列而未派"）；MSG_DROP 回队不销 `pending_tasks` 账（完结面板 pending=4 仍 SUCCESS）；完结无完整性断言 | 运行级追加文件 `.dspill`（无轮转无删除、字节游标、只含跳推目录）替代 pbin 滑动窗口；完结前 dspill 必须排空到 EOF，残留记 `DSPILL_RESIDUE` 非零退出；MSG_DROP 销账 + 丢失记 `TASK_DROP_LOST`；`--strict-nlink` nlink oracle 捕获无 errno 假空/假 EOF（`NLINK_MISMATCH`）；10 用例回归测试集（LD_PRELOAD 无 errno 注入 + 已知真值 fixture） |
 ---
 
 ## v13.0.0：IPC 线程隔离
@@ -746,6 +747,68 @@ Worker 侧上报范围从仅 `ETIMEDOUT/EIO` 扩展到除 `ENOENT/ENOTDIR` 外�
 - `src/scan/worker_scanner.c` — 双通道错误上报、`send_entry_error()`、`entry_stat()` EINTR 重试、`readdir` errno 检查
 - `src/scan/main_loop.c` — `RET_ENTRY_ERROR` 路由记录 `ENTRY_ERROR`；非超时目录错误记录 `DIR_ERROR`
 - `include/core/config.h` — 版本号 15.5.7 / VERSION_CODE 202607281100UL
+
+---
+
+## v15.5.8：dspill 派发兜底 + 完结硬性断言 + nlink oracle
+
+### 问题背景
+
+v15.5.7 已为全部 errno 通道装上监控，生产实测 R3 仍然 24.6M 条目（覆盖率 25.28%）+ 熔断清单空 + 退出码 0——6500 万条目的丢失**没有触发任何 errno**。《扫描完整性故障总结 v2.0.0》的形态判别：整子树消失（父目录存活率 0.0%）、边界目录"有条目、零后代"统一签名（30/30 采样）、完结面板 `Pending tasks: 4 / batches: 1` 仍 SUCCESS。丢失发生在派发记账层（"列而未派"），errno 检测族对此原理性失效。
+
+### 根因
+
+1. **pbin 滑动窗口 vs 分片轮转删除（主谋）**：v15.5.1 的 `load_dirs_from_pbin()` 是 HIGH_WATER(100000) 跳推目录的唯一兜底，但 `process_old_slice()` 每 10 万条封口轮转时默认 unlink 已封口分片；加载器游标追到被删分片后 `fopen` 失败 → 永久卡死且无日志，此后跳推目录全部静默丢失。R3 仅 37 分钟（从未回填所以快得反常）、覆盖率随负载波动（14/25/47%）、漏采部位各次不一致，均与此吻合。
+2. **HIGH_WATER 跳推零记录**：跳推目录不进任何任务账，唯一痕迹是会被轮转删除的 pbin 行。
+3. **MSG_DROP 回队不销账**：派发时已 +1，回队不重销，重派发再 +1——`pending_tasks` 永久泄漏（R3 面板 pending=4 的来源）。
+4. **完结无硬性断言**：`pending==0 && batches==0 && queue==0` 不能推出"数据完整"。
+
+### 修复
+
+#### 1. dspill 派发兜底文件（替代 pbin 滑动窗口）
+
+`{progress_base}.dspill` 运行级追加文件，复用 pbin 记录格式：
+
+- `dspill_append()`：batch_processor 在队列 ≥ HIGH_WATER 时把跳推目录追加到 dspill（懒打开 "ab"、每条 fflush）；写失败记 `DSPILL_IO` 熔断清单并强行入队——宁可队列膨胀也不丢目录。
+- `load_dirs_from_dspill()`：主循环在队列 ≤ LOW_WATER 时按字节游标回填；游标只在记录成功入队后前进，失败回退下轮重试。
+- 无分片轮转、无删除竞争、只含跳推目录——从设计上消除根因 1。
+- 写端（线程池线程）/读端（主线程）经 `dspill_mutex` 互斥；启动时删除陈旧 dspill（恢复模式经根目录重扫重新发现未完成目录）；成功完结后自删，出错保留审计。
+
+#### 2. 完结硬性断言
+
+终止检查全部静默条件满足后，若 dspill 存在：最后跑一次加载器，有产出则回填派发继续扫描；无产出则 stat 校验游标抵 EOF，残留记 `DSPILL_RESIDUE` 熔断清单 → 非零退出。不允许"挂起非零仍 SUCCESS"。
+
+#### 3. MSG_DROP 销账
+
+回队时 `pending_tasks-1`（重派发重新 +1）；回队失败记 `TASK_DROP_LOST` 熔断清单。
+
+#### 4. nlink oracle（`--strict-nlink`，默认关）
+
+针对 NFS 协议层**无 errno 假空/假 EOF**（任何 errno 检查无法捕获）的唯一客户端可检旁证：非空目录 `st_nlink = 2 + 直接子目录数`。readdir 正常结束后子目录计数与 `st_nlink-2` 不符即以 `errno_code=0` 的 ENTRY_ERROR 上报，Master 记录 `NLINK_MISMATCH` → 非零退出。默认关闭（NFS/btrfs nlink 语义不可靠 + 并发增删竞态）；条目级异常或 readdir 出错的目录禁用 oracle 防误报。
+
+### 已知原理性盲区
+
+纯文件目录（无子目录可供 oracle 比对）的无 errno 假空/截断客户端无法检测，只能靠跨运行对账。回归测试用例 5a 将此盲区作为预期行为存档。
+
+### 测试集（tests/）
+
+- `inject_readdir.c` — LD_PRELOAD shim 劫持 `readdir()` 制造无 errno 假空/假 EOF（`LF_TARGET_SUBSTR`/`LF_FAKE_EMPTY_AFTER`）；
+- `gen_fixture.py` — 已知真值 fixture：7 万+ 条目单目录、>4096 深路径、GBK 非法 UTF-8 文件名、软链、并发删除文件集、8 子目录注入靶点 + 二进制安全 manifest；
+- `run_regression.sh` — 10 用例：基线 diff=0 / workers 1·8·16 sorted 一致 / EACCES 两级注入 / 假空与中途假 EOF 注入（无 flag 盲区存档、有 flag 必须捕获）/ dspill 低水位标桩压力 / 并发删除豁免 / 深路径 ENAMETOOLONG。
+
+### 修改的文件
+
+- `include/core/config.h` — 版本号 15.5.8 / VERSION_CODE 202607290900UL；`Config.strict_nlink`
+- `include/core/app_context.h` — dspill 四字段 + `dspill_mutex`（替代 pbin 游标）
+- `include/output/progress.h` / `src/output/progress.c` — `get_dspill_filename()`
+- `include/scan/main_loop.h` — `dspill_append()`/`load_dirs_from_dspill()` 声明
+- `src/scan/batch_processor.c` — HIGH_WATER 跳推改投 dspill
+- `src/scan/dispatch.c` — dspill 追加/回填实现
+- `src/scan/main_loop.c` — dspill 加载点、完结硬性断言、MSG_DROP 销账、`NLINK_MISMATCH` 路由
+- `src/scan/worker_scanner.c` — nlink oracle
+- `src/core/main.c` — dspill 生命周期（mutex/陈旧清理/完结统计/自删）
+- `src/core/cmdline.c` — `--strict-nlink`
+- `tests/` — 注入 shim、fixture 生成器、回归脚本（新增）
 
 ---
 

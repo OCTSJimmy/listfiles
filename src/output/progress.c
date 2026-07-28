@@ -51,6 +51,17 @@ char *get_slice_filename(const char *base, unsigned long index) {
 }
 
 /**
+ * @brief  生成 dspill 派发兜底文件名（{base}.dspill，v15.5.8）
+ * @param  base  const char*  进度文件前缀，不能为空
+ * @return char*  动态分配的字符串，调用方负责 free
+ */
+char *get_dspill_filename(const char *base) {
+    char *name = safe_malloc(strlen(base) + 32);
+    sprintf(name, "%s.dspill", base);
+    return name;
+}
+
+/**
  * @brief  生成归档文件名（{base}.archive）
  * @param  base  const char*  进度文件前缀，不能为空
  * @return char*  动态分配的字符串，调用方负责 free

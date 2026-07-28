@@ -49,6 +49,7 @@ static void app_context_init(AppContext *ctx) {
     atomic_init(&ctx->pending_batches, 0);
     dispatch_queue_init(&ctx->dispatch_queue);
     record_path_batch_init(&ctx->record_batch);
+    pthread_mutex_init(&ctx->dspill_mutex, NULL); /* v15.5.8 */
 }
 
 /**
@@ -119,6 +120,12 @@ static void app_context_destroy(AppContext *ctx) {
         fclose(ctx->fpbin_slice_file);
         ctx->fpbin_slice_file = NULL;
     }
+    /* v15.5.8: 关闭 dspill 派发兜底文件句柄 */
+    if (ctx->dspill_fp) {
+        fclose(ctx->dspill_fp);
+        ctx->dspill_fp = NULL;
+    }
+    pthread_mutex_destroy(&ctx->dspill_mutex);
     if (ctx->fpbin_entries) {
         for (size_t i = 0; i < ctx->fpbin_count; i++) {
             free(ctx->fpbin_entries[i]);
@@ -374,6 +381,18 @@ int main(int argc, char *argv[]) {
     ctx.async_writer = async_worker_init(&ctx.cfg, &ctx.state);
     circuit_breaker_init(&ctx);
 
+    /* v15.5.8: 删除上一运行遗留的 dspill 兜底文件。
+     * 恢复模式下未完成目录会经根目录重扫重新发现（completed_set 只剪枝已完成
+     * 子树），遗留 dspill 若被追加复用会导致重复派发/重复输出，故启动时清理。 */
+    if (ctx.cfg.progress_base) {
+        char *stale_spill = get_dspill_filename(ctx.cfg.progress_base);
+        if (stale_spill) {
+            if (unlink(stale_spill) == 0)
+                log_info("[Dspill] removed stale spill file: %s", stale_spill);
+            free(stale_spill);
+        }
+    }
+
     /* Seed root task */
     struct stat root_info;
     if (lstat(ctx.cfg.target_path, &root_info) == 0) {
@@ -432,6 +451,12 @@ int main(int argc, char *argv[]) {
         log_info("任务完成。耗时: %ld 秒", time(NULL) - ctx.state.start_time);
     }
 
+    /* v15.5.8: dspill 兜底统计（>0 说明曾发生 HIGH_WATER 跳推，已全部回填） */
+    if (ctx.dspill_appended > 0) {
+        log_info("[Dspill] HIGH_WATER 跳推目录 %lu 个，回填 %lu 个",
+                 ctx.dspill_appended, ctx.dspill_loaded);
+    }
+
     if (ctx.state.skipped_count > 0) {
         fprintf(stderr,
                 "[CRITICAL] 扫描不完整：已跳过 %lu 个路径。详见 %s.circuit_breaker\n",
@@ -443,6 +468,14 @@ int main(int argc, char *argv[]) {
     /* v15.5.0: Delete temporary dpbin after successful completion */
     if (ctx.cfg.continue_mode && ctx.cfg.progress_base) {
         dpbin_delete_all(ctx.cfg.progress_base);
+    }
+    /* v15.5.8: 成功完结后删除 dspill 兜底文件；有错误时保留供审计 */
+    if (ctx.cfg.progress_base && !ctx.state.has_error) {
+        char *spill = get_dspill_filename(ctx.cfg.progress_base);
+        if (spill) {
+            unlink(spill);
+            free(spill);
+        }
     }
     app_context_destroy(&ctx);
 

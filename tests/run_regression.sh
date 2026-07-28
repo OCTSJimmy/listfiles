@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# run_regression.sh — listfiles 扫描完整性回归测试集（故障总结 v2.0.0 §四 规格 v2）
+#
+# 用法: tests/run_regression.sh [工作目录(默认 /tmp/lf_regression)]
+#
+# 覆盖：
+#   1. 已知真值 fixture 基线：输出与 manifest diff=0（7万+条目单目录/GBK文件名/软链）
+#   2. 并发一致性：workers=1/8/16 三方 sorted 输出一致
+#      （规格原文"逐字节一致"——多 worker 下分片写出顺序本就不确定，
+#        逐字节一致在小概率下也无法满足，故按 sorted 全文一致验收）
+#   3. EACCES opendir 注入：exit!=0 + 熔断清单 DIR_ERROR(errno=13)
+#   4. EACCES 条目 lstat 注入：exit!=0 + ENTRY_ERROR(errno=13)
+#   5. LD_PRELOAD 假空 readdir（errno=0）：不加 --strict-nlink 无感通过（盲区存档证明）；
+#      加 --strict-nlink 必须 exit!=0 + NLINK_MISMATCH
+#   6. LD_PRELOAD 中途假 EOF：--strict-nlink 下 exit!=0 + NLINK_MISMATCH
+#   7. dspill 派发兜底压力：低水位标桩构建（HIGH=64/LOW=16/BATCH=32），
+#      3000 目录溢出跳推→回填，输出与 manifest diff=0，[Dspill] 统计出现，完结后 dspill 已删除
+#   8. 并发删除豁免：扫描期间后台 rm churn/，exit=0、熔断清单无记录、输出 ⊆ manifest
+#   9. 深路径（>4096）：exit!=0 + ENAMETOOLONG
+#
+# 注意：用例 5 的"无感通过"是已知原理性盲区——纯文件目录的无 errno 假空/截断
+# 客户端无法检测（无子目录可供 nlink oracle 比对），只能靠跨运行对账。
+set -u
+cd "$(dirname "$0")/.."
+PROJECT_ROOT=$PWD
+LF=$PROJECT_ROOT/bin/listfiles
+WORK=${1:-/tmp/lf_regression}
+FIX=$WORK/fixture
+PASS=0; FAIL=0; FAILED_CASES=""
+
+say()  { printf '[regression] %s\n' "$*"; }
+ok()   { PASS=$((PASS+1)); say "PASS: $*"; }
+bad()  { FAIL=$((FAIL+1)); FAILED_CASES="$FAILED_CASES $1"; say "FAIL: $*"; }
+
+# 收集输出并排序（字节序）
+collect() { cat "$1"/*.txt 2>/dev/null | LC_ALL=C sort; }
+
+# 运行一次扫描: $1=输出目录 $2=进度前缀 $3..=附加参数
+run_lf() {
+    local out=$1 prog=$2; shift 2
+    rm -rf "$out"; mkdir -p "$out"
+    "$LF" -p "$FIX" -F "%p %s" -D -O "$out" -f "$prog" --max-slice 50000 \
+          --yes --worker-count 8 --batch-size 1024 "$@"
+}
+
+breaker_has() { # $1=进度前缀 $2=模式
+    [ -f "$1.circuit_breaker" ] && grep -q "$2" "$1.circuit_breaker"
+}
+breaker_empty() { # 无文件或仅有表头注释行
+    [ ! -f "$1.circuit_breaker" ] || ! grep -qv '^#' "$1.circuit_breaker"
+}
+
+say "工作目录: $WORK"
+# 每轮必须使用全新进度前缀/输出目录——.config status=Success 会自动开启续传
+# （无需 -c），上一轮残留的进度会让本轮扫描被 completed_set 剪成空扫描。
+if [ -d "$WORK" ] && [ ! -f "$WORK/.lf_regression_workdir" ] && [ -n "$(ls -A "$WORK")" ]; then
+    say "错误: $WORK 非空且非本脚本工作目录（缺少 .lf_regression_workdir 标记），拒绝清空"
+    exit 2
+fi
+rm -rf "$WORK"
+mkdir -p "$WORK"
+touch "$WORK/.lf_regression_workdir"
+
+[ -x "$LF" ] || { say "bin/listfiles 不存在，先 make"; exit 2; }
+
+# ---------- 准备 fixture ----------
+say "生成 main fixture（含 7 万条目大目录）..."
+python3 tests/gen_fixture.py "$FIX" --big-count 70000 --manifest "$WORK/manifest.txt"
+LC_ALL=C sort "$WORK/manifest.txt" > "$WORK/manifest.sorted"
+
+# LD_PRELOAD shim
+gcc -shared -fPIC -O2 -o "$WORK/inject_readdir.so" "$PROJECT_ROOT/tests/inject_readdir.c" -ldl \
+    || { say "shim 编译失败"; exit 2; }
+
+# ================================================================
+say "== 用例 1: 已知真值基线 diff=0 =="
+run_lf "$WORK/out1" "$WORK/prog1" -M
+rc=$?
+collect "$WORK/out1" > "$WORK/out1.sorted"
+if [ $rc -eq 0 ] && cmp -s "$WORK/out1.sorted" "$WORK/manifest.sorted"; then
+    ok "用例1 基线一致（$(wc -l < "$WORK/out1.sorted") 行）"
+else
+    bad "用例1" "基线 diff 非零或退出码=$rc"
+    diff "$WORK/out1.sorted" "$WORK/manifest.sorted" | head -5
+fi
+
+# ================================================================
+say "== 用例 2: workers=1/8/16 并发一致性 =="
+run_lf "$WORK/out_w1"  "$WORK/prog_w1"  -M --worker-count 1
+run_lf "$WORK/out_w8"  "$WORK/prog_w8"  -M --worker-count 8
+run_lf "$WORK/out_w16" "$WORK/prog_w16" -M --worker-count 16
+collect "$WORK/out_w1"  > "$WORK/w1.sorted"
+collect "$WORK/out_w8"  > "$WORK/w8.sorted"
+collect "$WORK/out_w16" > "$WORK/w16.sorted"
+if cmp -s "$WORK/w1.sorted" "$WORK/w8.sorted" && cmp -s "$WORK/w8.sorted" "$WORK/w16.sorted"; then
+    ok "用例2 三方 sorted 输出一致"
+else
+    bad "用例2" "workers 1/8/16 输出不一致"
+fi
+
+# ================================================================
+if [ "$(id -u)" -eq 0 ]; then
+    say "== 用例 3/4: root 运行，EACCES 注入无效，跳过 =="
+else
+    say "== 用例 3: EACCES opendir（chmod 000）=="
+    chmod 000 "$FIX/deepnest/a2"
+    run_lf "$WORK/out3" "$WORK/prog3" -M; rc=$?
+    chmod 755 "$FIX/deepnest/a2"
+    if [ $rc -ne 0 ] && breaker_has "$WORK/prog3" 'DIR_ERROR(errno=13)'; then
+        ok "用例3 DIR_ERROR(errno=13) 已记录，exit=$rc"
+    else
+        bad "用例3" "exit=$rc，熔断清单: $(cat "$WORK/prog3.circuit_breaker" 2>/dev/null | tail -2)"
+    fi
+
+    say "== 用例 4: EACCES 条目 lstat（chmod 444）=="
+    chmod 444 "$FIX/deepnest/a/b/c"
+    run_lf "$WORK/out4" "$WORK/prog4" -M; rc=$?
+    chmod 755 "$FIX/deepnest/a/b/c"
+    if [ $rc -ne 0 ] && breaker_has "$WORK/prog4" 'ENTRY_ERROR(errno=13)'; then
+        ok "用例4 ENTRY_ERROR(errno=13) 已记录，exit=$rc"
+    else
+        bad "用例4" "exit=$rc，熔断清单: $(cat "$WORK/prog4.circuit_breaker" 2>/dev/null | tail -2)"
+    fi
+fi
+
+# ================================================================
+say "== 用例 5a: 假空 readdir 注入，无 --strict-nlink（盲区存档）=="
+LF_TARGET_SUBSTR=inject_target LF_FAKE_EMPTY_AFTER=0 LD_PRELOAD="$WORK/inject_readdir.so" \
+    run_lf "$WORK/out5a" "$WORK/prog5a" -M; rc=$?
+if [ $rc -eq 0 ] && breaker_empty "$WORK/prog5a"; then
+    ok "用例5a 无 strict-nlink 时无感通过（已知盲区，符合预期存档）"
+else
+    bad "用例5a" "exit=$rc（预期 0 = 盲区证明）"
+fi
+
+say "== 用例 5b: 假空 readdir 注入 + --strict-nlink（必须捕获）=="
+LF_TARGET_SUBSTR=inject_target LF_FAKE_EMPTY_AFTER=0 LD_PRELOAD="$WORK/inject_readdir.so" \
+    run_lf "$WORK/out5b" "$WORK/prog5b" -M --strict-nlink; rc=$?
+if [ $rc -ne 0 ] && breaker_has "$WORK/prog5b" 'NLINK_MISMATCH'; then
+    ok "用例5b NLINK_MISMATCH 已捕获，exit=$rc"
+else
+    bad "用例5b" "exit=$rc，熔断清单: $(cat "$WORK/prog5b.circuit_breaker" 2>/dev/null | tail -2)"
+fi
+
+# ================================================================
+say "== 用例 6: 中途假 EOF（第 5 条后）+ --strict-nlink（必须捕获）=="
+LF_TARGET_SUBSTR=inject_target LF_FAKE_EMPTY_AFTER=5 LD_PRELOAD="$WORK/inject_readdir.so" \
+    run_lf "$WORK/out6" "$WORK/prog6" -M --strict-nlink; rc=$?
+if [ $rc -ne 0 ] && breaker_has "$WORK/prog6" 'NLINK_MISMATCH'; then
+    ok "用例6 中途假 EOF 已捕获，exit=$rc"
+else
+    bad "用例6" "exit=$rc，熔断清单: $(cat "$WORK/prog6.circuit_breaker" 2>/dev/null | tail -2)"
+fi
+
+# ================================================================
+say "== 用例 7: dspill 兜底压力（低水位标桩构建）=="
+INST=$WORK/inst_build
+rm -rf "$INST"; mkdir -p "$INST"
+cp -r "$PROJECT_ROOT/src" "$PROJECT_ROOT/include" "$PROJECT_ROOT/lib" "$PROJECT_ROOT/Makefile" "$INST/"
+sed -i \
+    -e 's/define DISPATCH_QUEUE_HIGH_WATER.*/define DISPATCH_QUEUE_HIGH_WATER    8/' \
+    -e 's/define DISPATCH_QUEUE_LOW_WATER.*/define DISPATCH_QUEUE_LOW_WATER      4/' \
+    -e 's/define DISPATCH_QUEUE_LOAD_BATCH.*/define DISPATCH_QUEUE_LOAD_BATCH     16/' \
+    "$INST/include/core/config.h"
+if make -C "$INST" -j"$(nproc)" > "$WORK/inst_make.log" 2>&1; then
+    DSP=$WORK/dspill_case
+    rm -rf "$DSP"; mkdir -p "$DSP/tree"
+    for i in $(seq 0 1999); do
+        d=$(printf '%s/tree/d%04d' "$DSP" "$i"); mkdir "$d"
+        for j in 0 1 2 3 4 5 6 7 8 9; do echo x > "$d/f$j"; done
+    done
+    find "$DSP/tree" -mindepth 1 -printf '%p %s\n' | LC_ALL=C sort > "$DSP/manifest.sorted"
+    mkdir -p "$DSP/out"
+    "$INST/bin/listfiles" -p "$DSP/tree" -F "%p %s" -D -O "$DSP/out" -f "$DSP/prog" \
+        --max-slice 50000 --yes --worker-count 2 --batch-size 32 -v > "$DSP/run.log" 2>&1
+    rc=$?
+    collect "$DSP/out" > "$DSP/out.sorted"
+    if [ $rc -eq 0 ] \
+        && cmp -s "$DSP/out.sorted" "$DSP/manifest.sorted" \
+        && grep -q '\[Dspill\] HIGH_WATER' "$DSP/run.log" \
+        && [ ! -f "$DSP/prog.dspill" ]; then
+        ok "用例7 dspill 溢出→回填完整（$(grep -o 'HIGH_WATER 跳推目录 [0-9]*' "$DSP/run.log" | tail -1)）"
+    else
+        bad "用例7" "exit=$rc；diff: $(diff "$DSP/out.sorted" "$DSP/manifest.sorted" | wc -l) 行；log: $(grep -c Dspill "$DSP/run.log") 处"
+    fi
+else
+    bad "用例7" "标桩构建失败，见 $WORK/inst_make.log"
+fi
+
+# ================================================================
+say "== 用例 8: 并发删除豁免（churn/ 扫描期间后台 rm）=="
+(
+    for i in $(seq 0 1999); do
+        rm -f "$(printf '%s/churn/del_%04d.txt' "$FIX" "$i")"
+        sleep 0.002
+    done
+) &
+DELETER=$!
+run_lf "$WORK/out8" "$WORK/prog8" -M; rc=$?
+wait $DELETER 2>/dev/null
+collect "$WORK/out8" | cut -d' ' -f1 | LC_ALL=C sort -u > "$WORK/out8.paths"
+cut -d' ' -f1 "$WORK/manifest.sorted" > "$WORK/manifest.paths"
+# 输出路径必须 ⊆ manifest（删除的只是缺席，不得出现 manifest 之外的路径）
+extra=$(LC_ALL=C comm -23 "$WORK/out8.paths" "$WORK/manifest.paths" | wc -l)
+if [ $rc -eq 0 ] && breaker_empty "$WORK/prog8" && [ "$extra" -eq 0 ]; then
+    ok "用例8 并发删除豁免（exit=0，清单干净，输出 ⊆ manifest）"
+else
+    bad "用例8" "exit=$rc extra=$extra breaker: $(tail -2 "$WORK/prog8.circuit_breaker" 2>/dev/null)"
+fi
+
+# ================================================================
+say "== 用例 9: 深路径（>4096）ENAMETOOLONG =="
+python3 tests/gen_fixture.py "$WORK/deepfix" --mode deep
+mkdir -p "$WORK/out9"
+"$LF" -p "$WORK/deepfix" -F "%p %s" -D -O "$WORK/out9" -f "$WORK/prog9" \
+      --max-slice 50000 --yes --worker-count 2 -M; rc=$?
+if [ $rc -ne 0 ] && breaker_has "$WORK/prog9" 'ENTRY_ERROR(errno=36)'; then
+    ok "用例9 ENAMETOOLONG(errno=36) 已记录，exit=$rc"
+else
+    bad "用例9" "exit=$rc，熔断清单: $(cat "$WORK/prog9.circuit_breaker" 2>/dev/null | tail -2)"
+fi
+
+# ================================================================
+say "=================================================="
+say "结果: PASS=$PASS FAIL=$FAIL${FAILED_CASES:+  失败用例:$FAILED_CASES}"
+say "产物保留于: $WORK"
+[ $FAIL -eq 0 ]
