@@ -242,11 +242,11 @@ util/     — 日志、xxhash
    │   ├── 对每个条目:
    │   │   ├── 计算 fingerprint(path, dev, ino)
    │   │   ├── 查 reference_map:
-   │   │   │   ├── 存在且 mtime 未变且 d_type == DT_REG:
-   │   │   │   │   └── 文件: 盲信跳过（不 lstat，不输出）
-   │   │   │   │   └── 目录: 仍须 readdir 发现子目录（不盲信子树）
-   │   │   │   └── 不存在或 mtime 已变:
-   │   │   │       └── 全量处理（lstat + 输出/入队）
+   │   │   │   ├── 存在:
+   │   │   │   │   └── 文件: 不执行 lstat，直接复用 reference_map 中记录的上次 stat 数据填入 BATCH
+   │   │   │   │   └── 目录: 仍须 readdir 枚举子目录（子目录发现不可盲信跳过）
+   │   │   │   └── 不存在:
+   │   │   │       └── 正常 lstat，新数据进入 BATCH
    │   └── batch 满 → send_batch
    │
    ├── Main 收到 RET_BATCH
@@ -263,14 +263,17 @@ util/     — 日志、xxhash
 ```
 
 **与 4.1/4.2 的关键差异**：
-- **盲信判定在每个目录节点独立进行**：不是"子树根 mtime 未变就跳过整棵树"。Worker 对每个目录仍执行 `readdir`，但对已存在且未变的**文件**跳过 `lstat`。
-- `reference_map` 在本次运行中**只读**，不写入新条目。只有全量扫描（不带 `--skip-interval`）才会更新 reference_map。
-- 盲信跳过的文件**不会出现在本轮输出中**。输出契约需明确：本轮输出只含变更条目，消费者需自行合并上轮全量输出（或工具内部做结转）。
+- **盲信即不验证**：Worker 对 `reference_map` 中存在的条目**不执行 lstat**，直接复用上次记录的 stat 数据（来自首次完整扫描的 pbin）。本轮输出中这些条目带着的是**上次扫描时的 mtime**，不是当前值。**不需要读取文件当前的 mtime**。
+- `reference_map` 在本次运行中**只读**，不写入新条目。只有全量扫描（不带 `--skip-interval`）才会更新 reference_map 和 pbin。
+- 盲信扫描仍能发现**新增条目**（readdir 发现了 reference_map 中没有的条目），但不会发现**已有条目的变更**（因为不 lstat）。
+- 盲信扫描的输出是"上次全量结果 + 本轮新增条目"的混合。已变更条目不会反映最新状态。
+- 删除的条目：若 readdir 中仍可见则输出（旧数据），若已不可见则自然消失。无 tombstone 机制。
 
-**前置条件（必须满足）**：
-- 必须已有至少一次完整扫描建立的 reference_map 基准。
-- 文件系统必须保证"目录 mtime 随子项变动而更新"。若该前提不成立（如 noatime、某些分布式存储），盲信可能漏扫深层变更。
-- 盲信跳过是**显式开关**（`--skip-interval`），默认关闭。
+**盲信扫描的正确性前提**：
+1. 必须已有至少一次完整扫描建立的 pbin 基准（reference_map 从 pbin 重建）。
+2. **盲信扫描期间文件系统应无变更**。若有变更（文件修改、属性变化），盲信扫描**不会检测到**——因为完全不读取当前状态。
+3. 盲信跳过是**显式开关**（`--skip-interval`），默认关闭。`skip_interval` 参数的含义是"上次全量扫描距今不超过此秒数则允许盲信"，即只在确认近期无变更时使用。
+4. 盲信扫描的输出是**近似快照**，不是精确当前状态。用于快速复现上次结果或处理新增条目，不用于变更检测。
 
 ---
 
@@ -437,7 +440,7 @@ while (running) {
 - `opendir(path) → readdir 循环 → lstat 每个条目 → 区分文件/目录`
 - 文件：收集进 batch → 满 `batch_size` 时 `send_batch(fd_data)`
 - 目录：收集进 batch → 由 batch_processor 后续处理
-- 盲信检查（若启用）：`reference_map` 中存在且 mtime 未变且 `d_type==DT_REG` → 跳过 `lstat`
+- 盲信检查（若启用）：`reference_map` 中存在 → 不执行 lstat，直接复用上次记录的 stat 数据
 - `scanner_progress_tick()` 每 5s 更新（v15.5.9），防止 NFS 大目录误判
 
 **Batch Processor**（`batch_processor.c`）：
