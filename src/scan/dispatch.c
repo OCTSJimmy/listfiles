@@ -138,6 +138,22 @@ void dispatch_from_queue(AppContext *ctx) {
             }
             break; /* 停止继续尝试，等下一轮 */
         }
+
+        /* v15.5.9: redispatch 退避检查——该 slot 若处于退避期，跳过 */
+        if (ctx->redispatch_backoff_until[wid] > 0) {
+            time_t now = time(NULL);
+            if (now < ctx->redispatch_backoff_until[wid]) {
+                log_debug_v(202607030000UL, "[DispatchQueue] worker %d in backoff until %ld (now=%ld), requeue %s",
+                            wid, (long)ctx->redispatch_backoff_until[wid], (long)now, path_log_mask(task.path));
+                if (!dispatch_queue_push(&ctx->dispatch_queue, task.path, &task.st)) {
+                    free(task.path);
+                }
+                continue; /* 尝试下一个任务 */
+            }
+            /* 退避已过期，清除标记 */
+            ctx->redispatch_backoff_until[wid] = 0;
+        }
+
         WorkerSlot *slot = &ctx->worker_pool->slots[wid];
         atomic_store(&slot->state, WORKER_STATE_BUSY);
 
@@ -240,10 +256,26 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
 
     atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
 
-    /* v15.5.3: Circuit breaker for DEV_TIMEOUT redispatch loop */
+    /* v15.5.3: Circuit breaker for DEV_TIMEOUT redispatch loop
+     * v15.5.9: 增加指数退避——同一目录连续超时后，redispatch 前等待
+     * 30s -> 120s -> 300s，给 NFS 大目录喘息时间 */
     if (redispatch_current && slot->current_path[0] != '\0') {
         bool tripped = circuit_breaker_check(ctx, worker_id, slot->current_path);
         if (!tripped) {
+            /* 计算退避时间：基于已超时次数 */
+            int backoff_sec = 0;
+            if (ctx->timeout_counts[worker_id] == 1) backoff_sec = 30;
+            else if (ctx->timeout_counts[worker_id] == 2) backoff_sec = 120;
+            else if (ctx->timeout_counts[worker_id] >= 3) backoff_sec = 300;
+
+            if (backoff_sec > 0) {
+                ctx->redispatch_backoff_until[worker_id] = time(NULL) + backoff_sec;
+                log_info_v(202607030000UL, "[CircuitBreaker] Path timeout count=%d, backoff %ds before redispatch: %s",
+                           ctx->timeout_counts[worker_id], backoff_sec, path_log_mask(slot->current_path));
+            } else {
+                ctx->redispatch_backoff_until[worker_id] = 0;
+            }
+
             char *dup = strdup(slot->current_path);
             if (!dispatch_queue_push(&ctx->dispatch_queue, dup, NULL)) {
                 free(dup);

@@ -4,6 +4,35 @@
 
 ---
 
+## [15.5.9] - 2026-08-09
+
+### Fixed：NFS 大目录场景下 DEV_TIMEOUT 误判深度加固
+
+**P0 — Critical：**
+- **HEARTBEAT_TIMEOUT 30s 对 NFS 大目录过严**：Worker Scanner 在 NFS 上遍历大目录时，`readdir()` 单次 RPC 可能耗时数十秒，`opendir()` 本身也是多 RPC 聚合。30 秒无心跳即被 IPC 线程判定为 DEV_TIMEOUT，Master 替换 Worker 后再次派发同一目录，形成无限循环。
+  - 修复：HEARTBEAT_TIMEOUT_SEC 从 30 提高到 120，给 NFS 大目录足够喘息时间。
+
+- **CIRCUIT_BREAKER_THRESHOLD 3 次过严**：目录级熔断原阈值为 3，即 30s*3=90s 后熔断。但对于 7 万+ 文件的 NFS 大目录，90s 远远不够，导致路径过早被熔断跳过，目录丢失。
+  - 修复：CIRCUIT_BREAKER_THRESHOLD 从 3 提高到 10，配合 120s 超时，总容忍时间扩大到 1200s（20 分钟）。
+
+- **redispatch 无退避，同一目录被瞬间连续派发**：Worker 因 DEV_TIMEOUT 死亡后，`cleanup_dead_worker_slot` 立即将同一目录 requeue，下一个 Worker 瞬间接手再次卡死，CPU 空转且 dispatch_queue 被快速消耗。
+  - 修复：新增 redispatch 指数退避机制。`cleanup_dead_worker_slot` 在 requeue 前，根据该路径已连续超时次数设置退避时间：1 次→30s、2 次→120s、3 次+→300s。退避期间 `dispatch_from_queue` 遇到该 slot 直接跳过，等待时间到期后再尝试。
+
+- **scanner_progress_tick 计数驱动（每 1000 条目）在大目录前段无保护**：NFS 上处理 1000 个条目可能需要数分钟，前 999 条期间 `last_progress` 不更新，IPC 线程随时可能误判。
+  - 修复：`scanner_progress_tick` 从计数驱动改为时间驱动（每 5 秒），无论处理多慢，心跳持续更新。参数从 `(int *entry_count, int interval)` 改为 `(time_t *last_tick_time, int interval_sec)`。
+
+- **opendir() 和 send_batch() 期间无心跳保护**：`opendir()` 在 NFS 上是多 RPC 调用，大目录可能阻塞数十秒；`send_batch()` 涉及 IPC 写管道，大 batch 可能阻塞。两者期间 `last_progress` 不更新，被误判卡死。
+  - 修复：`opendir()` 成功后立即 tick 一次；`send_batch()` 前后各 tick 一次，确保长耗时操作期间心跳持续。
+
+**修改的文件**：
+- `include/core/config.h` — VERSION "15.5.9"，VERSION_CODE 202608090000UL，HEARTBEAT_TIMEOUT_SEC 120
+- `include/core/app_context.h` — CIRCUIT_BREAKER_THRESHOLD 10，新增 `redispatch_backoff_until[8]`
+- `src/core/main.c` — 初始化 `redispatch_backoff_until` 数组
+- `src/scan/dispatch.c` — redispatch 指数退避逻辑 + `dispatch_from_queue` 退避跳过
+- `src/scan/worker_scanner.c` — `scanner_progress_tick` 时间驱动重构 + opendir/send_batch 前后 tick
+
+---
+
 ## [15.5.3] - 2026-07-06
 
 ### Fixed：大目录 readdir 超时误判（DEV_TIMEOUT false-positive）+ 目录级熔断 + 日志版本化

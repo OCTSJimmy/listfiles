@@ -129,25 +129,26 @@ extern void worker_scanner_progress(pthread_mutex_t *mutex, time_t *last_progres
 
 /**
  * @brief  定期更新 Scanner 进度时间戳，防止大目录 readdir 超时误判
- * @param  entry_count  int*  条目计数器（输入输出，每调用自动递增）
- * @param  interval     int   更新间隔（条目数），默认 1000
- * @param  worker_id    int   Worker 编号
+ * @param  last_tick_time  time_t*  上次 tick 时间（输入输出）
+ * @param  interval_sec    int      更新间隔（秒），默认 5
+ * @param  worker_id       int      Worker 编号
  * @return void
  *
- * @note   在 scan_and_send 的 readdir 循环中调用。每处理 interval 个条目
- *         更新一次 last_progress，让 IPC 线程的 stuck 检测知道 Scanner
- *         仍在正常工作，避免对大目录（7万+ 文件）误判为 DEV_TIMEOUT。
+ * @note   v15.5.9: 从计数驱动（每 N 条目）改为时间驱动（每 interval_sec 秒）。
+ *         NFS 大目录场景下，1000 个条目可能需要数分钟，计数驱动导致前 999 条无保护。
+ *         时间驱动确保无论处理多慢，心跳持续更新。
  */
-static void scanner_progress_tick(int *entry_count, int interval,
+static void scanner_progress_tick(time_t *last_tick_time, int interval_sec,
                                   pthread_mutex_t *mutex, time_t *last_progress,
                                   int worker_id) {
-    (*entry_count)++;
-    if (*entry_count % interval == 0) {
+    time_t now = time(NULL);
+    if (now - *last_tick_time >= interval_sec) {
         pthread_mutex_lock(mutex);
-        *last_progress = time(NULL);
+        *last_progress = now;
+        *last_tick_time = now;
         pthread_mutex_unlock(mutex);
-        log_debug_v(202607030000UL, "[W%d-Scanner] progress tick (entries=%d)",
-                    worker_id, *entry_count);
+        log_debug_v(202607030000UL, "[W%d-Scanner] progress tick (time-driven, interval=%ds)",
+                    worker_id, interval_sec);
     }
 }
 
@@ -352,6 +353,11 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
     int count = 0;
 
     DIR *dir = opendir(dir_path);
+    /* v15.5.9: opendir 本身在 NFS 上就是多个 RPC，可能极慢，
+     * 先 tick 一次防止 opendir 期间被误判卡死 */
+    time_t last_tick_time = time(NULL);
+    scanner_progress_tick(&last_tick_time, 5, &task->progress_mutex, &task->last_progress, worker_id);
+
     if (!dir) {
         log_warn("[W%d-Scanner] opendir failed on %s: %s", worker_id, dir_path, strerror(errno));
         send_error_and_empty_batch(fd_out, task->fd_ctrl, errno, dir_dev, dir_path);
@@ -371,8 +377,8 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
             readdir_err = errno;
             break;
         }
-        /* v15.5.3: heartbeat tick every 1000 entries for large directories */
-        scanner_progress_tick(&entry_count, 1000,
+        /* v15.5.9: 时间驱动 heartbeat tick（每 5 秒），替代计数驱动的 1000 条目间隔 */
+        scanner_progress_tick(&last_tick_time, 5,
                               &task->progress_mutex, &task->last_progress,
                               worker_id);
 
@@ -416,7 +422,11 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
         }
 
         if (count >= batch_size) {
+            /* v15.5.9: send_batch 前 tick，防止 IPC 阻塞期间误判 */
+            scanner_progress_tick(&last_tick_time, 5, &task->progress_mutex, &task->last_progress, worker_id);
             send_batch(fd_out, paths, stats, count);
+            /* v15.5.9: send_batch 后 tick，长耗时 IPC 已结束 */
+            scanner_progress_tick(&last_tick_time, 5, &task->progress_mutex, &task->last_progress, worker_id);
             for (int i = 0; i < count; i++) free(paths[i]);
             count = 0;
         }

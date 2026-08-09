@@ -8,8 +8,9 @@
 #define RECORD_BATCH_COUNT 4096
 #define RECORD_BATCH_BYTES (1 * 1024 * 1024)
 
-/* v15.5.3: 目录级熔断阈值——同一个路径连续 DEV_TIMEOUT 超过此次数后不再重试 */
-#define CIRCUIT_BREAKER_THRESHOLD 3
+/* v15.5.9: 目录级熔断阈值——同一个路径连续 DEV_TIMEOUT 超过此次数后不再重试
+ * NFS 大目录场景下 3 次过严（30s*3=90s 对大目录远远不够），提高到 10 */
+#define CIRCUIT_BREAKER_THRESHOLD 10
 
 typedef struct {
     char *paths[RECORD_BATCH_COUNT];
@@ -123,6 +124,9 @@ typedef struct AppContext {
     unsigned long   dspill_appended;    /* 累计跳推（溢出）目录数 */
     unsigned long   dspill_loaded;      /* 累计从 dspill 回填目录数 */
     pthread_mutex_t dspill_mutex;       /* 写端/读端互斥 */
+
+    /* === v15.5.9: redispatch 指数退避（NFS大目录防连续快速失败） === */
+    time_t redispatch_backoff_until[8];  /* 每个 slot 的退避截止时间 */
 
     /* === v15.5.3: per-slot DEV_TIMEOUT circuit breaker === */
     char timeout_paths[8][4096];   /* 每个 Worker slot 最近 timeout 的路径 */

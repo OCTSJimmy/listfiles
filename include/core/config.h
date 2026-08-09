@@ -16,8 +16,8 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.5.8"
-#define VERSION_CODE 202607290900UL
+#define VERSION "15.5.9"
+#define VERSION_CODE 202608090000UL
 #define MAX_PATH_LENGTH 4088 // v15.4.1: PIPE_BUF(4096) - sizeof(IpcMessageHeader)(8) = 4088, ensure atomic pipe writes
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
@@ -52,7 +52,7 @@ struct DeviceManager;
 #define OUTPUT_DIR_PREFIX "目录: "
 
 
-#define HEARTBEAT_TIMEOUT_SEC 30   // Worker 30秒无心跳视为卡死
+#define HEARTBEAT_TIMEOUT_SEC 120   // v15.5.9: 从30提高到120，NFS大目录场景下30秒极易误判卡死
 #define PROBE_TIMEOUT_SEC 5        // 探针5秒不返回视为设备死亡
 #define MONITOR_INTERVAL_MS 500    // Monitor 线程主频 (500ms)
 #define CHECK_INTERVAL_SEC 1       // 巡检频率 (1秒)
@@ -65,8 +65,6 @@ struct DeviceManager;
 #define PBIN_FOOTER_MAGIC   0xDEADBEEF66AAC0FFULL
 #define PBIN_FOOTER_SIZE    24  /* sizeof(PbinFooter) */
 
-/* v15.5.3: 目录级熔断阈值——同一个路径连续 DEV_TIMEOUT 超过此次数后不再重试 */
-#define CIRCUIT_BREAKER_THRESHOLD 3
 
 #define min_size(a, b) ((a) < (b) ? (a) : (b))
 #define max_size(a, b) ((a) > (b) ? (a) : (b))

@@ -50,6 +50,10 @@ static void app_context_init(AppContext *ctx) {
     dispatch_queue_init(&ctx->dispatch_queue);
     record_path_batch_init(&ctx->record_batch);
     pthread_mutex_init(&ctx->dspill_mutex, NULL); /* v15.5.8 */
+    /* v15.5.9: 初始化 redispatch 退避数组 */
+    for (int i = 0; i < 8; i++) {
+        ctx->redispatch_backoff_until[i] = 0;
+    }
 }
 
 /**
