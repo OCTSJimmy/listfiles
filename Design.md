@@ -180,7 +180,7 @@ util/     — 日志、xxhash
 
 **关键数据流**：
 - 目录路径：dispatch_queue → Worker → BATCH → batch_processor → pbin（持久化）+ dispatch_queue（新任务）
-- 文件路径：BATCH → batch_processor → record_batch → async_worker → 输出文件
+- 文件路径：BATCH → batch_processor → pbin（持久化，作为盲信基准）+ record_batch → async_worker → 输出文件
 
 ---
 
@@ -194,14 +194,15 @@ util/     — 日志、xxhash
 1. 初始化（同 4.1）
 
 2. 加载进度（restore_progress）
-   ├── 读取 archive / 散落 pbin 分片 → 重建"已发现目录集合"
+   ├── 读取 archive / 散落 pbin 分片 → 重建"已发现条目集合"（目录用于续传队列，文件用于盲信基准）
    ├── 读取 dpbin → 重建"已完成目录集合"
-   ├── 差集 = 已发现 - 已完成 = "待扫描目录"
+   ├── 差集 = 已发现目录 - 已完成目录 = "待扫描目录"
    └── 泵送（pump）差集到 dispatch_queue
 
 3. 主循环运行（与 4.1 相同，但 dispatch_queue 初始非空）
    ├── dispatch_from_queue(): 先消费恢复的目录
    ├── 运行中 Worker 返回新子目录 → pbin + dispatch_queue
+   ├── 运行中 Worker 返回文件 → pbin（盲信基准）+ 输出
    └── 同时 pump 继续从历史 pbin 加载更多目录回填 queue
 
 4. 恢复完成判定
@@ -526,9 +527,15 @@ Master                                    Worker
 
 ## 8. 数据持久化模型
 
-### 8.1 pbin — 进度分片
+### 8.1 pbin — 进度分片（全量扫描记录）
 
-记录所有已发现但尚未扫描的目录。文本格式 + Footer 自描述。每 10 万行切分，命名 `{base}.pbin.{NNNNNN}`。
+记录**所有扫描过的条目**（目录 + 文件），每条包含：路径、设备号、inode、mtime、d_type。文本格式 + Footer 自描述。每 10 万行切分，命名 `{base}.pbin.{NNNNNN}`。
+
+**为什么同时记录文件**：pbin 是盲信扫描的基准来源。`restore_progress_to_memory()` 从 pbin 重建 `reference_map`（fingerprint → mtime/d_type），盲信时直接查表跳过 lstat。若 pbin 不记录文件，盲信对文件无从谈起。
+
+**目录与文件的分流策略**：
+- 正常扫描阶段（`HIST_PUMP_NEW/DONE`）：目录和文件都写入 pbin
+- 恢复旧 pbin 阶段（`HIST_PUMP_OLD`）：新发现的目录写入 fpbin（防止与旧 pbin 混淆），但**文件仍写入 pbin**（文件不参与续传队列，无混淆问题）
 
 ### 8.2 dpbin — 完成日志
 
