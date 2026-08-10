@@ -8,18 +8,20 @@
 
 ## P0 阻塞项（进入编码前必须闭环）
 
-### P0-001 [NEW] FINISH/BATCH 竞态——目录任务完成屏障
+### P0-001 [FIXED] FINISH/BATCH 竞态——目录任务完成屏障
 - **问题**：Worker 先发 BATCH 再发 FINISH，但两通道独立 epoll，Master 可能先收到 FINISH 标记目录完成，后续 BATCH 滞留丢失，子树永久漏扫
 - **根因**：FINISH 语义不等待 BATCH 全处理
-- **方向**：目录任务引入完成屏障——FINISH 不直接触发完成，需等该任务所有 BATCH 处理完毕、子目录入队、输出偏移确认后才写 dpbin
+- **方案**：目录任务生命周期状态机（P0-009）定义 `SCANNING → ALL_BATCHES_RECEIVED → ALL_BATCHES_PROCESSED → OUTPUT_COMMITTED → COMPLETED` 路径。FINISH 仅触发 `ALL_BATCHES_RECEIVED`（收到所有数据），不直接触发 COMPLETED。必须等所有 BATCH 处理完毕、子目录入队、输出偏移确认后才写 dpbin。
 - **关联**：P0-009 目录任务生命周期状态机
+- **状态**：设计已确认（状态机定义见 P0-009）
 - **评审来源**：外部评审 P0-1
 
-### P0-002 [UPGRADE] 输出三态状态机——DISCOVERED → OUTPUT_QUEUED → OUTPUT_COMMITTED
+### P0-002 [FIXED] 输出三态状态机——DISCOVERED → OUTPUT_QUEUED → OUTPUT_COMMITTED
 - **问题**：pbin 记录"已发现"不代表"已输出"。崩溃后增量跳过，文件条目永久丢失
 - **根因**：发现态与输出提交态混用
-- **方向**：从"偏移量屏障"升级到三态。dpbin_append 需等待该目录所有文件条目达到 OUTPUT_COMMITTED
-- **关联**：P0-001 完成屏障
+- **方案**：目录任务生命周期状态机（P0-009）定义 `OUTPUT_COMMITTED` 态——输出线程确认该目录所有文件条目已落盘。dpbin_append 需等待 OUTPUT_COMMITTED 后才能写 dpbin。
+- **关联**：P0-001, P0-009
+- **状态**：设计已确认（状态机定义见 P0-009）
 - **评审来源**：Jimmy 评审 / 外部评审 P0-2
 
 ### P0-003 [FIXED] fpbin 二次崩溃恢复路径
@@ -51,14 +53,16 @@
 - **关联**：P0-003 dspill 恢复
 - **评审来源**：外部评审 P0-4
 
-### P0-005 [NEW] spbin 纳入恢复路径
+### P0-005 [FIXED] spbin 纳入恢复路径
 - **问题**：续传只算 `pbin-dpbin`，不读 spbin。被熔断目录永久丢失
 - **根因**：spbin 不在恢复逻辑中
-- **方向**：
-  1. 恢复时 `待扫描 = (pbin-dpbin) ∪ fpbin ∪ dspill ∪ spbin_recoverable`
-  2. spbin 原因码区分：PROBE_FAIL/TIMEOUT → 重新入队；CIRCUIT_BREAKER/PERMISSION → 保持跳过
-  3. 设备恢复后 probe_scheduler 负责将对应 spbin 条目重新入队
+- **方案**：
+  1. spbin 格式扩展：`[path][reason: uint8_t][timestamp: time_t][device_key: 64 bytes]`
+  2. 恢复时按 device_key 分组：PERMISSION/CIRCUIT_BREAKER 永久跳过；PROBE_FAIL/TIMEOUT 超窗后敢死队探测
+  3. 探测成功 → 设备标记 NORMAL，spbin 该设备条目删除；探测失败 → timestamp 更新，指数退避（30min→2h→6h→24h）
+  4. spbin 保持 append-only，正常退出时 compaction 清理已恢复条目
 - **关联**：P1-002 errno 分类矩阵
+- **状态**：设计已确认
 - **评审来源**：外部评审 P0-5
 
 ### P0-006 [NEW] MSG_DROP 正常路径禁止
@@ -102,22 +106,17 @@
 - **关联**：P0-001, P0-002
 - **评审来源**：外部评审 §6.1
 
-### P0-010 [NEW] 崩溃恢复矩阵
+### P0-010 [FIXED] 崩溃恢复矩阵——统一 Reset 援救机制
 - **问题**：当前恢复只覆盖 Worker 死亡一种情况，缺少 12+ 个崩溃点的覆盖
-- **方向**：枚举并定义以下崩溃点的恢复行为：
-  1. Worker 发送 BATCH 前崩溃
-  2. Worker 发送 BATCH 后、Master 读取前崩溃
-  3. Master 读取后、去重前崩溃
-  4. 去重后、pbin 落盘前崩溃
-  5. pbin 落盘后、输出落盘前崩溃
-  6. Worker 发送 FINISH 前崩溃
-  7. FINISH 已处理但最后 BATCH 未处理
-  8. dpbin 已写但子目录未持久化
-  9. fpbin 转正前崩溃
-  10. archive 压缩中崩溃
-  11. 新基准覆盖旧基准时崩溃
-  12. 输出线程崩溃
-  13. Master 收到 SIGTERM/SIGINT
+- **根因**：试图枚举每个崩溃点的精确恢复行为，不可穷尽
+- **方案**：不枚举崩溃点，统一采用 **Reset 援救机制**：
+  - **核心原则**：任何目录只要没写 dpbin（状态 ≠ COMPLETED），就视为未扫描，恢复时重新入队
+  - **输出截断**：恢复时输出文件截断到最后一个已确认 dpbin 对应的 offset
+  - **pbin 幂等**：已写 pbin 但未完成的目录，恢复时重新扫描是安全的（re-scan 幂等）
+  - **spbin 按 P0-005 处理**：超窗探测，设备活了统一入队
+  - **fpbin 按 P0-003 处理**：完整则转正，不完整整对抛弃重来
+  - 不需要为每个崩溃点写恢复逻辑——状态机终态唯一（COMPLETED = 写 dpbin），非终态统一重置
+- **状态**：设计已确认
 - **评审来源**：外部评审 §6.2
 
 ### P0-011 [WIP] 半增量跳过前提条件声明
