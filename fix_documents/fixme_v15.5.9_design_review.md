@@ -8,23 +8,23 @@
 
 ## P0 阻塞项（进入编码前必须闭环）
 
-### P0-001 [FIXED] FINISH/BATCH 竞态——目录任务完成屏障
+### P0-001 [Design v1] FINISH/BATCH 竞态——目录任务完成屏障
 - **问题**：Worker 先发 BATCH 再发 FINISH，但两通道独立 epoll，Master 可能先收到 FINISH 标记目录完成，后续 BATCH 滞留丢失，子树永久漏扫
 - **根因**：FINISH 语义不等待 BATCH 全处理
 - **方案**：目录任务生命周期状态机（P0-009）定义 `SCANNING → ALL_BATCHES_RECEIVED → ALL_BATCHES_PROCESSED → OUTPUT_COMMITTED → COMPLETED` 路径。FINISH 仅触发 `ALL_BATCHES_RECEIVED`（收到所有数据），不直接触发 COMPLETED。必须等所有 BATCH 处理完毕、子目录入队、输出偏移确认后才写 dpbin。
 - **关联**：P0-009 目录任务生命周期状态机
-- **状态**：设计已确认（状态机定义见 P0-009）
+- **状态**：Design v1 已确认，待编码实现（状态机定义见 P0-009）
 - **评审来源**：外部评审 P0-1
 
-### P0-002 [FIXED] 输出三态状态机——DISCOVERED → OUTPUT_QUEUED → OUTPUT_COMMITTED
+### P0-002 [Design v1] 输出三态状态机——DISCOVERED → OUTPUT_QUEUED → OUTPUT_COMMITTED
 - **问题**：pbin 记录"已发现"不代表"已输出"。崩溃后增量跳过，文件条目永久丢失
 - **根因**：发现态与输出提交态混用
 - **方案**：目录任务生命周期状态机（P0-009）定义 `OUTPUT_COMMITTED` 态——输出线程确认该目录所有文件条目已落盘。dpbin_append 需等待 OUTPUT_COMMITTED 后才能写 dpbin。
 - **关联**：P0-001, P0-009
-- **状态**：设计已确认（状态机定义见 P0-009）
+- **状态**：Design v1 已确认，待编码实现（状态机定义见 P0-009）
 - **评审来源**：Jimmy 评审 / 外部评审 P0-2
 
-### P0-003 [FIXED] fpbin 二次崩溃恢复路径
+### P0-003 [Design v1] fpbin 二次崩溃恢复路径
 - **问题**：第一次续传期间发现新目录 A 写入 fpbin，旧 pbin 未消费完时再次崩溃。第二次续传不读 fpbin，A 永久漏扫
 - **根因**：恢复期间父目录扫描完会写 dpbin，崩溃后父目录不在 pbin-dpbin 差集中，不会重扫，导致 fpbin 里的子目录永久丢失
 - **方案**：引入 `fpbin + dfpbin` 原子对作为**可抛弃工作区**
@@ -33,10 +33,10 @@
   3. 完整 → fpbin 内容合并到 pbin，清空 fpbin/dfpbin
   4. 不完整 → **整对抛弃**，重新从旧 pbin 恢复
   5. 不会无限套娃——总是回退到旧 pbin 恢复，不会递归产生新的 fpbin
-- **状态**：设计已确认
+- **状态**：Design v1 已确认，待编码实现
 - **评审来源**：外部评审 P0-3
 
-### P0-004 [FIXED] visited_set 背压竞态——统一队列模型
+### P0-004 [Design v1] visited_set 背压竞态——统一队列模型
 - **问题**：目录因背压写 pbin 后进 visited_set，但未入队，只进 dspill。回填时 visited_set 误判"已访问"而丢弃
 - **根因**："已发现"等价于"已入队"
 - **方案**：
@@ -48,12 +48,12 @@
      - `completed_set`：已完成（dpbin），防重复扫描
   4. **统一 `enqueue()` 调度入口**：所有待扫描目录（恢复 pump、运行时新发现、dspill 回填）都走同一入口
   5. dspill 写入策略：内存缓冲池 1000 条/1 秒刷盘，崩溃丢失可接受（pbin 是权威持久化）
-- **状态**：设计已确认
+- **状态**：Design v1 已确认，待编码实现
 - **评审来源**：外部评审 P0-4
 - **关联**：P0-003 dspill 恢复
 - **评审来源**：外部评审 P0-4
 
-### P0-005 [FIXED] spbin 纳入恢复路径
+### P0-005 [Design v1] spbin 纳入恢复路径
 - **问题**：续传只算 `pbin-dpbin`，不读 spbin。被熔断目录永久丢失
 - **根因**：spbin 不在恢复逻辑中
 - **方案**：
@@ -62,7 +62,7 @@
   3. 探测成功 → 设备标记 NORMAL，spbin 该设备条目删除；探测失败 → timestamp 更新，指数退避（30min→2h→6h→24h）
   4. spbin 保持 append-only，正常退出时 compaction 清理已恢复条目
 - **关联**：P1-002 errno 分类矩阵
-- **状态**：设计已确认
+- **状态**：Design v1 已确认，待编码实现
 - **评审来源**：外部评审 P0-5
 
 ### P0-006 [NEW] MSG_DROP 正常路径禁止
@@ -106,7 +106,7 @@
 - **关联**：P0-001, P0-002
 - **评审来源**：外部评审 §6.1
 
-### P0-010 [FIXED] 崩溃恢复矩阵——统一 Reset 援救机制
+### P0-010 [Design v1] 崩溃恢复矩阵——统一 Reset 援救机制
 - **问题**：当前恢复只覆盖 Worker 死亡一种情况，缺少 12+ 个崩溃点的覆盖
 - **根因**：试图枚举每个崩溃点的精确恢复行为，不可穷尽
 - **方案**：不枚举崩溃点，统一采用 **Reset 援救机制**：
@@ -116,26 +116,25 @@
   - **spbin 按 P0-005 处理**：超窗探测，设备活了统一入队
   - **fpbin 按 P0-003 处理**：完整则转正，不完整整对抛弃重来
   - 不需要为每个崩溃点写恢复逻辑——状态机终态唯一（COMPLETED = 写 dpbin），非终态统一重置
-- **状态**：设计已确认
+- **状态**：Design v1 已确认，待编码实现
 - **评审来源**：外部评审 §6.2
 
-### P0-011 [WIP] 半增量跳过前提条件声明
+### P0-011 [Design v1] 半增量跳过前提条件声明
 - **问题**：盲信跳过的前置条件、粒度、收益描述不准确
-- **方向**：
-  1. 盲信跳过默认关闭，仅 `--skip-interval` 显式开启
-  2. 首次扫描必须全量（不带 `--skip-interval`）
-  3. 依赖文件系统"目录 mtime 随子项变动而更新"前提
-  4. 收益上限：省下已存在文件的 lstat + 输出 I/O；readdir 本身省不掉
-- **状态**：Design.md §4.3 已部分修正，需继续完善
+- **澄清与结论**：
+  1. **目录 mtime 传播性无关紧要**：盲信扫描直接采信 pbin 中记录的**文件级 mtime**，不依赖目录 mtime 是否向上传播
+  2. **reference_map 内存膨胀可接受**：盲信扫描不更新 reference_map（只读）。全量扫描时重建 reference_map，旧数据自然丢弃。若用户指定 `--runone` 但目标目录非空，exit(2) 提示清理
+  3. **文件级粒度是默认行为**：目录本身仍须 readdir + lstat（发现新增/删除），但目录下的**已有文件**可盲信跳过 lstat。两者不冲突
+- **状态**：Design v1 已确认（前提澄清完毕）
 - **评审来源**：Jimmy 评审 / 外部评审
 
-### P0-012 [WIP] epoch + waitpid 确认（旧 Worker 残留数据）
+### P0-012 [Design v1] epoch + waitpid 确认（旧 Worker 残留数据）
 - **问题**：SIGKILL 后旧 Worker 的 Scanner 线程可能仍在内核中完成最后的 write()，残留数据在 pipe 中
-- **方向**：
-  1. epoch 机制：每个目录派发时附加递增 epoch，Worker 返回 BATCH 携带 epoch，Master 丢弃过期 epoch
-  2. waitpid 确认：cleanup 中 SIGKILL 后 waitpid(WNOHANG) 轮询，确认旧进程回收后才 spawn 新 Worker
-  3. pipe 清空：CMD_REPLACE 时 IPC 线程先 drain 旧 pipe 残留
-- **状态**：已在 todo，待设计确认
+- **方案**：
+  1. **epoch 机制**：每个 CMD_SCAN 附带递增 epoch（64 位原子计数器），Worker 返回 BATCH 携带 epoch，Master 丢弃过期 epoch
+  2. **waitpid 确认**：SIGKILL 后轮询 waitpid(WNOHANG) 直到旧进程回收，通常 < 1ms
+  3. **pipe drain**：CMD_REPLACE 时 IPC 线程先清空旧 pipe 读缓冲区
+- **状态**：Design v1 已确认，待编码实现
 - **评审来源**：Jimmy 评审 A
 
 ---
