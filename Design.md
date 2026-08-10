@@ -529,7 +529,13 @@ Master                                    Worker
 
 ### 8.1 pbin — 进度分片（全量扫描记录）
 
-记录**所有扫描过的条目**（目录 + 文件），每条包含：路径、设备号、inode、mtime、d_type。文本格式 + Footer 自描述。每 10 万行切分，命名 `{base}.pbin.{NNNNNN}`。
+记录**所有扫描过的条目**（目录 + 文件），每条包含：路径、设备号、inode、mtime、d_type。**二进制格式**，每条记录结构为：
+```
+[path_len: size_t][path: N bytes][dev: dev_t][ino: ino_t][mtime: time_t][d_type: unsigned char]
+```
+每 10 万行切分，命名 `{base}_000000.pbin`。分片末尾写 Footer 自描述（记录数 + 校验）。
+
+**平台兼容性约束**：pbin/fpbin/dpbin 的二进制字段宽度（`size_t`、`dev_t`、`ino_t`、`time_t`）与平台相关。**进度文件仅在同架构、同机器上可续传**，不保证跨 x86_64/aarch64、不保证跨 32/64 位、不保证跨大端/小端。
 
 **为什么同时记录文件**：pbin 是盲信扫描的基准来源。`restore_progress_to_memory()` 从 pbin 重建 `reference_map`（fingerprint → mtime/d_type），盲信时直接查表跳过 lstat。若 pbin 不记录文件，盲信对文件无从谈起。
 
@@ -556,6 +562,8 @@ Master                                    Worker
 ### 8.6 archive — 压缩归档
 
 gzip 压缩的 pbin 块 + spbin 块。`block_type = 0/1` 区分。
+
+**平台兼容性约束**：archive 中的 pbin 块继承同平台的二进制字段宽度，恢复时必须校验架构一致性（见 §12.4 平台兼容性检查）。
 
 ---
 
@@ -630,17 +638,38 @@ cd /root/listfiles && make clean && make
 # 全量扫描
 ./listfiles -p /public2/data -o /tmp/output.txt -f /tmp/progress
 
-# 续传
+# 续传（同机同架构）
 ./listfiles -p /public2/data -o /tmp/output.txt -f /tmp/progress -c
 
-# 盲信扫描（需已有完整基准）
+# 盲信扫描（需已有完整基准，同机同架构）
 ./listfiles -p /public2/data -o /tmp/output.txt -f /tmp/progress -c --skip-interval=604800
 ```
 
+### 平台兼容性检查（续传 / 盲信扫描强制）
+
+续传或盲信扫描时，程序读取 `{base}.config` 中的系统架构签名，与当前运行环境比对：
+
+| 字段 | 说明 | 不一致时的行为 |
+|------|------|---------------|
+| `arch` | CPU 架构（x86_64 / aarch64） | 拒绝续传，要求 `--runone` 全量扫描 |
+| `endian` | 字节序（little / big） | 拒绝续传，要求 `--runone` |
+| `word_size` | 字长（32 / 64） | 拒绝续传，要求 `--runone` |
+| `glibc_version` | glibc 版本（兼容性参考） | 输出 warning，不拒绝 |
+
+`.config` 在首次全量扫描时自动生成。若文件缺失（旧版本进度），视为不兼容，强制 `--runone`。
+
+**退出码**：架构不匹配时返回 3，stderr 输出 `[FATAL] 进度文件架构不兼容：期望 x86_64/little/64，实际 aarch64/little/64。请使用 --runone 重新全量扫描。`
+
 ### NFS 挂载要求
 ```bash
-mount -t nfs -o soft,intr,timeo=600,retrans=3 server:/public2 /public2
+mount -t nfs -o soft,timeo=6000,retrans=3 server:/public2 /public2
 ```
+
+**参数说明**：
+- `soft`：元数据操作超时时返回错误（避免 D-State 不可杀）
+- `timeo=6000`：超时时间为 600 秒（单位是十分之一秒）
+- `retrans=3`：超时后重传 3 次
+- **注意**：`intr` 在 CentOS 7.4 内核（3.10）中无效，已移除
 
 ---
 
