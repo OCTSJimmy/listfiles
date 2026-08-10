@@ -141,10 +141,9 @@
 
 ## P1 重要项（不阻塞但需尽快）
 
-### P1-001 [WIP] 恢复时加载 dspill 并集
+### P1-001 [Covered by P0-004] 恢复时加载 dspill 并集
 - **问题**：恢复逻辑未读取 dspill，背压跳推的目录可能丢失
-- **方向**：`restore_progress()` 增加 `load_dspill_entries()`，dspill 路径与 pbin 差集做并集
-- **状态**：已在 todo，待设计确认
+- **状态**：已纳入 P0-004 统一队列模型。dspill 是 dispatch_queue 的磁盘扩展，恢复时自动读取回填。无需单独处理。
 - **评审来源**：Jimmy 评审
 
 ### P1-002 [WIP] errno 分类矩阵
@@ -171,13 +170,9 @@
 - **状态**：已在 todo，待设计确认
 - **评审来源**：Jimmy 评审 C
 
-### P1-004 [WIP] 毒丸目录清单（致死 3 次隔离）
+### P1-004 [Covered by P0-005] 毒丸目录清单（致死 3 次隔离）
 - **问题**：某目录内存在必崩条目 → Worker 反复被杀 → 拖垮设备熔断统计
-- **方向**：
-  1. 同一目录因任何原因（DEV_TIMEOUT、ERROR、ENTRY_ERROR 中的 EIO/ETIMEDOUT）导致 Worker 死亡累计 3 次，直接进隔离清单
-  2. 隔离清单 `{base}.poison`，带原因码（POISON_IO_ERROR、POISON_TIMEOUT、POISON_UNKNOWN）
-  3. 毒丸目录不计入设备级错误统计
-- **状态**：已在 todo，待设计确认
+- **状态**：已纳入 P0-005 spbin 扩展。spbin reason 码增加 `POISON(5)`，同一目录致死 3 次直接进 POISON，永久跳过，不计入设备级错误统计。
 - **评审来源**：Jimmy 评审 D
 
 ### P1-005 [WIP] 设备级熔断 DEGRADED 灰度态
