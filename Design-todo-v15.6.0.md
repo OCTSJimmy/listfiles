@@ -1,3 +1,66 @@
+# Design-todo-v15.6.0.md 插入内容
+
+> 警告：本文档是 **v15.6.0 规划文档**，包含尚未编码实现的设计变更。当前代码事实请参考 `Design.md`（v15.5.9）。
+
+---
+
+## 0. 待修正项（来自设计评审）
+
+以下修正尚未合并到正文，需在编码前落实：
+
+### 0.1 discovered_set 目录级限定（关闭 P0-002 反例）
+- `discovered_set` **严格只包含目录**（`d_type == directory`）
+- 文件记录不进入目录任务去重集合
+- 恢复时从 pbin 只加载目录记录
+- 文件输出语义 = **at-least-once**（允许重复行）
+
+### 0.2 pbin 格式扩展
+当前：`[path_len][path][dev][ino][mtime][d_type]`
+需扩展为：
+```
+[path_len][path][d_type][mtime_sec][mtime_nsec][size][uid][gid][mode][dev][ino][flags]
+```
+- flags: 标记盲信安全字段版本
+- dev/ino: 仅全量扫描/诊断用，盲信不用
+- atime: **完全排除**（NFS 不可信）
+
+### 0.3 盲信扫描信任模型
+- **信任本轮 readdir**: 存在性、路径名称、目录成员关系
+- **信任历史 pbin**: size, mtime, uid, gid, mode, d_type
+- **不信任**: atime, dev+ino（不参与盲信身份判断）
+- **skip_interval 改名**: `blind_min_age`（死数据启发式，非变更检测）
+
+### 0.4 两级扫描体系
+- **第一层**: 低频全量重扫（~2周），建立/刷新基准
+- **第二层**: 高频盲信扫描（2/6/12/24/48h），复用基准
+- 盲信结果 **不能链式作为下次基准**（baseline_eligible = false）
+- 基准有效期由 **业务层控制**，工具仅记录 `baseline_completed_at` 供审计
+
+### 0.5 dpbin 与输出截断
+- 接受 at-least-once，不精确回滚输出到 dpbin offset
+- 恢复时仅截断损坏的输出尾部（不完整最后一条记录）
+- 未完成目录重扫后，文件条目可能重复输出
+
+### 0.6 d_type 不一致处理
+- 路径命中但本轮 `d_type` != 历史 `d_type` → 视为盲信未命中，必须重新 lstat
+- 防止"文件变目录、目录变文件"误判
+
+### 0.7 manifest 扩展
+`.config` 升级或拆分为独立 `manifest`：
+- baseline_run_id, baseline_completed_at, baseline_checksum
+- 盲信命中率统计
+- pbin_schema_version
+
+### 0.8 仍阻塞的 P0
+| P0 | 问题 | 状态 |
+|----|------|------|
+| P0-001 | FINISH/BATCH 竞态 — 批次完整性协议 | 待设计 |
+| P0-003 | fpbin/dfpbin 上次遗留 vs 本次生成阶段拆分 | 待设计 |
+| P0-008 | manifest 完整性 — .config 升级 | 待设计（已提出方案） |
+| P0-012 | RET_ERROR 持久化顺序 — 先写 spbin 再 pending_tasks-- | 待设计 |
+
+---
+
 # listfiles 架构设计文档
 
 > 文档版本：v15.6.0  
