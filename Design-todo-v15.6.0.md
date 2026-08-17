@@ -6,7 +6,9 @@
 
 ## 0. 待修正项（来自设计评审）
 
-以下修正尚未合并到正文，需在编码前落实：
+以下修正尚未合并到正文，需在编码前落实。
+
+---
 
 ### 0.1 discovered_set 目录级限定（关闭 P0-002 反例）
 - `discovered_set` **严格只包含目录**（`d_type == directory`）
@@ -51,24 +53,532 @@
 - 盲信命中率统计
 - pbin_schema_version
 
-### 0.8 仍阻塞的 P0（Design v1 已确认，待编码实现）
+---
 
-| P0 | 问题 | 状态 | 方案摘要 |
-|----|------|------|---------|
-| P0-001 | FINISH/BATCH 竞态 — 批次完整性协议 | **Design v1** | 目录任务状态机：FINISH 仅触发 `ALL_BATCHES_RECEIVED`，必须等全部 BATCH 处理、子目录入队、输出偏移确认后才写 dpbin。空目录可直通完成。 |
-| P0-003 | fpbin/dfpbin 上次遗留 vs 本次生成阶段拆分 | **Design v1** | `fpbin+dfpbin` 原子对作为可抛弃工作区。Footer 校验完整则合并转正，不完整则整对抛弃回退旧 pbin。不会无限套娃。 |
-| P0-008 | manifest 完整性 — .config 升级 | **Design v1** | `.config` 升级为独立 `{base}.manifest`，包含 `baseline_run_id`、`baseline_completed_at`、`baseline_checksum`、盲信命中率统计、`pbin_schema_version`。`baseline_eligible=true` 需严格满足完整性条件。原子切换通过 `{base}.archive.new` + `rename()` 实现。 |
-| P0-012 | RET_ERROR 持久化顺序 — 先写 spbin 再 pending_tasks-- | **Design v1** | 严格线性顺序：校验 epoch → 写 `spbin(path, reason=PROBE_FAIL, timestamp, device_key)` → `pending_tasks--` → 状态机推进 `DEVICE_WAITING` → `device_mgr_mark_probing()`。`spbin` 写入在 `pending_tasks--` 之前，崩溃恢复时安全重试。当前目录不重入队，由恢复时的敢死队探测决定。 |
+## P0 阻塞项（进入编码前必须闭环）
 
-**关联 Design v1 已确认项：**
-- P0-002 [Design v1] 输出三态状态机 — `OUTPUT_COMMITTED` 态已定义
-- P0-004 [Design v1] 统一队列模型 — `discovered/enqueued/completed` 三态拆分 + dspill 统一队列
-- P0-005 [Design v1] spbin 纳入恢复路径 — 时间窗口 + 敢死队探测
-- P0-006 [Design v1] MSG_DROP 废除 — IPC 队列扩至 65536
-- P0-007 [Design v1] RET_ERROR 状态机 — 写 spbin + 设备级退避
-- P0-009 [Design v1] 目录任务生命周期 10 态 — 状态机完整定义
-- P0-010 [Design v1] Reset 援救机制 — 非终态统一重来
-- P0-011 [Design v1] 半增量跳过前提 — 信任模型和两级体系已定义
+> 全部 12 项 Design v1 已确认，可进入编码实现。
+
+---
+
+### P0-001 FINISH/BATCH 竞态 — 目录任务完成屏障
+
+**问题描述**
+Worker 先发 BATCH 再发 FINISH，但 `fd_data` 和 `fd_ctrl` 是独立 epoll 通道。Master 可能先收到 FINISH 标记目录完成，后续 BATCH 滞留丢失，子树永久漏扫。
+
+**根因分析**
+FINISH 语义不等待 BATCH 全处理。当前设计收到 FINISH 后直接 `pending_tasks--` 并标记目录完成，没有确认该目录产生的全部 BATCH 是否已被接收和处理。
+
+**设计方案**
+目录任务生命周期状态机定义 `SCANNING → ALL_BATCHES_RECEIVED → ALL_BATCHES_PROCESSED → OUTPUT_COMMITTED → COMPLETED` 路径：
+1. FINISH 仅触发 `ALL_BATCHES_RECEIVED`（收到 Worker 声明的扫描结束信号）
+2. 必须等该目录产生的**全部 BATCH** 被 Master 接收并处理
+3. 所有子目录完成去重并入队（或写入 dspill）
+4. 该目录下所有文件条目经输出线程确认已落盘（`OUTPUT_COMMITTED`）
+5. 最后才写 `dpbin`，标记 `COMPLETED`
+6. **空目录**（无 BATCH，直接 FINISH）可直通完成
+
+**关键实现点**
+- Master 侧维护每个目录任务的 `expected_batch_count` 或批次序号追踪
+- 收到 FINISH 后状态机推进到 `ALL_BATCHES_RECEIVED`，但不释放 Worker 也不减 `pending_tasks`
+- 去重线程池完成该目录全部 BATCH 处理后，通知主线程推进到 `ALL_BATCHES_PROCESSED`
+- 输出线程确认落盘后推进到 `OUTPUT_COMMITTED`
+- 只有 `OUTPUT_COMMITTED` 后才能 `dpbin_append` 和 `pending_tasks--`
+
+**关联项**: P0-009 目录任务生命周期状态机
+
+---
+
+### P0-002 输出三态状态机 — DISCOVERED → OUTPUT_QUEUED → OUTPUT_COMMITTED
+
+**问题描述**
+pbin 记录"已发现"不代表"已输出"。崩溃后恢复时，已写 pbin 但未写输出的文件条目可能永久丢失（如果输出被截断且重扫时被 discovered_set 抑制）。
+
+**根因分析**
+发现态与输出提交态混用。当前设计把"写进 pbin"当作"该条目已处理完毕"，但 pbin 和输出是异步的，存在崩溃窗口。
+
+**设计方案**
+目录任务生命周期状态机引入 `OUTPUT_COMMITTED` 态：
+1. `DISCOVERED` — batch_processor 处理新条目，写 pbin，入输出队列
+2. `OUTPUT_QUEUED` — 条目已提交到异步输出线程队列
+3. `OUTPUT_COMMITTED` — 输出线程确认该目录所有文件条目已落盘（fsync 或写入操作系统缓冲区）
+4. 只有 `OUTPUT_COMMITTED` 后才能写 `dpbin`
+
+**输出语义**
+- 全量扫描/续传：at-least-once，允许重复行
+- 盲信扫描：基准回放 + 新增发现
+- 恢复时截断损坏尾部，不精确回滚到 dpbin offset
+
+**关联项**: P0-001, P0-009
+
+---
+
+### P0-003 fpbin 二次崩溃恢复路径
+
+**问题描述**
+第一次续传期间发现新目录 A 写入 fpbin，旧 pbin 未消费完时再次崩溃。第二次续传不读 fpbin，A 永久漏扫。
+
+**根因分析**
+恢复期间父目录扫描完会写 dpbin，崩溃后父目录不在 `pbin - dpbin` 差集中，不会重扫，导致 fpbin 里的子目录永久丢失。
+
+**设计方案**
+引入 `fpbin + dfpbin` 原子对作为**可抛弃工作区**：
+1. **dfpbin** 记录 fpbin 阶段已完成的父目录（格式同 dpbin）
+2. 恢复时检查 `fpbin + dfpbin` 完整性（Footer 校验通过）
+   - **完整** → fpbin 内容合并到 pbin，清空 fpbin/dfpbin，进入 `HIST_PUMP_NEW`
+   - **不完整** → **整对抛弃**，重新从旧 pbin 恢复（Reset 援救）
+3. 不会无限套娃——总是回退到旧 pbin 恢复，不会递归产生新的 fpbin
+4. 旧 pbin 全部消费完后 `hist_pump_state = HIST_PUMP_DONE`，fpbin 转正入队
+
+**关键实现点**
+- dfpbin 只记录 fpbin 阶段已完成的父目录路径（不是 fpbin 里的子目录）
+- Footer 校验不通过 → 视为不完整，整对抛弃
+- 重新扫描时，父目录会重新从旧 pbin 入队，重新发现子目录
+- 若某父目录总是导致崩溃，会触发目录级熔断/毒丸机制（P0-005），不会无限循环
+
+---
+
+### P0-004 visited_set 背压竞态 — 统一队列模型
+
+**问题描述**
+目录因背压写 pbin 后进 visited_set，但未入队，只进 dspill。回填时 visited_set 误判"已访问"而丢弃。
+
+**根因分析**
+"已发现"等价于"已入队"。单一套合 `visited_set` 同时承担发现去重和入队去重，导致背压场景下逻辑冲突。
+
+**设计方案**
+1. **dspill 是 dispatch_queue 的磁盘扩展**，不是独立缓存池（append-only，字节游标回填）
+2. 废除 pbin cursor 运行时回填（v15.5.8 已改用 dspill，文档需同步修正）
+3. **visited_set 语义拆分为三态**：
+   - `discovered_set`：已发现（已写 pbin），防重复发现
+   - `enqueued_set`：已入队（dispatch_queue 或 dspill），防重复入队
+   - `completed_set`：已完成（dpbin），防重复扫描
+4. **统一 `enqueue()` 调度入口**：所有待扫描目录（恢复 pump、运行时新发现、dspill 回填）都走同一入口
+5. dspill 写入策略：内存缓冲池 1000 条 / 1 秒刷盘，崩溃丢失可接受（pbin 是权威持久化）
+
+**背压链路**
+```
+batch_processor 发现新目录
+  → enqueue()
+    → dispatch_queue < HIGH_WATER（10万）?
+      → 是：入 dispatch_queue，标记 enqueued_set
+      → 否：入 dspill 内存缓冲池，标记 enqueued_set
+  → 主线程每轮检查 dispatch_queue 水位
+    → < LOW_WATER（3万）：从 dspill 游标读取 5000 条 → 回填 dispatch_queue
+```
+
+---
+
+### P0-005 spbin 纳入恢复路径
+
+**问题描述**
+续传只算 `pbin - dpbin`，不读 spbin。被熔断/跳过的目录可能永久丢失。
+
+**根因分析**
+spbin 不在恢复逻辑中。设备恢复后，这些目录无人重新入队。
+
+**设计方案**
+1. **spbin 格式扩展**：
+   ```
+   [path_len][path][reason: uint8_t][timestamp: time_t][device_key: 64 bytes]
+   ```
+2. **恢复时按 device_key 分组处理**：
+   - `PERMISSION(4)` / `CIRCUIT_BREAKER(3)` / `POISON(5)` → 永久跳过
+   - `PROBE_FAIL(1)` / `TIMEOUT(2)` → 检查最新 timestamp
+     - 未超窗 → 保持跳过
+     - 超窗 → 敢死队探测该设备（随机抽样子路径 `opendir → readdir → closedir`）
+       - 成功 → 设备标记 NORMAL，整组入队
+       - 失败 → timestamp 更新，指数退避（30min → 2h → 6h → 24h）
+3. **spbin 保持 append-only**，正常退出时 compaction 清理已恢复条目
+4. 探测成功不立即修改 spbin（避免随机写），而是在内存标记 RECOVERED，正常退出时重写 spbin 过滤
+
+**关联项**: P1-002 errno 分类矩阵
+
+---
+
+### P0-006 MSG_DROP 正常路径禁止
+
+**问题描述**
+MSG_DROP 只销账不补救，若 BATCH 被 drop 则结果丢失。
+
+**根因分析**
+协议层允许丢结果。IPC 线程 → 主线程队列满时生成 MSG_DROP，而不是背压。
+
+**设计方案**
+1. **正常路径禁止 drop**，队列满时应背压
+2. IPC 队列容量从 1024 扩至 **65536**（约 2MB 内存），使容量瓶颈永远在 dispatch_queue 而非 IPC 层
+3. 主线程优先 drain：每次 `epoll_wait` 之前先把 IPC 队列排空
+4. **MSG_DROP 降级为 panic 路径**：队列满直接 `log_fatal`，因为这在设计正常时不应发生
+5. 两层背压收敛到一处：dispatch_queue + dspill。Worker 发送永远不被丢弃
+
+---
+
+### P0-007 RET_ERROR 状态机补全
+
+**问题描述**
+`BUSY -- RET_ERROR --> IDLE`，但 `pending_tasks` 是否减、目录是否重入队、是否写 spbin 均未定义。
+
+**根因分析**
+状态机缺漏。RET_ERROR 是设备级错误（EIO/ENODEV），不是目录问题。
+
+**设计方案**
+1. RET_ERROR → **pending_tasks--**（Worker 已释放）
+2. 当前目录**不重入队**（避免重试风暴）
+3. 写入 **spbin**，带原因码 `SP_REASON_PROBE_FAIL`
+4. 目录任务状态机推进到 `DEVICE_WAITING`
+5. 设备进入 `PROBING` 态，由 probe_scheduler 敢死队探测
+6. 设备恢复后，spbin 中该设备所有目录统一重新入队（见 P0-005）
+
+**关键规则**
+- 不重试单个目录（设备级错误不是目录问题）
+- 不立即重入队（避免重试风暴导致设备更差）
+- 由设备恢复后的统一入队机制处理
+
+---
+
+### P0-008 Run manifest + baseline_eligible 原子切换
+
+**问题描述**
+上次扫描可能不完整（spbin 非空、dspill 未排空等），但没有机制阻止它成为盲信基准。
+
+**根因分析**
+缺少运行完整性标记。当前 `.config` 只存运行参数，不表达"本次运行是否完整"。
+
+**设计方案**
+1. `.config` 升级为独立 `{base}.manifest`（文本/JSON 格式，便于审计），包含：
+   - `run_id`, `target_path`, `schema_version`, `tool_version`
+   - `status`（Running / Success / Incomplete / Failed）
+   - `started_at`, `finished_at`
+   - 统计：dirs, files, skipped, errors, bytes
+   - `spbin_count`, `dspill_offset`
+   - `baseline_eligible`（布尔）
+   - `baseline_run_id`, `baseline_completed_at`, `baseline_checksum`
+   - 盲信命中率统计
+   - `pbin_schema_version`
+   - `output_checksum`
+2. **`baseline_eligible = true` 的严格条件**（必须同时满足）：
+   - `status == complete`（正常结束，非 Incomplete）
+   - `spbin` 为空（或被熔断目录数 == 0）
+   - `dspill` 已排空
+   - `fpbin` 不存在或已转正
+   - archive 校验通过（gzip footer 校验）
+   - 输出尾部完整
+3. **盲信扫描启动时**：读取 manifest → `baseline_eligible != true` → 拒绝运行，`exit(2)`
+4. **原子切换**：
+   - 新 archive 先写 `{base}.archive.new`
+   - 校验通过后 `rename()` 覆盖旧 archive
+   - 旧基准保留为 `{base}.archive.prev`
+   - manifest 同步更新
+
+**关键原则**
+- 完整性由工具强制，时效性由业务控制
+- 盲信结果 `baseline_eligible = false`（不能链式作为下次基准）
+
+---
+
+### P0-009 目录任务生命周期状态机
+
+**问题描述**
+当前只有"派发/完成"二元态，缺少中间状态定义，导致多个 P0 问题的根因无法精确描述。
+
+**设计方案**
+引入显式 10 态 + 4 异常分支：
+
+```
+                         目录 P 被 readdir 发现
+[DISCOVERED] ──────────────────────────────────────────> [PERSISTED]
+                                                              │
+                                                              │ write_pbin 成功
+                                                              ▼
+                                                        [ENQUEUED]
+                                                              │
+                                                              │ dispatch_from_queue 弹出
+                                                              ▼
+                                                        [DISPATCHED]
+                                                              │
+                                                              │ CMD_SCAN 发送成功(epoch++)
+                                                              ▼
+                                                         [SCANNING]
+                                                              │
+                                    ┌───────────────────────┼───────────────────────┐
+                                    │                       │                       │
+                                    ▼                       ▼                       ▼
+                              [ALL_BATCHES         [RETRYING]              [BACKOFF]
+                               _RECEIVED]            (Worker 死亡)            (熔断退避)
+                                    │                       │                       │
+                                    │ Worker 替换成功        │ 退避到期              │
+                                    └───────────────────────┼───────────────────────┘
+                                    │                       │
+                                    ▼                       ▼
+                              [ALL_BATCHES                                        [DEVICE_WAITING]
+                               _PROCESSED]                                         (设备 PROBING)
+                                    │                                                │
+                                    │ 输出线程确认                                    │ 设备恢复
+                                    ▼                                                ▼
+                              [OUTPUT_COMMITTED]                              [ENQUEUED]（重入队）
+                                    │
+                                    │ dpbin_append 成功
+                                    ▼
+                              [COMPLETED]
+```
+
+| 状态 | 含义 | 可转移 | dpbin？ |
+|------|------|--------|---------|
+| `DISCOVERED` | readdir 发现但尚未写 pbin | PERSISTED | 不写 |
+| `PERSISTED` | 已写 pbin（崩溃可恢复） | ENQUEUED | 不写 |
+| `ENQUEUED` | 在 dispatch_queue 或 dspill 中 | DISPATCHED | 不写 |
+| `DISPATCHED` | 已发给 Worker，等待 SCANNING 确认 | SCANNING | 不写 |
+| `SCANNING` | Worker 正在扫描 | ALL_BATCHES_RECEIVED / RETRYING / BACKOFF / DEVICE_WAITING | 不写 |
+| `ALL_BATCHES_RECEIVED` | 收到该目录所有 BATCH + FINISH | ALL_BATCHES_PROCESSED | 不写 |
+| `ALL_BATCHES_PROCESSED` | batch_processor 处理完所有条目 | OUTPUT_COMMITTED | 不写 |
+| `OUTPUT_COMMITTED` | 输出线程确认该目录文件已落盘 | COMPLETED | 不写 |
+| `COMPLETED` | 完整闭环 | 终态 | **写 dpbin** |
+| `RETRYING` | Worker 死亡，等待替换重发 | ENQUEUED | 不写 |
+| `BACKOFF` | 目录级熔断，指数退避 | ENQUEUED | 不写 |
+| `DEVICE_WAITING` | 设备 PROBING，目录在 spbin 中等待 | ENQUEUED | 不写 |
+| `SKIPPED_FAILED` | 永久跳过（PERMISSION/CIRCUIT_BREAKER/毒丸） | 终态 | 不写 |
+| `UNKNOWN` | 异常终止，状态丢失 | 恢复时按 Reset 援救处理 | 不写 |
+
+**关键规则**
+- 只有 `COMPLETED` 写 dpbin
+- `SKIPPED_FAILED` 阻止本次运行标记为完整（`baseline_eligible = false`）
+- `OUTPUT_COMMITTED` 之前崩溃 → 恢复时该目录在 `discovered_set - completed_set` 中，重新扫描
+- `SCANNING` 中崩溃 → 同上，Worker 的 BATCH 可能部分丢失，重新扫描
+
+**关联项**: P0-001, P0-002
+
+---
+
+### P0-010 崩溃恢复矩阵 — Reset 援救机制
+
+**问题描述**
+当前恢复只覆盖 Worker 死亡一种情况，缺少 12+ 个崩溃点的精确恢复行为定义。
+
+**根因分析**
+试图枚举每个崩溃点的精确恢复行为，不可穷尽。
+
+**设计方案**
+不枚举崩溃点，统一采用 **Reset 援救机制**：
+1. **核心原则**：任何目录只要状态 ≠ `COMPLETED`（未写 dpbin），就视为未扫描
+2. **恢复时**：这些目录在 `discovered_set - completed_set` 中，重新入队
+3. **re-scan 幂等**：已写 pbin 但未完成的目录，重新扫描是安全的
+4. **输出截断**：恢复时输出文件截断到最后一个已确认 dpbin 对应的位置（或损坏尾部）
+5. **spbin 按 P0-005 处理**：超窗探测，设备活了统一入队
+6. **fpbin 按 P0-003 处理**：完整则转正，不完整整对抛弃重来
+7. **不需要为每个崩溃点写恢复逻辑**——状态机终态唯一（`COMPLETED = 写 dpbin`），非终态统一重置
+
+**覆盖的崩溃点**（非穷尽，统一处理）：
+- Worker 发送 BATCH 前崩溃
+- Worker 发送 BATCH 后、Master 读取前崩溃
+- Master 读取后、去重前崩溃
+- 去重后、pbin 落盘前崩溃
+- pbin 落盘后、输出落盘前崩溃
+- Worker 发送 FINISH 前崩溃
+- FINISH 已处理但最后 BATCH 未处理
+- dpbin 已写但子目录未持久化
+- fpbin 转正前崩溃
+- archive 压缩中崩溃
+- 新基准覆盖旧基准时崩溃
+- 输出线程崩溃
+- Master 收到 SIGTERM/SIGINT
+
+---
+
+### P0-011 半增量跳过前提条件声明
+
+**问题描述**
+盲信跳过的前置条件、粒度、收益描述不准确，存在设计矛盾。
+
+**澄清与结论**
+1. **目录 mtime 传播性无关紧要**：盲信扫描直接采信 pbin 中记录的**文件级 mtime**，不依赖目录 mtime 是否向上传播
+2. **reference_map 内存膨胀可接受**：盲信扫描不更新 reference_map（只读）。全量扫描时重建 reference_map，旧数据自然丢弃
+3. **文件级粒度是默认行为**：目录本身仍须 `readdir + lstat`（发现新增/删除），但目录下的**已有文件**可盲信跳过 lstat。两者不冲突
+4. **盲信 key 改为完整路径**：不依赖 `dev + ino`（不做 lstat 无法获取），以路径命中 reference_map
+5. **两级扫描体系**：低频全量重扫（~2周建基准）+ 高频盲信扫描（2/6/12/24/48h复用基准）
+6. **盲信结果不能链式作为基准**：`baseline_eligible = false`
+
+---
+
+### P0-012 epoch + waitpid 确认（旧 Worker 残留数据）
+
+**问题描述**
+SIGKILL 后旧 Worker 的 Scanner 线程可能仍在内核中完成最后的 write()，残留数据在 pipe 中。新 Worker 连接同一个 fd_data 后，Master 读到旧 Worker 残留的 BATCH 数据，导致输出污染。
+
+**设计方案**
+1. **epoch 机制**：
+   - 每个 CMD_SCAN 附带递增 epoch（64 位原子计数器）
+   - Worker 返回 BATCH/FINISH 携带 epoch
+   - Master 校验 epoch 匹配，不匹配则丢弃（旧 Worker 残留数据）
+2. **waitpid 确认**：
+   - SIGKILL 后轮询 `waitpid(WNOHANG)` 直到旧进程回收
+   - 通常 < 1ms，但必须有确认才 spawn 新 Worker
+3. **pipe drain**：
+   - CMD_REPLACE 时 IPC 线程先清空旧 pipe 读缓冲区
+   - 或者关闭旧 fd，新 Worker 使用新 fd
+
+**关键实现点**
+- epoch 是 64 位原子递增，不会回绕
+- 过期 epoch 的 BATCH 直接丢弃，不计入任何目录任务
+- 丢弃时记 WARN 日志，便于审计
+- 与 P0-001 的 ALL_BATCHES_RECEIVED 结合：过期 epoch 的 BATCH 不影响"批次完整性"判断
+
+---
+
+## P1 重要项（不阻塞 P0 编码，但需尽快设计确认）
+
+### P1-001 恢复时加载 dspill 并集
+**状态**：已纳入 P0-004 统一队列模型。dspill 是 dispatch_queue 的磁盘扩展，恢复时自动读取回填。无需单独处理。
+
+### P1-002 errno 分类矩阵
+**问题**：EINTR/ESTALE/ETIMEDOUT/EIO/ENOENT 未统一分类处理，导致设备级和条目级错误混淆。
+
+**方向**：
+
+| 错误码 | 分类 | 行为 |
+|--------|------|------|
+| EINTR | 瞬态信号中断 | 有界重试（3 次，间隔 1ms） |
+| ESTALE | NFS stale handle | 按父目录 dirfd 重新解析；仍失败→设备嫌疑 |
+| ETIMEDOUT/EIO | 设备级故障 | 喂给 probe_scheduler，计数熔断 |
+| EACCES | 权限终态 | DIR_ERROR + SP_REASON_PERMISSION，不重试 |
+| ENOENT/ENOTDIR | 竞态删除 | 静默跳过，记 debug 日志 |
+| ENAMETOOLONG | 覆盖边界 | DIR_ERROR，不可静默 |
+| ENOMEM | 本地资源耗尽 | log_fatal，终止运行 |
+
+### P1-003 设备身份主键改为 (fsid, server, export)
+**问题**：NFS failover 后 st_dev 变，熔断状态错挂或丢失。
+
+**方向**：
+1. 设备身份 = `(fsid, server, export_path)`，fsid 来自 `statfs()->f_fsid`
+2. st_dev 仅用于运行时快速查找，启动时建立 st_dev → (fsid, server, export) 映射
+3. spbin 中记录 (fsid, server, export) 而非仅 st_dev
+
+### P1-004 毒丸目录清单（致死 3 次隔离）
+**状态**：已纳入 P0-005 spbin 扩展。spbin reason 码增加 `POISON(5)`，同一目录致死 3 次直接进 POISON，永久跳过，不计入设备级错误统计。
+
+### P1-005 设备级熔断 DEGRADED 灰度态
+**问题**：ParaStor 单 OST 故障表现为局部 EIO，设备级不跳、目录级狂跳。
+
+**方向**：
+1. 错误聚合：单位时间内设备 EIO/ETIMEDOUT 目录数占比
+2. >10% 目录报错 → DEV_STATE_DEGRADED（健康目录正常扫描，报错目录单独探测）
+3. >50% → DEV_STATE_DEAD
+4. 探活粒度细化：从 spbin 随机抽样多个子路径分别探活
+
+### P1-006 IPC 协议显式字段编码 + protocol_version
+**问题**：Header 是 TLV，但 payload 内部用 struct stat memcpy，锁死 ABI。
+
+**方向**：
+1. struct stat 展开为显式字段序列（st_ino(8) + st_mode(4) + st_nlink(4) + ...）
+2. Header 增加 protocol_version(uint16_t)，当前为 1
+3. 接收端校验 protocol_version，不匹配则 log_fatal
+
+### P1-007 输出完整性语义声明
+**问题**：输出是精确快照还是近似快照？是否允许重复？删除是否有 tombstone？
+
+**方向**：
+1. 全量扫描：at-least-once 快照，不保证 exactly-once
+2. 盲信扫描：基准回放 + 新增发现，不保证变更检测、不保证删除可见
+3. 退出码区分：0=完全完成、1=部分完成、2=严重失败
+4. 失败目录下的旧基准不结转（避免假存在）
+
+### P1-008 输出文件续写语义
+**问题**：-c 续传时输出是追加还是覆盖？已写入行如何避免重复？
+
+**方向**：
+1. 输出文件续传时追加（基于 output_offset checkpoint）
+2. 恢复时截断输出到最后一个已确认提交的 dpbin 偏移
+3. 输出文件损坏检测：启动时校验输出文件大小与 dpbin 最后记录一致
+4. -O 分片模式：记录每个分片的 output_offset，续传时从原分片继续
+
+### P1-009 pbin 文本格式 → 二进制安全编码
+**状态**：**不成立**。实际代码中 pbin 本来就是二进制格式，`path_len` 前缀编码天然支持任意字节。
+**衍生问题**：二进制字段宽度平台相关 → 见 P3-001 平台兼容性检查。
+
+### P1-010 盲信目录枚举失败的输出语义
+**问题**：目录因设备错误无法 readdir，旧基准结转输出假存在，不结转则大规模漏输出。
+
+**方向**：
+1. 该目录及子树标记为 UNKNOWN/INCOMPLETE
+2. 不计入 completed_set，不进 dpbin
+3. 旧基准不结转（避免假存在）
+4. 进 spbin 带原因码
+5. 本次运行不能标记为"完整完成"
+
+---
+
+## P2 补充项（待设计确认，不阻塞编码）
+
+### P2-001 一致性模型声明（快照隔离近似）
+文档声明——不保证全局一致快照，每个目录的枚举+stat 原子，跨目录不保证。
+
+### P2-002 孤儿 Worker 自裁（PR_SET_PDEATHSIG）
+Worker 启动时 `prctl(PR_SET_PDEATHSIG, SIGTERM)`，Master 死后自动退出。
+
+### P2-003 续传配置校验（版本、格式、标志）
+续传时校验 target_path、format、VERSION、`--strict-nlink` 等关键字段一致。
+
+### P2-004 进度文件位置声明
+文档声明进度文件和输出文件建议放本地磁盘，不要与被扫描目录共用同一 NFS。
+
+### P2-005 容量模型（内存、磁盘、吞吐）
+给出每条路径平均长度、每条 stat 大小、12亿条目下内存公式、最低/典型/峰值内存、输出磁盘需求、IPC吞吐目标。
+
+### P2-006 长路径 / 非 UTF-8 文件名 / 换行文件名处理
+1. MAX_PATH_LENGTH 不应由 pipe 原子写反推，覆盖能力和协议分包应分离设计
+2. 路径长度超限应显式记 DIR_ERROR 而非静默截断
+3. 非 UTF-8 字节：保留原始字节，文档声明"原始字节输出"
+
+### P2-007 挂载点 / 符号链接 / bind mount 策略
+1. 是否跨越挂载点？是否只扫描根设备？
+2. 符号链接作为文件输出还是跟随？
+3. bind mount 如何处理？
+4. 遍历身份与输出身份分离：遍历防环关注物理身份(dev+ino)，输出去重可包含路径
+
+### P2-008 计数器、游标、偏移全部 64 位
+文件数、目录数、字节数、分片序号、dspill 游标、pbin 游标、output_offset、BATCH 累计数、pending 计数全部明确要求 64 位。
+
+### P2-009 全链路资源有界性论证
+为每个队列/集合写明"满了怎么办"：fingerprint_set 达 80% 触发分片落盘、spbin_entries 上限 10 万、dspill 单文件上限 1GB 滚动。
+
+### P2-010 自适应并发控制（AIMD）
+基于 readdir/lstat 延迟 p50/p99 调整 Worker 数，AIMD 算法。
+
+### P2-011 输出按大小分片
+新增 `--output-slice-size` 参数，与 `--output-slice-lines` 二选一。
+
+---
+
+## P3 长期项
+
+### P3-001 平台兼容性检查（续传 / 盲信扫描强制）
+**问题**：pbin/fpbin/dpbin 的二进制字段宽度（size_t、dev_t、ino_t、time_t）与平台相关，跨架构恢复会错位。
+
+**方向**：
+1. 首次全量扫描时 `{base}.config` 写入系统架构签名：arch、endian、word_size
+2. 续传或盲信扫描时读取 `.config` 中的架构签名，与当前环境比对
+3. 不一致 → 拒绝续传，返回退出码 3，stderr 输出 `[FATAL] 进度文件架构不兼容...请使用 --runone 重新全量扫描`
+4. `.config` 缺失（旧版本进度）→ 视为不兼容，强制 `--runone`
+5. `glibc_version` 作为兼容性参考字段，输出 warning 但不拒绝
+
+**状态**：Design.md §12.4 已更新
+
+---
+
+## 文档矛盾修正（不涉及代码，仅 Design.md 表述）
+
+| 编号 | 问题 | 位置 | 修正方向 | 状态 |
+|------|------|------|---------|------|
+| DOC-001 | IPC 消息方向表错误：§7.2 混了 M→W 和 W→M | §7.2 | 拆成两个方向表 | 待修正 |
+| DOC-002 | pbin 写入者前后不一致：§4.1 vs §5.1 | §4.1 / §5.1 | 明确 batch_processor 写 pbin，async_worker 只写输出 | 待修正 |
+| DOC-003 | "pbin 记录所有扫描过的条目"应为"已发现" | §8.1 | 修正语义 | 已修正（v15.5.9） |
+| DOC-004 | Monitor 与 Main 进程收割职责重复 | §5.1 / §5.4 | 明确唯一 owner | 待修正 |
+| DOC-005 | "新文件/变更文件输出"与盲信语义矛盾 | §4.3 | 盲信模式下不存在"变更文件" | 待修正 |
+| DOC-006 | "减少 90%+ I/O"没有论证 | §10 | 删除或补模型/测试数据 | 待修正 |
+| DOC-007 | timeo=600 单位错误（应为 6000=600秒） | §12 | 修正挂载参数 | **已修正** |
+| DOC-008 | intr 在 CentOS 7.4 无效，不应作为关键前提 | §12 | 移除 intr | **已修正** |
+| DOC-009 | pbin 格式描述错误："文本格式"实际是二进制 | §8.1 | 修正为二进制格式 + 平台兼容性说明 | **已修正** |
+
+---
 
 ---
 
