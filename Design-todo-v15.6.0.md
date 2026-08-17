@@ -51,13 +51,24 @@
 - 盲信命中率统计
 - pbin_schema_version
 
-### 0.8 仍阻塞的 P0
-| P0 | 问题 | 状态 |
-|----|------|------|
-| P0-001 | FINISH/BATCH 竞态 — 批次完整性协议 | 待设计 |
-| P0-003 | fpbin/dfpbin 上次遗留 vs 本次生成阶段拆分 | 待设计 |
-| P0-008 | manifest 完整性 — .config 升级 | 待设计（已提出方案） |
-| P0-012 | RET_ERROR 持久化顺序 — 先写 spbin 再 pending_tasks-- | 待设计 |
+### 0.8 仍阻塞的 P0（Design v1 已确认，待编码实现）
+
+| P0 | 问题 | 状态 | 方案摘要 |
+|----|------|------|---------|
+| P0-001 | FINISH/BATCH 竞态 — 批次完整性协议 | **Design v1** | 目录任务状态机：FINISH 仅触发 `ALL_BATCHES_RECEIVED`，必须等全部 BATCH 处理、子目录入队、输出偏移确认后才写 dpbin。空目录可直通完成。 |
+| P0-003 | fpbin/dfpbin 上次遗留 vs 本次生成阶段拆分 | **Design v1** | `fpbin+dfpbin` 原子对作为可抛弃工作区。Footer 校验完整则合并转正，不完整则整对抛弃回退旧 pbin。不会无限套娃。 |
+| P0-008 | manifest 完整性 — .config 升级 | **Design v1** | `.config` 升级为独立 `{base}.manifest`，包含 `baseline_run_id`、`baseline_completed_at`、`baseline_checksum`、盲信命中率统计、`pbin_schema_version`。`baseline_eligible=true` 需严格满足完整性条件。原子切换通过 `{base}.archive.new` + `rename()` 实现。 |
+| P0-012 | RET_ERROR 持久化顺序 — 先写 spbin 再 pending_tasks-- | **Design v1** | 严格线性顺序：校验 epoch → 写 `spbin(path, reason=PROBE_FAIL, timestamp, device_key)` → `pending_tasks--` → 状态机推进 `DEVICE_WAITING` → `device_mgr_mark_probing()`。`spbin` 写入在 `pending_tasks--` 之前，崩溃恢复时安全重试。当前目录不重入队，由恢复时的敢死队探测决定。 |
+
+**关联 Design v1 已确认项：**
+- P0-002 [Design v1] 输出三态状态机 — `OUTPUT_COMMITTED` 态已定义
+- P0-004 [Design v1] 统一队列模型 — `discovered/enqueued/completed` 三态拆分 + dspill 统一队列
+- P0-005 [Design v1] spbin 纳入恢复路径 — 时间窗口 + 敢死队探测
+- P0-006 [Design v1] MSG_DROP 废除 — IPC 队列扩至 65536
+- P0-007 [Design v1] RET_ERROR 状态机 — 写 spbin + 设备级退避
+- P0-009 [Design v1] 目录任务生命周期 10 态 — 状态机完整定义
+- P0-010 [Design v1] Reset 援救机制 — 非终态统一重来
+- P0-011 [Design v1] 半增量跳过前提 — 信任模型和两级体系已定义
 
 ---
 

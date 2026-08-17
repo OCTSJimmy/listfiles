@@ -11,9 +11,9 @@
 ### P0-001 [Design v1] FINISH/BATCH 竞态——目录任务完成屏障
 - **问题**：Worker 先发 BATCH 再发 FINISH，但两通道独立 epoll，Master 可能先收到 FINISH 标记目录完成，后续 BATCH 滞留丢失，子树永久漏扫
 - **根因**：FINISH 语义不等待 BATCH 全处理
-- **方案**：目录任务生命周期状态机（P0-009）定义 `SCANNING → ALL_BATCHES_RECEIVED → ALL_BATCHES_PROCESSED → OUTPUT_COMMITTED → COMPLETED` 路径。FINISH 仅触发 `ALL_BATCHES_RECEIVED`（收到所有数据），不直接触发 COMPLETED。必须等所有 BATCH 处理完毕、子目录入队、输出偏移确认后才写 dpbin。
+- **方案**：目录任务生命周期状态机（P0-009）定义 `SCANNING → ALL_BATCHES_RECEIVED → ALL_BATCHES_PROCESSED → OUTPUT_COMMITTED → COMPLETED` 路径。FINISH 仅触发 `ALL_BATCHES_RECEIVED`（收到所有数据），不直接触发 COMPLETED。必须等所有 BATCH 处理完毕、子目录入队、输出偏移确认后才写 dpbin。空目录可直通完成。
 - **关联**：P0-009 目录任务生命周期状态机
-- **状态**：Design v1 已确认，待编码实现（状态机定义见 P0-009）
+- **状态**：**Design v1 已确认，待编码实现**（状态机定义见 P0-009）
 - **评审来源**：外部评审 P0-1
 
 ### P0-002 [Design v1] 输出三态状态机——DISCOVERED → OUTPUT_QUEUED → OUTPUT_COMMITTED
@@ -33,7 +33,7 @@
   3. 完整 → fpbin 内容合并到 pbin，清空 fpbin/dfpbin
   4. 不完整 → **整对抛弃**，重新从旧 pbin 恢复
   5. 不会无限套娃——总是回退到旧 pbin 恢复，不会递归产生新的 fpbin
-- **状态**：Design v1 已确认，待编码实现
+- **状态**：**Design v1 已确认，待编码实现**
 - **评审来源**：外部评审 P0-3
 
 ### P0-004 [Design v1] visited_set 背压竞态——统一队列模型
@@ -92,6 +92,7 @@
   2. `baseline_eligible = true` 条件：status==complete、skipped==0、dspill 排空、fpbin 转正、archive 校验通过
   3. 盲信扫描启动时 baseline_eligible!=true 则拒绝运行
   4. finalize_archive() 保留旧基准，原子切换新基准（新 archive 写完校验通过后替换，旧基准保留为 `.archive.prev`）
+- **状态**：**Design v1 已确认，待编码实现**
 - **评审来源**：外部评审 P0-8
 
 ### P0-009 [Design v1] 目录任务生命周期状态机
@@ -134,7 +135,7 @@
   1. **epoch 机制**：每个 CMD_SCAN 附带递增 epoch（64 位原子计数器），Worker 返回 BATCH 携带 epoch，Master 丢弃过期 epoch
   2. **waitpid 确认**：SIGKILL 后轮询 waitpid(WNOHANG) 直到旧进程回收，通常 < 1ms
   3. **pipe drain**：CMD_REPLACE 时 IPC 线程先清空旧 pipe 读缓冲区
-- **状态**：Design v1 已确认，待编码实现
+- **状态**：**Design v1 已确认，待编码实现**
 - **评审来源**：Jimmy 评审 A
 
 ---
@@ -319,4 +320,47 @@
 | DOC-006 | "减少 90%+ I/O"没有论证 | §10 | 删除或补模型/测试数据 | 待修正 |
 | DOC-007 | `timeo=600` 单位错误（应为 6000=600秒） | §12 | 修正挂载参数 | **已修正** |
 | DOC-008 | `intr` 在 CentOS 7.4 无效，不应作为关键前提 | §12 | 移除 intr | **已修正** |
-| DOC-009 | pbin 格式描述错误："文本格式"实际是二进制 | §8.1 | 修正为二进制格式 + 平台兼容性说明 | **已修正** |
+---
+
+## 状态汇总（2026-08-17 更新）
+
+### P0 阻塞项（12项）
+
+| 编号 | 问题 | 状态 | 备注 |
+|------|------|------|------|
+| P0-001 | FINISH/BATCH 竞态 — 目录任务完成屏障 | **Design v1 已确认** | 状态机路径定义完毕 |
+| P0-002 | 输出三态状态机 | **Design v1 已确认** | OUTPUT_COMMITTED 态已定义 |
+| P0-003 | fpbin 二次崩溃恢复 | **Design v1 已确认** | fpbin+dfpbin 原子对方案 |
+| P0-004 | visited_set 背压竞态 — 统一队列模型 | **Design v1 已确认** | 三态拆分 + dspill 统一队列 |
+| P0-005 | spbin 纳入恢复路径 | **Design v1 已确认** | 时间窗口 + 敢死队探测 |
+| P0-006 | MSG_DROP 正常路径禁止 | **Design v1 已确认** | IPC 队列扩至 65536 |
+| P0-007 | RET_ERROR 状态机补全 | **Design v1 已确认** | 写 spbin + 设备级退避 |
+| P0-008 | Run manifest + baseline_eligible 原子切换 | **Design v1 已确认** | manifest 升级方案 |
+| P0-009 | 目录任务生命周期状态机 | **Design v1 已确认** | 10 态 + 4 异常分支 |
+| P0-010 | 崩溃恢复矩阵 — Reset 援救机制 | **Design v1 已确认** | 非终态统一重来 |
+| P0-011 | 半增量跳过前提条件声明 | **Design v1 已确认** | 信任模型和两级体系已定义 |
+| P0-012 | epoch + waitpid 确认（旧 Worker 残留数据） | **Design v1 已确认** | epoch + waitpid + pipe drain |
+
+**P0 全部 12 项 Design v1 已确认，可进入编码阶段。**
+
+### P1 重要项（10项）
+- P1-001 [Covered by P0-004] 已覆盖
+- P1-002 [WIP] errno 分类矩阵
+- P1-003 [WIP] 设备身份主键改为 (fsid, server, export)
+- P1-004 [Covered by P0-005] 已覆盖
+- P1-005 [WIP] 设备级熔断 DEGRADED 灰度态
+- P1-006 [WIP] IPC 协议显式字段编码 + protocol_version
+- P1-007 [NEW] 输出完整性语义声明
+- P1-008 [NEW] 输出文件续写语义
+- P1-009 [OBSOLETE] 不成立
+- P1-010 [NEW] 盲信目录枚举失败的输出语义
+
+### P2 补充项（11项）
+全部待设计确认，不阻塞 P0 编码。
+
+### P3 长期项（1项）
+- P3-001 [Design.md §12.4 已更新] 平台兼容性检查
+
+### 文档矛盾（9项）
+- DOC-007 / DOC-008 / DOC-009 已修正
+- DOC-001 / DOC-002 / DOC-004 / DOC-005 / DOC-006 待修正
