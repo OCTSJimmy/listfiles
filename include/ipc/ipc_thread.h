@@ -28,6 +28,9 @@ typedef struct {
     pthread_cond_t *master_cond;    /* Signal master thread when message sent */
     IpcReadFsm      ctrl_fsm;       /* v15.4.0: resumable fd_ctrl read state */
     IpcReadFsm      data_fsm;       /* v15.4.0: resumable fd_data read state */
+    /* v15.6.0: 替换窗口期（fd_cmd < 0）暂存的 CMD_SCAN，CMD_REPLACE 完成后补发 */
+    IpcThreadMsg    pending_scan;
+    bool            has_pending_scan;
 } IpcThreadCtx;
 
 /**
@@ -62,7 +65,7 @@ void ipc_thread_stop(IpcThreadCtx *ctx);
 
 void worker_mark_dead(IpcThreadCtx *ctx, bool send_notify);
 void worker_timeout_kill(IpcThreadCtx *ctx);
-void send_return(IpcThreadCtx *ctx, uint32_t type, void *data, size_t len);
+void send_return(IpcThreadCtx *ctx, uint32_t type, void *data, size_t len, uint64_t epoch);
 void read_ctrl_message(IpcThreadCtx *ctx);
 void read_data_message(IpcThreadCtx *ctx);
 void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd);

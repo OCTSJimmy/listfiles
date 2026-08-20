@@ -7,11 +7,13 @@
 #include <pthread.h>
 
 /* ================================================================
- * Lock-free ring buffer message queue (v13.0.0)
- * Capacity must be power of 2. Uses 64-bit atomic head/tail + eventfd notify.
+ * Mutex-protected ring buffer message queue (v13.0.0)
+ * Capacity must be power of 2. head/tail guarded by mutex, eventfd notify.
  * ================================================================ */
 
-#define MSG_QUEUE_DEFAULT_CAPACITY 1024
+/* v15.6.0: 1024 -> 65536，使容量瓶颈永远在 dispatch_queue 而非 IPC 层。
+ * 满即设计外异常（log_fatal），正常路径禁止丢消息。 */
+#define MSG_QUEUE_DEFAULT_CAPACITY 65536
 
 typedef struct {
     IpcThreadMsg  *buffer;      /* ring buffer storage */
@@ -35,13 +37,13 @@ MsgQueue* msg_queue_create(size_t cap);
 void msg_queue_destroy(MsgQueue *q);
 
 /**
- * @brief  Send a message (non-blocking, lock-free)
+ * @brief  Send a message (non-blocking, mutex-protected)
  * @return true if queued, false if full (caller should retry or backpressure)
  */
 bool msg_queue_send(MsgQueue *q, const IpcThreadMsg *msg);
 
 /**
- * @brief  Receive a message (non-blocking, lock-free)
+ * @brief  Receive a message (non-blocking, mutex-protected)
  * @return true if a message was popped, false if empty
  */
 bool msg_queue_recv(MsgQueue *q, IpcThreadMsg *out);

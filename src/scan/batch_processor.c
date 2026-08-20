@@ -111,16 +111,17 @@ void batch_dedup_worker(TPBatch *batch, void *user_data) {
         }
         const char *path = batch->paths[i];
         struct stat *st = &batch->stats[i];
-        uint8_t fp[FP_SIZE];
-        fp_compute(path, st->st_dev, st->st_ino, fp);
         uint8_t result = 0;
-        /* v15.4.5: In HIST_PUMP_OLD phase, skip visited_set dedup for directories
-         * so that re-scanning can discover sub-directories that were lost during
-         * the previous interrupted run. Files are still deduped to avoid duplicate
-         * output entries. */
+        /* v15.6.0（P0-004 统一队列模型）：discovered_set 仅含目录——所有阶段
+         * （含 HIST_PUMP_OLD）均对目录查重，防环/防重复发现。v15.4.5 的 OLD 阶段
+         * 跳过特例已删除：统一队列模型下泵送差集覆盖所有"已发现未完成"目录，
+         * 无需靠跳过去重补救丢失的子目录。
+         * 文件不进入目录任务去重集合——输出语义 at-least-once 允许重复行。 */
         bool is_dir = S_ISDIR(st->st_mode);
-        if (!is_dir || ctx->hist_pump_state != HIST_PUMP_OLD) {
-            if (fp_set_insert(ctx->visited_set, fp)) {
+        if (is_dir) {
+            uint8_t fp[FP_SIZE];
+            fp_compute(path, st->st_dev, st->st_ino, fp);
+            if (fp_set_insert(ctx->discovered_set, fp)) {
                 result |= 1; /* duplicate */
             }
         }
@@ -139,6 +140,22 @@ void batch_dedup_worker(TPBatch *batch, void *user_data) {
  * Side effects for a completed batch (must run on main thread)
  * ================================================================ */
 
+/* v15.6.0（P0-002 输出三态）：提交输出 batch 前登记 output_pending[slot]（OUTPUT_QUEUED），
+ * 输出线程 fflush 后递减（OUTPUT_COMMITTED），目录完成屏障等待其归零才写 dpbin。
+ * 条目语义：pbin 先记（DISCOVERED）→ 此处提交输出线程（OUTPUT_QUEUED）→
+ * 输出线程 fflush + 计数回调（OUTPUT_COMMITTED）；"pbin 先于输出提交"的顺序不变。
+ * 无有效 slot 归属时按 -1 提交、不计数。 */
+static void submit_output_batch(AppContext *ctx, OutputBatch *out_batch, int slot_id) {
+    if (slot_id >= 0 && ctx->worker_pool && slot_id < ctx->worker_pool->num_workers
+        && ctx->output_pending) {
+        out_batch->slot_id = slot_id;
+        atomic_fetch_add(&ctx->output_pending[slot_id], 1);
+    } else {
+        out_batch->slot_id = -1;
+    }
+    async_writer_submit_batch(ctx->async_writer, out_batch);
+}
+
 static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
     /* v15.1.4: defensive sanity check to prevent CPU spin from corrupted count */
     if (!batch || batch->count < 0 || batch->count > 1000000) {
@@ -146,6 +163,11 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                   (void*)batch, batch ? batch->count : -999,
                   batch ? batch->worker_id : -999);
         if (batch) {
+            /* v15.6.0: 批次处理完成计数（P0-001 屏障）——防御性丢弃路径同样闭环 */
+            if (batch->worker_id >= 0 && ctx->worker_pool
+                && batch->worker_id < ctx->worker_pool->num_workers) {
+                atomic_fetch_add(&ctx->worker_pool->slots[batch->worker_id].batches_processed, 1);
+            }
             for (int i = 0; i < batch->count && i < 1000000; i++) free(batch->paths[i]);
             free(batch->paths);
             free(batch->stats);
@@ -155,7 +177,6 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
         atomic_fetch_sub(&ctx->pending_batches, 1);
         return;
     }
-
     log_debug_v(202605181600UL, "[Batch] process_completed_batch start worker=%d count=%d pending_batches=%ld",
               batch->worker_id, batch->count, atomic_load(&ctx->pending_batches));
     OutputBatch out_batch = {0};
@@ -184,20 +205,11 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
                 /* v15.4.5: During resume pumping, re-scan discovered directories
                  * to recover sub-directories lost in the previous interrupted run. */
             }
-            /* v15.5.0: Stage 3 only pushes to dispatch_queue; Stage 4 consumes */
-            /* v15.5.8: HIGH_WATER 跳推改投 dspill 兜底文件（原 pbin 滑动窗口已废——
-             * 已封口 pbin 分片会被 process_old_slice 轮转删除，加载器游标追到被删
-             * 分片后永久卡死，跳推目录随之静默丢失）。无 progress_base 时无兜底
-             * 通道，宁可队列膨胀也不丢目录。 */
-            if (dispatch_queue_count(&ctx->dispatch_queue) < DISPATCH_QUEUE_HIGH_WATER
-                || !ctx->cfg.progress_base) {
-                char *dup = strdup(path);
-                if (!dispatch_queue_push(&ctx->dispatch_queue, dup, st)) {
-                    free(dup);
-                }
-            } else {
-                dspill_append(ctx, path, st);
-            }
+            /* v15.6.0（P0-004 统一队列模型）：新目录统一经 enqueue_dir 入队——
+             * completed_set 差集剪枝、enqueued_set 防重复入队、
+             * dispatch_queue（未达 HIGH_WATER）/dspill（超水位兜底）分流均在其内。
+             * 无 progress_base 时无兜底通道，宁可队列膨胀也不丢目录。 */
+            enqueue_dir(ctx, path, st);
 
             ctx->state.dir_count++;
             if (ctx->cfg.include_dir) {
@@ -215,7 +227,11 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
             if (ctx->cfg.print_dir && ctx->state.dir_info_fp && !ctx->cfg.mute) {
                 fprintf(ctx->state.dir_info_fp, "%s%s\n", OUTPUT_DIR_PREFIX, path);
             }
-            if (ctx->cfg.continue_mode && ctx->hist_pump_state != HIST_PUMP_OLD) {
+            if (ctx->hist_pump_state != HIST_PUMP_OLD) {
+                /* v15.6.0：pbin 全量记录（不再要求 continue_mode）——pbin 是
+                 * 盲信扫描的基准来源（§8.1），基准则必须是任意完整全量运行。
+                 * --clean 模式由 record_path 内部早退，不保留任何进度文件。
+                 * HIST_PUMP_OLD 阶段新发现目录走 fpbin（P0-003），不写 pbin。 */
                 record_path_batch_append(&ctx->cfg, &ctx->state, &ctx->record_batch, path, st);
             }
         } else {
@@ -230,24 +246,25 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
             }
             out_batch.tail = task;
             out_batch.count++;
-            if (ctx->cfg.continue_mode) {
-                record_path_batch_append(&ctx->cfg, &ctx->state, &ctx->record_batch, path, st);
-            }
+            /* v15.6.0：pbin 全量记录（含文件，盲信基准来源），不再要求 continue_mode */
+            record_path_batch_append(&ctx->cfg, &ctx->state, &ctx->record_batch, path, st);
         }
 
         if (out_batch.count >= ASYNC_BATCH_SIZE) {
-            async_writer_submit_batch(ctx->async_writer, &out_batch);
-            out_batch.head = NULL;
-            out_batch.tail = NULL;
-            out_batch.count = 0;
+            submit_output_batch(ctx, &out_batch, batch->worker_id);
         }
     }
 
     if (out_batch.count > 0) {
-        async_writer_submit_batch(ctx->async_writer, &out_batch);
+        submit_output_batch(ctx, &out_batch, batch->worker_id);
     }
 
     atomic_fetch_sub(&ctx->pending_batches, 1);
+    /* v15.6.0: 批次处理完成计数（P0-001 屏障），供 advance_task_barriers 判定 */
+    if (batch->worker_id >= 0 && ctx->worker_pool
+        && batch->worker_id < ctx->worker_pool->num_workers) {
+        atomic_fetch_add(&ctx->worker_pool->slots[batch->worker_id].batches_processed, 1);
+    }
     log_debug_v(202605181600UL, "[Batch] pending_batches after sub: %ld", atomic_load(&ctx->pending_batches));
     ctx->state.total_dequeued_count++;
 
@@ -258,11 +275,14 @@ static void process_completed_batch(AppContext *ctx, TPBatch *batch) {
     free(batch);
 }
 
-void drain_completed_batches(AppContext *ctx) {
+int drain_completed_batches(AppContext *ctx) {
     TPBatch *batch;
+    int drained = 0;
     while ((batch = thread_pool_poll_completed(ctx->thread_pool)) != NULL) {
         process_completed_batch(ctx, batch);
+        drained++;
     }
+    return drained;
 }
 
 /* ================================================================
@@ -290,7 +310,6 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
         parsed_batch_free(&parsed);
         return;
     }
-
     TPBatch *batch = malloc(sizeof(TPBatch));
     if (!batch) {
         free(results);
@@ -302,6 +321,15 @@ void main_loop_handle_batch(AppContext *ctx, int worker_id, const void *payload,
     batch->count = parsed.count;
     batch->results = results;
     batch->worker_id = worker_id;
+
+    /* v15.6.0: 批次接收计数（P0-001 屏障）——解析成功、确定会被处理才计数；
+     * 解析失败/OOM 丢弃的批次不计 received，也不计 processed，屏障账目保持平衡。
+     * 协议空批次（count==0，空目录的收尾批次）照常计数，自然闭环。
+     * v15.6.0（P0-007）：错误路径不再尾随空 BATCH——Master 收到 RET_ERROR 即
+     * 销账并清零该任务的屏障计数，滞留批次由 epoch 校验丢弃。 */
+    if (worker_id >= 0 && ctx->worker_pool && worker_id < ctx->worker_pool->num_workers) {
+        atomic_fetch_add(&ctx->worker_pool->slots[worker_id].batches_received, 1);
+    }
 
     log_debug_v(202605181600UL, "[Batch] pending_batches before add: %ld", atomic_load(&ctx->pending_batches));
     atomic_fetch_add(&ctx->pending_batches, 1);

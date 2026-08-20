@@ -28,9 +28,14 @@ void dispatch_from_queue(AppContext *ctx);
 /* v15.5.8: dspill 派发兜底 — HIGH_WATER 跳推目录追加 / 回填 */
 void dspill_append(AppContext *ctx, const char *path, const struct stat *st);
 int load_dirs_from_dspill(AppContext *ctx, int target);
+/* v15.6.0（P0-004）：dspill 定时刷盘（1000 条或 1 秒，主循环挂点） */
+void dspill_flush_check(AppContext *ctx, bool force);
+
+/* v15.6.0（P0-004 统一队列模型）：所有待扫描目录的统一入队入口 */
+void enqueue_dir(AppContext *ctx, const char *path, const struct stat *st);
 
 /* Drain completed batches from thread pool */
-void drain_completed_batches(AppContext *ctx);
+int drain_completed_batches(AppContext *ctx);
 
 /* Worker death cleanup: drain fd_in_rd, migrate backlog, adjust pending_tasks, close fds */
 void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_current);

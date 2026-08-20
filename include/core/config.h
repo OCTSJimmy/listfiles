@@ -16,9 +16,20 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.5.9"
-#define VERSION_CODE 202608090000UL
+#define VERSION "15.6.0"
+#define VERSION_NAME "v15.6.0"
+#define VERSION_CODE 202608202300UL
+/* 版本限定日志的门控码不写宏：直接在调用点写死时间戳字面量（本周期为 202608202330UL），
+ * 防止宏值随版本递进被一改全改、旧日志被不断宽限而失去门控意义。
+ * **严格遵循**：当程序异常以至于可能导致文件元数据被忽略或者有可能丢失时，需要输出的
+ * 日志信息不得被版本门控，必须归属于全局日志（引用 VERSION_CODE 的 log_* 宏）。
+ * error 类型的日志不得被版本门控，必须归属于全局日志。 */
 #define MAX_PATH_LENGTH 4088 // v15.4.1: PIPE_BUF(4096) - sizeof(IpcMessageHeader)(8) = 4088, ensure atomic pipe writes
+/* v15.6.0: Worker 数硬上限——redispatch_backoff_until/timeout_paths/timeout_counts
+ * 等 per-slot 数组按此定长。--worker-count 超过此值必须钳制，否则 wid>=数组大小
+ * 时越界读写 AppContext 后续字段（实测：越界读到 run_id 的 ASCII 字节被当作
+ * 巨大 time_t 退避截止时间，低号 slot 全忙时派发永久活锁）。 */
+#define MAX_WORKERS 64
 #define PROGRESS_BATCH_SIZE 50
 #define DEFAULT_MEM_ITEMS 10000000
 #define MAX_SYMLINK_DEPTH 8
@@ -155,6 +166,7 @@ typedef struct {
     bool archive;           // -Z
     bool clean;             // -C
     char *progress_base;    // -f
+    char *reference_base;   // [v15.6.0] --reference-base 盲信基准（旧 progress 路径）
     char *resume_file;      // -R
     
     // === 输出格式 ===

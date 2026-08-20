@@ -34,20 +34,27 @@ bool send_scan_to_ipc(AppContext *ctx, int wid, const char *path, uint64_t dev) 
     if (!scan) return false;
     scan->path_len = (uint32_t)strlen(path);
     scan->dev = dev;
+    /* v15.6.0: 每次派发分配递增 epoch；发送失败则回滚计数器，保持账目一致 */
+    uint64_t epoch = atomic_fetch_add(&ctx->epoch_counter, 1) + 1;
+    scan->epoch = epoch;
     safe_strcpy(scan->path, path, sizeof(scan->path));
 
     IpcThreadMsg msg = {
         .type = CMD_SCAN,
         .slot_id = wid,
         .data = scan,
-        .data_len = sizeof(*scan)
+        .data_len = sizeof(*scan),
+        .epoch = 0
     };
 
     if (!msg_queue_send(ctx->ipc_cmd_queues[wid], &msg)) {
+        atomic_fetch_sub(&ctx->epoch_counter, 1);  /* 回滚未生效的 epoch */
         log_warn_v(202607030000UL, "[Dispatch] cmd_queue[%d] full, dropping %s", wid, path_log_mask(path));
         free(scan);
         return false;
     }
+    /* 发送成功：epoch 生效，写入 slot 供 RET_BATCH/RET_FINISH 校验 */
+    ctx->worker_pool->slots[wid].current_epoch = epoch;
     return true;
 }
 
@@ -70,12 +77,20 @@ void send_replace_to_ipc(AppContext *ctx, int wid, int fd_cmd, int fd_data, int 
         .type = CMD_REPLACE,
         .slot_id = wid,
         .data = rep,
-        .data_len = sizeof(*rep)
+        .data_len = sizeof(*rep),
+        .epoch = 0
     };
 
-    if (!msg_queue_send(ctx->ipc_cmd_queues[wid], &msg)) {
-        log_error("[Replace] cmd_queue[%d] full, REPLACE dropped", wid);
-        free(rep);
+    /* v15.6.0: REPLACE 丢失会导致 IPC 线程永久等待新 fd，队列满时短暂重试，
+     * 仍失败属设计外异常（容量 65536），log_fatal 暴露，不得静默丢弃 */
+    int retry = 0;
+    while (!msg_queue_send(ctx->ipc_cmd_queues[wid], &msg)) {
+        if (++retry > 100) {
+            log_fatal("[Replace] cmd_queue[%d] full after 100 retries, REPLACE undeliverable", wid);
+            free(rep);
+            return;
+        }
+        usleep(1000);
     }
 }
 
@@ -101,8 +116,11 @@ int dispatch_find_idle_worker(AppContext *ctx) {
     int num_workers = ctx->worker_pool->num_workers;
     int attempts = 0;
     while (attempts < num_workers) {
+        /* 计数器必须始终取模回卷：v15.6.0 自适应零等待主循环使本函数在
+         * "全部 Worker 忙 + 队列非空" 时以内存速度空转，plain int 约 2 分钟
+         * 即可溢出为负值，candidate 变负 → slots[-15] 野读段错误（回归实测）。 */
         int candidate = ctx->next_dispatch_worker % num_workers;
-        ctx->next_dispatch_worker++;
+        ctx->next_dispatch_worker = (candidate + 1) % num_workers;
         WorkerSlot *cand_slot = &ctx->worker_pool->slots[candidate];
         if (!atomic_load(&cand_slot->is_alive)) { attempts++; continue; }
         if (atomic_load(&cand_slot->state) != WORKER_STATE_IDLE) { attempts++; continue; }
@@ -164,11 +182,15 @@ void dispatch_from_queue(AppContext *ctx) {
             }
             continue;
         }
-        /* v15.5.0: pending_tasks++ and dpbin_append only on successful dispatch */
+        /* v15.5.0: pending_tasks++ only on successful dispatch */
         atomic_fetch_add(&ctx->pending_tasks, 1);
-        if (task.st.st_dev != 0) {
-            dpbin_append(ctx, task.path, &task.st);
-        }
+        /* v15.6.0: 在途任务屏障初始化（P0-001）。dpbin_append 从此处迁走——
+         * 改由 main_loop.c advance_task_barriers 在该任务全部 BATCH 处理完且
+         * 输出 COMMITTED 后写入；此处仅保存目录 stat 供届时使用。 */
+        slot->current_st = task.st;
+        atomic_store(&slot->batches_received, 0);
+        atomic_store(&slot->batches_processed, 0);
+        slot->task_state = DT_SCANNING;
         log_debug_v(202605201600UL, "[DispatchQueue] dispatched %s to worker %d, pending_tasks=%ld", path_log_mask(task.path), wid, atomic_load(&ctx->pending_tasks));
 
         slot->current_dev = task.st.st_dev;
@@ -194,7 +216,7 @@ void dispatch_from_queue(AppContext *ctx) {
  *         不同路径会重置计数器。熔断路径记录 WARN 日志。
  */
 static bool circuit_breaker_check(AppContext *ctx, int wid, const char *path) {
-    if (wid < 0 || wid >= 8) return false;
+    if (wid < 0 || wid >= MAX_WORKERS) return false;
 
     if (strcmp(ctx->timeout_paths[wid], path) == 0) {
         ctx->timeout_counts[wid]++;
@@ -207,9 +229,56 @@ static bool circuit_breaker_check(AppContext *ctx, int wid, const char *path) {
         log_warn_v(202607030000UL, "[CircuitBreaker] Path timed out %d times, skipping: %s",
                    ctx->timeout_counts[wid], path_log_mask(path));
         circuit_breaker_record(ctx, "PATH_TIMEOUT", path, 0, ctx->timeout_counts[wid]);
+        /* v15.6.0（P0-005）：目录级熔断达阈值统一写 spbin（CIRCUIT_BREAKER），
+         * 恢复时永久跳过，不再经泵送盲目重入队 */
+        dev_t dev = 0;
+        if (ctx->worker_pool && wid < ctx->worker_pool->num_workers) {
+            dev = (dev_t)ctx->worker_pool->slots[wid].current_dev;
+        }
+        spbin_write_record(ctx, path, SP_REASON_CIRCUIT_BREAKER, dev);
         return true; /* 熔断：不再重试 */
     }
     return false; /* 未熔断：允许重试 */
+}
+
+/* ================================================================
+ * v15.6.0（P1-004）：毒丸目录致死计数
+ * ================================================================ */
+
+#define POISON_DEATH_THRESHOLD 3  /* 同一目录累计致死 Worker 此次数后永久隔离 */
+
+/**
+ * @brief  记录一次"Worker 死亡时正在扫描该目录"的致死事件
+ * @param  ctx   AppContext*  应用上下文，不能为空
+ * @param  path  const char*  致死时 Worker 正在扫描的目录路径，不能为空
+ * @return int   该路径的累计致死次数（含本次）
+ *
+ * @note   毒丸计数的是"Worker 死亡（DEV_TIMEOUT/heartbeat/崩溃）时正在扫描该目录"，
+ *         与 RET_ERROR 的设备级错误不同，不计入设备级错误统计（不触碰 dev_mgr）。
+ *         Worker 死亡是稀有事件，小型动态数组 + 线性查找即可。
+ */
+static int poison_note_death(AppContext *ctx, const char *path) {
+    for (size_t i = 0; i < ctx->poison_count; i++) {
+        if (strcmp(ctx->poison_paths[i], path) == 0) {
+            return ++ctx->poison_counts[i];
+        }
+    }
+    if (ctx->poison_count >= ctx->poison_capacity) {
+        size_t new_cap = ctx->poison_capacity ? ctx->poison_capacity * 2 : 16;
+        /* 逐个 realloc 并立即写回：失败时原指针仍有效，不产生悬垂 */
+        char **new_paths = realloc(ctx->poison_paths, new_cap * sizeof(char *));
+        if (!new_paths) return 1; /* OOM：不计数也不隔离，保守继续 */
+        ctx->poison_paths = new_paths;
+        int *new_counts = realloc(ctx->poison_counts, new_cap * sizeof(int));
+        if (!new_counts) return 1;
+        ctx->poison_counts = new_counts;
+        ctx->poison_capacity = new_cap;
+    }
+    ctx->poison_paths[ctx->poison_count] = strdup(path);
+    if (!ctx->poison_paths[ctx->poison_count]) return 1;
+    ctx->poison_counts[ctx->poison_count] = 1;
+    ctx->poison_count++;
+    return 1;
 }
 
 /* ================================================================
@@ -256,32 +325,49 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
 
     atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
 
+    /* v15.6.0: 在途任务屏障复位（P0-001）——重派发时由 dispatch_from_queue 重新初始化 */
+    atomic_store(&slot->batches_received, 0);
+    atomic_store(&slot->batches_processed, 0);
+    slot->task_state = DT_NONE;
+
     /* v15.5.3: Circuit breaker for DEV_TIMEOUT redispatch loop
      * v15.5.9: 增加指数退避——同一目录连续超时后，redispatch 前等待
-     * 30s -> 120s -> 300s，给 NFS 大目录喘息时间 */
+     * 30s -> 120s -> 300s，给 NFS 大目录喘息时间
+     * v15.6.0（P1-004）：毒丸隔离优先——同一目录累计致死 Worker 3 次
+     * 直接写 spbin POISON 永久隔离，不再重入队，不计入设备级错误统计 */
     if (redispatch_current && slot->current_path[0] != '\0') {
-        bool tripped = circuit_breaker_check(ctx, worker_id, slot->current_path);
-        if (!tripped) {
-            /* 计算退避时间：基于已超时次数 */
-            int backoff_sec = 0;
-            if (ctx->timeout_counts[worker_id] == 1) backoff_sec = 30;
-            else if (ctx->timeout_counts[worker_id] == 2) backoff_sec = 120;
-            else if (ctx->timeout_counts[worker_id] >= 3) backoff_sec = 300;
+        int deaths = poison_note_death(ctx, slot->current_path);
+        if (deaths >= POISON_DEATH_THRESHOLD) {
+            log_warn("[Poison] 目录已累计致死 Worker %d 次，隔离进 spbin(POISON) 永久跳过: %s",
+                     deaths, path_log_mask(slot->current_path));
+            spbin_write_record(ctx, slot->current_path, SP_REASON_POISON, (dev_t)slot->current_dev);
+            circuit_breaker_record(ctx, "POISON", slot->current_path,
+                                   (dev_t)slot->current_dev, deaths);
+            /* 毒丸目录不重入队，pending_tasks 已在上方递减 */
+        } else {
+            bool tripped = circuit_breaker_check(ctx, worker_id, slot->current_path);
+            if (!tripped) {
+                /* 计算退避时间：基于已超时次数 */
+                int backoff_sec = 0;
+                if (ctx->timeout_counts[worker_id] == 1) backoff_sec = 30;
+                else if (ctx->timeout_counts[worker_id] == 2) backoff_sec = 120;
+                else if (ctx->timeout_counts[worker_id] >= 3) backoff_sec = 300;
 
-            if (backoff_sec > 0) {
-                ctx->redispatch_backoff_until[worker_id] = time(NULL) + backoff_sec;
-                log_info_v(202607030000UL, "[CircuitBreaker] Path timeout count=%d, backoff %ds before redispatch: %s",
-                           ctx->timeout_counts[worker_id], backoff_sec, path_log_mask(slot->current_path));
-            } else {
-                ctx->redispatch_backoff_until[worker_id] = 0;
-            }
+                if (backoff_sec > 0) {
+                    ctx->redispatch_backoff_until[worker_id] = time(NULL) + backoff_sec;
+                    log_info_v(202608202330UL, "[CircuitBreaker] Path timeout count=%d, backoff %ds before redispatch: %s",
+                               ctx->timeout_counts[worker_id], backoff_sec, path_log_mask(slot->current_path));
+                } else {
+                    ctx->redispatch_backoff_until[worker_id] = 0;
+                }
 
-            char *dup = strdup(slot->current_path);
-            if (!dispatch_queue_push(&ctx->dispatch_queue, dup, NULL)) {
-                free(dup);
+                char *dup = strdup(slot->current_path);
+                if (!dispatch_queue_push(&ctx->dispatch_queue, dup, NULL)) {
+                    free(dup);
+                }
             }
+            /* If tripped: path is skipped, pending_tasks already decremented above */
         }
-        /* If tripped: path is skipped, pending_tasks already decremented above */
     }
 
     if (atomic_load(&slot->is_alive)) {
@@ -290,6 +376,62 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
     }
     atomic_store(&slot->state, WORKER_STATE_DEAD);  /* v15.1.0 */
     slot->pid = -1;
+}
+
+/* ================================================================
+ * v15.6.0: 统一入队入口 enqueue_dir（P0-004 统一队列模型）
+ * ================================================================ */
+
+/**
+ * @brief  统一目录入队入口——所有待扫描目录的唯一入口
+ * @param  ctx   AppContext*        应用上下文，不能为空
+ * @param  path  const char*        目录路径，不能为空
+ * @param  st    const struct stat* 目录 stat，允许为 NULL（spbin 重入队等无 stat 场景）
+ * @return void
+ *
+ * @note   调用点：batch_processor 新发现目录、pump_pbin_batch 恢复泵送、
+ *         spbin_requeue_recovered 设备恢复重入队、restore_progress 的 dspill 回填。
+ *         语义顺序：
+ *         1. 查 completed_set：已完成目录不再入队（差集剪枝）；
+ *         2. 查 enqueued_set：已入队（在 dispatch_queue 或 dspill 中）直接返回；
+ *            不在则插入 enqueued_set（防重复入队）；
+ *         3. dispatch_queue < HIGH_WATER 或无 progress_base → dispatch_queue_push；
+ *            否则 dspill_append 兜底。push 失败时 enqueued_set 语义上无删除，
+ *            转 dspill_append 兜底即可（不丢目录）。
+ *         注意：dspill 运行时回填（load_dirs_from_dspill）是"搬运"而非新入队
+ *         ——条目写 dspill 时已标记 enqueued_set，不回查、不经本函数。
+ */
+void enqueue_dir(AppContext *ctx, const char *path, const struct stat *st) {
+    if (!ctx || !path) return;
+
+    uint8_t fp[FP_SIZE];
+    fp_compute(path, st ? st->st_dev : 0, st ? st->st_ino : 0, fp);
+
+    /* 1. 已完成剪枝（differential resume）——仅当该目录同时在 discovered_set
+     *    （pbin 有其发现记录，子树可由泵送/重扫闭环）才剪枝。
+     *    非续传运行崩溃后 pbin 无记录：根目录等不在 discovered_set，
+     *    若仅按 completed_set 剪枝会导致整棵子树永久漏扫（v15.6.0 回归实测）。 */
+    if (ctx->completed_set && fp_set_contains(ctx->completed_set, fp)
+        && ctx->discovered_set && fp_set_contains(ctx->discovered_set, fp)) {
+        return;
+    }
+
+    /* 2. 防重复入队 */
+    if (ctx->enqueued_set && fp_set_insert(ctx->enqueued_set, fp)) {
+        return;
+    }
+
+    /* 3. 入队：内存队列优先；超 HIGH_WATER 或 push 失败转 dspill 兜底。
+     *    无 progress_base 时无兜底通道，宁可队列膨胀也不丢目录。 */
+    if (dispatch_queue_count(&ctx->dispatch_queue) < DISPATCH_QUEUE_HIGH_WATER
+        || !ctx->cfg.progress_base) {
+        char *dup = strdup(path);
+        if (dup && dispatch_queue_push(&ctx->dispatch_queue, dup, st)) {
+            return;
+        }
+        free(dup);
+    }
+    dspill_append(ctx, path, st);
 }
 
 /* ================================================================
@@ -303,11 +445,16 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
  * @param  st    const struct stat* 目录 stat，允许为 NULL
  * @return void
  *
- * @note   懒打开 {base}.dspill（"ab"），复用 pbin 记录格式；每条追加后 fflush
- *         （write 页缓存，非 fsync），保证加载器立即可见。
+ * @note   懒打开 {base}.dspill（"ab"），复用 pbin 记录格式。
+ *         v15.6.0（P0-004）：不再每条 fflush——内存缓冲刷盘策略为
+ *         "1000 条或 1 秒，先到先刷"（条数在此统计，定时刷盘由主循环
+ *         dspill_flush_check 触发；加载器读取前也会先 fflush 保证可见）。
+ *         崩溃丢失可接受：dspill 条目在发现时已写 pbin（或父目录未完成会被
+ *         重扫重新发现），pbin 泵送与 Reset 援救兜底，不丢目录（at-least-once）。
  *         兜底文件不可用时记入熔断清单并强行入队——宁可队列膨胀也不丢目录。
- *         由 batch_processor（线程池线程）调用，与主线程的加载器经 dspill_mutex 互斥。
+ *         须持 dspill_mutex 与主线程的加载器互斥。
  */
+#define DSPILL_FLUSH_BATCH 1000  /* v15.6.0: dspill 内存缓冲刷盘批量（另挂 1 秒定时刷盘） */
 void dspill_append(AppContext *ctx, const char *path, const struct stat *st) {
     if (!ctx || !path || !ctx->cfg.progress_base) return;
 
@@ -326,11 +473,39 @@ void dspill_append(AppContext *ctx, const char *path, const struct stat *st) {
             return;
         }
         setvbuf(ctx->dspill_fp, NULL, _IOFBF, 64 * 1024);
+        ctx->dspill_last_flush = time(NULL);
     }
 
     write_pbin_record(ctx->dspill_fp, path, st);
-    fflush(ctx->dspill_fp);
     ctx->dspill_appended++;
+    ctx->dspill_pending++;
+    if (ctx->dspill_pending >= DSPILL_FLUSH_BATCH) {
+        fflush(ctx->dspill_fp);
+        ctx->dspill_pending = 0;
+        ctx->dspill_last_flush = time(NULL);
+    }
+    pthread_mutex_unlock(&ctx->dspill_mutex);
+}
+
+/**
+ * @brief  dspill 定时刷盘检查（v15.6.0，P0-004）
+ * @param  ctx    AppContext*  应用上下文
+ * @param  force  bool         true 表示无视计数与时间强制刷盘（完结检查前调用）
+ * @return void
+ *
+ * @note   挂点：主循环每轮 dspill 回填检查后调用（force=false，距上次刷盘
+ *         超过 1 秒且有待刷条目时刷盘）；完结硬性断言前调用（force=true，
+ *         保证残留字节统计基于落盘后的文件大小）。
+ */
+void dspill_flush_check(AppContext *ctx, bool force) {
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->dspill_mutex);
+    if (ctx->dspill_fp && ctx->dspill_pending > 0
+        && (force || time(NULL) - ctx->dspill_last_flush >= 1)) {
+        fflush(ctx->dspill_fp);
+        ctx->dspill_pending = 0;
+        ctx->dspill_last_flush = time(NULL);
+    }
     pthread_mutex_unlock(&ctx->dspill_mutex);
 }
 
@@ -354,6 +529,8 @@ int load_dirs_from_dspill(AppContext *ctx, int target) {
     }
 
     fflush(ctx->dspill_fp); /* 确保写缓冲对读端可见 */
+    ctx->dspill_pending = 0;
+    ctx->dspill_last_flush = time(NULL);
 
     char *spill_path = get_dspill_filename(ctx->cfg.progress_base);
     FILE *fp = fopen(spill_path, "rb");

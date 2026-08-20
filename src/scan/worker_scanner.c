@@ -78,7 +78,7 @@ static mode_t dt_to_mode(unsigned char d_type) {
 }
 
 /**
- * @brief  尝试对已知文件执行 blind-trust（跳过 lstat）
+ * @brief  尝试对已知文件执行 blind-trust（跳过 lstat，v15.6.0，P0-011）
  * @param  full_path  const char*      文件绝对路径，不能为空
  * @param  dir_dev    uint64_t         父目录所在设备号
  * @param  d_ino      uint64_t         文件的 inode 号（来自 dirent）
@@ -86,13 +86,21 @@ static mode_t dt_to_mode(unsigned char d_type) {
  * @param  out_st     struct stat*     输出缓冲区，用于存放构造的 stat 信息，不能为空
  * @return bool  返回 true 表示 blind-trust 成功，out_st 已填充；false 表示无法信任，需要执行 lstat
  *
- * @note   信任条件：
- *         1. 半增量模式已启用（g_worker_ref_set 和 g_worker_ref_map 均不为 NULL）
+ * @note   信任模型（设计 §0.3）：
+ *         - 信任本轮 readdir：存在性、路径名称、目录成员关系；
+ *         - 信任历史 pbin（schema 2）：size, mtime, mtime_nsec, uid, gid, mode, d_type；
+ *         - 不信任：atime, dev+ino（不参与盲信身份判断）。
+ *         命中条件：
+ *         1. 盲信模式已启用（g_worker_ref_set 和 g_worker_ref_map 均不为 NULL）
  *         2. d_type 和 d_ino 均有效（非 DT_UNKNOWN、非 0）
- *         3. 指纹存在于 reference_set 中
- *         4. reference_map 中存在匹配记录且 d_type 一致
- *         5. 当前时间与 mtime 的差值超过 skip_interval
- *         满足以上条件时，直接用历史 mtime 构造 stat，避免 lstat 系统调用。
+ *         3. 纯路径指纹（fp_compute(path,0,0)——盲信不 lstat 拿不到 dev/ino）
+ *            存在于 reference_set 中
+ *         4. reference_map 中存在匹配记录且 d_type 一致（§0.6：路径命中但本轮
+ *            d_type != 历史 d_type → 视为未命中，必须重新 lstat，
+ *            防止"文件变目录、目录变文件"误判）
+ *         5. 当前时间与基准 mtime 的差值超过 skip_interval
+ *         满足以上条件时，复用基准 pbin 记录的完整历史 stat（输出不再退化零字段）；
+ *         st_dev/st_ino 仍取本轮 readdir 的旁证（dir_dev/d_ino）。
  */
 static bool try_blind_trust(const char *full_path, uint64_t dir_dev, uint64_t d_ino,
                             unsigned char d_type, struct stat *out_st) {
@@ -100,8 +108,9 @@ static bool try_blind_trust(const char *full_path, uint64_t dir_dev, uint64_t d_
     if (d_type == DT_DIR) return false; /* v15.5.0: 目录始终不信任，避免 mtime 不可靠导致的遗漏 */
     if (d_type == DT_UNKNOWN || d_ino == 0) return false;
 
+    /* v15.6.0（P0-011）：盲信 key 改为纯路径哈希 xxHash3-128(path) */
     uint8_t fp[FP_SIZE];
-    fp_compute(full_path, dir_dev, d_ino, fp);
+    fp_compute(full_path, 0, 0, fp);
 
     if (!fp_set_contains(g_worker_ref_set, fp)) return false;
 
@@ -112,11 +121,16 @@ static bool try_blind_trust(const char *full_path, uint64_t dir_dev, uint64_t d_
     if (g_worker_cfg->skip_interval <= 0) return false;
     if (now - ref->mtime <= g_worker_cfg->skip_interval) return false;
 
+    /* 复用基准完整历史 stat（schema 2），输出字段不再退化为 0 */
     memset(out_st, 0, sizeof(*out_st));
     out_st->st_dev   = dir_dev;
     out_st->st_ino   = d_ino;
-    out_st->st_mtime = ref->mtime;
-    out_st->st_mode  = dt_to_mode(d_type);
+    out_st->st_mtim.tv_sec  = ref->mtime;
+    out_st->st_mtim.tv_nsec = ref->mtime_nsec;
+    out_st->st_size  = ref->size;
+    out_st->st_uid   = (uid_t)ref->uid;
+    out_st->st_gid   = (gid_t)ref->gid;
+    out_st->st_mode  = ref->mode ? (mode_t)ref->mode : dt_to_mode(d_type);
     return true;
 }
 
@@ -162,6 +176,7 @@ static void scanner_progress_tick(time_t *last_tick_time, int interval_sec,
  * @param  paths   char**         文件路径字符串数组，允许为 NULL（当 count == 0 时）
  * @param  stats   struct stat*   对应的 stat 信息数组，允许为 NULL（当 count == 0 时）
  * @param  count   int            本次批次中的文件数量，取值范围: >= 0
+ * @param  epoch   uint64_t       当前任务 epoch（v15.6.0），随批次回带供 Master 校验
  * @return void
  *
  * @note   即使 count == 0 也会发送空批次，确保 Master 的 pending_tasks 正确递减。
@@ -169,7 +184,7 @@ static void scanner_progress_tick(time_t *last_tick_time, int interval_sec,
  *         Worker 侧遇到 EAGAIN 时以 1ms 间隔重试，直至成功。
  *         若内存分配失败，递归发送空批次防止 Master 挂起。
  */
-static void send_batch(int fd_out, char **paths, struct stat *stats, int count) {
+static void send_batch(int fd_out, char **paths, struct stat *stats, int count, uint64_t epoch) {
     /* Always send a batch (even count==0) so Master can decrement pending_tasks */
 
     /* Calculate total payload size */
@@ -189,12 +204,12 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
     uint8_t *buf = malloc(total);
     if (!buf) {
         /* 内存不足时发送空 batch，确保 Master 能正确递减 pending_tasks */
-        send_batch(fd_out, NULL, NULL, 0);
+        send_batch(fd_out, NULL, NULL, 0, epoch);
         return;
     }
 
     uint8_t *p = buf;
-    IpcBatchHeader bh = { (uint32_t)count };
+    IpcBatchHeader bh = { (uint32_t)count, epoch };  /* v15.6.0: 回带任务 epoch */
     memcpy(p, &bh, sizeof(bh)); p += sizeof(bh);
 
     for (int i = 0; i < count; i++) {
@@ -222,39 +237,39 @@ static void send_batch(int fd_out, char **paths, struct stat *stats, int count) 
 }
 
 /**
- * @brief  发送目录级错误通知并追加空批次
- * @param  fd_data   int          数据通道 fd（空批次走这里），取值范围: >= 0 的可写 fd
+ * @brief  发送目录级错误通知（v15.6.0 P0-007：不再追加空批次）
  * @param  fd_ctrl   int          控制通道 fd（错误上报走这里），取值范围: >= 0 的可写 fd
  * @param  err_code  int          错误码，取值范围: ETIMEDOUT(110)、EIO(5)、EACCES(13) 等系统 errno
  * @param  dev       dev_t        当前任务所在设备号
  * @param  path      const char*  发生错误的文件/目录路径，不能为空
  * @return void
  *
- * @note   空批次确保 Master 正确递减 pending_tasks。
- *         v15.5.6: 填充真实 st_dev，修复之前硬编码 dev=0 的问题。
+ * @note   v15.5.6: 填充真实 st_dev，修复之前硬编码 dev=0 的问题。
  *         v15.5.7: 错误上报从 fd_data 改到 fd_ctrl——此前误用 fd_data，Master 侧
  *         read_data_message 只接受 BATCH，非 BATCH 帧会被当作垃圾 drain 掉，
  *         导致 scanner 自检到的目录级错误永远到不了熔断清单；
  *         上报范围从仅 ETIMEDOUT/EIO 扩展到除 ENOENT/ENOTDIR 外的全部 errno
  *         （ENOENT/ENOTDIR 为扫描期间目录被并发删除/替换的正常竞态，不上报；
  *         EACCES 等此前静默丢失，会导致整棵子树缺失但扫描"成功"）。
+ *         v15.6.0（P0-007 RET_ERROR 状态机）：错误路径只发 IPC_MSG_ERROR——
+ *         不再尾随空 BATCH、不再发 FINISH；Master 收到 ERROR 即销账
+ *         （pending_tasks--）并置 Worker IDLE，目录写 spbin 等待设备恢复
+ *         或跨会话恢复（DEVICE_WAITING），不重入队避免重试风暴。
  */
-static void send_error_and_empty_batch(int fd_data, int fd_ctrl, int err_code, dev_t dev, const char *path) {
-    if (err_code != ENOENT && err_code != ENOTDIR) {
-        IpcErrorHeader eh = { (uint32_t)err_code, (uint64_t)dev };
-        uint32_t plen = (uint32_t)strlen(path);
-        uint8_t *buf = malloc(sizeof(eh) + sizeof(plen) + plen);
-        if (buf) {
-            memcpy(buf, &eh, sizeof(eh));
-            memcpy(buf + sizeof(eh), &plen, sizeof(plen));
-            memcpy(buf + sizeof(eh) + sizeof(plen), path, plen);
-            int rc = ipc_send(fd_ctrl, IPC_MSG_ERROR, buf, (uint32_t)(sizeof(eh) + sizeof(plen) + plen));
-            if (rc != 0)
-                log_error("[Worker] send IPC_MSG_ERROR FAILED (rc=%d, path=%s)", rc, path);
-            free(buf);
-        }
+static void send_dir_error(int fd_ctrl, int err_code, dev_t dev, const char *path) {
+    if (err_code == ENOENT || err_code == ENOTDIR) return;
+    IpcErrorHeader eh = { (uint32_t)err_code, (uint64_t)dev };
+    uint32_t plen = (uint32_t)strlen(path);
+    uint8_t *buf = malloc(sizeof(eh) + sizeof(plen) + plen);
+    if (buf) {
+        memcpy(buf, &eh, sizeof(eh));
+        memcpy(buf + sizeof(eh), &plen, sizeof(plen));
+        memcpy(buf + sizeof(eh) + sizeof(plen), path, plen);
+        int rc = ipc_send(fd_ctrl, IPC_MSG_ERROR, buf, (uint32_t)(sizeof(eh) + sizeof(plen) + plen));
+        if (rc != 0)
+            log_error("[Worker] send IPC_MSG_ERROR FAILED (rc=%d, path=%s)", rc, path);
+        free(buf);
     }
-    send_batch(fd_data, NULL, NULL, 0);
 }
 
 /**
@@ -312,12 +327,18 @@ static int entry_stat(const char *path, struct stat *st) {
  * @param  dir_path   const char*  要扫描的目录路径，不能为空
  * @param  worker_id  int          Worker 编号（当前未使用，保留用于日志），取值范围: >= 0
  * @param  task       WorkerThreadCtx*  线程上下文（用于进度心跳），不能为空
- * @return void
+ * @param  epoch      uint64_t          当前任务 epoch（v15.6.0），随 BATCH 回带供 Master 校验
+ * @return bool  返回 false 表示扫描成功完成（调用方随后发送 FINISH）；
+ *               返回 true 表示目录级错误（已上报 IPC_MSG_ERROR，调用方不得发送 FINISH）。
  *
  * @note   先对目录本身执行 lstat 获取设备号；然后 opendir/readdir 遍历条目。
  *         对每个条目：跳过 . 和 ..；尝试 blind-trust；失败则执行 lstat/stat；
  *         收集到 batch_size 条后发送批次；遍历结束后发送剩余批次（或空批次）。
- *         若 opendir 或 lstat 失败，发送错误通知和空批次。
+ *         若 opendir 或 lstat 失败，发送错误通知。
+ *         v15.6.0（P0-007）：错误路径只发 IPC_MSG_ERROR，不再尾随空 BATCH，
+ *         由返回值告知 worker_scanner_thread 跳过 FINISH；Master 收到 ERROR 即
+ *         销账并置 Worker IDLE。ENOENT/ENOTDIR（目录被并发删除/替换的正常竞态）
+ *         视为空目录成功完成，不上报、照常发 FINISH。
  *         v15.5.3: readdir 循环中每 1000 个条目更新一次 last_progress，
  *         防止大目录（7万+ 文件）遍历被 IPC 线程误判为 stuck。
  *         v15.5.7: 完整性加固——
@@ -332,12 +353,19 @@ static int entry_stat(const char *path, struct stat *st) {
  *         的唯一客户端可检旁证：st_nlink-2 与实际子目录计数不符时以
  *         errno_code=0 的 ENTRY_ERROR 上报（NLINK_MISMATCH）。
  */
-static void scan_and_send(int fd_out, const char *dir_path, int worker_id, WorkerThreadCtx *task) {
+static bool scan_and_send(int fd_out, const char *dir_path, int worker_id, WorkerThreadCtx *task, uint64_t epoch) {
     struct stat dir_st;
     if (lstat(dir_path, &dir_st) != 0) {
-        log_warn("[W%d-Scanner] lstat failed on %s: %s", worker_id, dir_path, strerror(errno));
-        send_error_and_empty_batch(fd_out, task->fd_ctrl, errno, task->current_dev, dir_path);
-        return;
+        int lstat_err = errno;
+        /* ENOENT/ENOTDIR：目录被并发删除/替换的正常竞态，视为空目录成功完成 */
+        if (lstat_err == ENOENT || lstat_err == ENOTDIR) {
+            log_debug("[W%d-Scanner] lstat: %s vanished (%s), treat as done",
+                      worker_id, dir_path, strerror(lstat_err));
+            return false;
+        }
+        log_warn("[W%d-Scanner] lstat failed on %s: %s", worker_id, dir_path, strerror(lstat_err));
+        send_dir_error(task->fd_ctrl, lstat_err, task->current_dev, dir_path);
+        return true;
     }
 
     uint64_t dir_dev = dir_st.st_dev;
@@ -351,6 +379,7 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
     char **paths = calloc(batch_size, sizeof(char*));
     struct stat *stats = calloc(batch_size, sizeof(struct stat));
     int count = 0;
+    bool scan_failed = false; /* v15.6.0（P0-007）：true = 已上报 ERROR，跳过 FINISH */
 
     DIR *dir = opendir(dir_path);
     /* v15.5.9: opendir 本身在 NFS 上就是多个 RPC，可能极慢，
@@ -359,8 +388,15 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
     scanner_progress_tick(&last_tick_time, 5, &task->progress_mutex, &task->last_progress, worker_id);
 
     if (!dir) {
-        log_warn("[W%d-Scanner] opendir failed on %s: %s", worker_id, dir_path, strerror(errno));
-        send_error_and_empty_batch(fd_out, task->fd_ctrl, errno, dir_dev, dir_path);
+        int opendir_err = errno;
+        if (opendir_err == ENOENT || opendir_err == ENOTDIR) {
+            log_debug("[W%d-Scanner] opendir: %s vanished (%s), treat as done",
+                      worker_id, dir_path, strerror(opendir_err));
+            goto cleanup;
+        }
+        log_warn("[W%d-Scanner] opendir failed on %s: %s", worker_id, dir_path, strerror(opendir_err));
+        send_dir_error(task->fd_ctrl, opendir_err, dir_dev, dir_path);
+        scan_failed = true;
         goto cleanup;
     }
     log_debug_v(202605181600UL, "[W%d-Scanner] opendir success: %s", worker_id, dir_path);
@@ -424,7 +460,7 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
         if (count >= batch_size) {
             /* v15.5.9: send_batch 前 tick，防止 IPC 阻塞期间误判 */
             scanner_progress_tick(&last_tick_time, 5, &task->progress_mutex, &task->last_progress, worker_id);
-            send_batch(fd_out, paths, stats, count);
+            send_batch(fd_out, paths, stats, count, epoch);
             /* v15.5.9: send_batch 后 tick，长耗时 IPC 已结束 */
             scanner_progress_tick(&last_tick_time, 5, &task->progress_mutex, &task->last_progress, worker_id);
             for (int i = 0; i < count; i++) free(paths[i]);
@@ -434,15 +470,18 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
 
     if (readdir_err != 0) {
         /* v15.5.7: readdir 中途失败——目录部分条目可能已丢失。
-         * 先 flush 已收集的有效条目，再按目录级错误上报（空批次保证计数平衡）。 */
+         * 先 flush 已收集的有效条目（扫描成果保留，目录将整体重扫，at-least-once
+         * 语义允许重复），再按目录级错误上报。
+         * v15.6.0（P0-007）：不再尾随空 BATCH，标记 scan_failed 跳过 FINISH。 */
         log_warn("[W%d-Scanner] readdir failed mid-way on %s: %s", worker_id, dir_path, strerror(readdir_err));
         if (count > 0) {
-            send_batch(fd_out, paths, stats, count);
+            send_batch(fd_out, paths, stats, count, epoch);
             for (int i = 0; i < count; i++) free(paths[i]);
             count = 0;
         }
         closedir(dir);
-        send_error_and_empty_batch(fd_out, task->fd_ctrl, readdir_err, dir_dev, dir_path);
+        send_dir_error(task->fd_ctrl, readdir_err, dir_dev, dir_path);
+        scan_failed = true;
         goto cleanup;
     }
 
@@ -464,12 +503,12 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
 
     if (count > 0) {
         log_debug_v(202605181600UL, "[W%d-Scanner] sending final batch (count=%d)", worker_id, count);
-        send_batch(fd_out, paths, stats, count);
+        send_batch(fd_out, paths, stats, count, epoch);
         for (int i = 0; i < count; i++) free(paths[i]);
     } else {
         /* Empty directory: send empty batch so Master decrements pending_tasks */
         log_debug_v(202605181600UL, "[W%d-Scanner] empty dir, sending empty batch", worker_id);
-        send_batch(fd_out, NULL, NULL, 0);
+        send_batch(fd_out, NULL, NULL, 0, epoch);
     }
 
     log_debug_v(202605181600UL, "[W%d-Scanner] readdir loop done (entries=%d)", worker_id, entry_count);
@@ -477,6 +516,7 @@ static void scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
 cleanup:
     free(paths);
     free(stats);
+    return scan_failed;
 }
 
 /* ================================================================
@@ -499,6 +539,7 @@ void *worker_scanner_thread(void *arg) {
         char path[4096];
         strncpy(path, ctx->task_path, sizeof(path) - 1);
         path[sizeof(path) - 1] = '\0';
+        uint64_t epoch = ctx->task_epoch;  /* v15.6.0: 与 task_path 一同取出 */
         ctx->task_ready = false;
         pthread_mutex_unlock(&ctx->task_mutex);
 
@@ -511,31 +552,37 @@ void *worker_scanner_thread(void *arg) {
         log_debug("[W%d-Scanner] start scanning: %s", ctx->worker_id, path);
 
         /* 扫描 — 结果通过 fd_data 发送 */
-        scan_and_send(ctx->fd_data, path, ctx->worker_id, ctx);
+        bool scan_failed = scan_and_send(ctx->fd_data, path, ctx->worker_id, ctx, epoch);
 
-        log_debug("[W%d-Scanner] scan_and_send returned: %s", ctx->worker_id, path);
+        log_debug("[W%d-Scanner] scan_and_send returned: %s (failed=%d)", ctx->worker_id, path, scan_failed);
 
-        /* 发送 FINISH 信号，通知 Master 当前任务完成 */
-        IpcFinishPayload fin = { 0, 0 };
-        uint32_t plen = (uint32_t)strlen(path);
-        fin.status = 0; /* OK */
-        fin.path_len = plen;
-        size_t fin_total = sizeof(fin) + plen;
-        uint8_t *fin_buf = malloc(fin_total);
-        if (fin_buf) {
-            memcpy(fin_buf, &fin, sizeof(fin));
-            memcpy(fin_buf + sizeof(fin), path, plen);
-            int rc;
-            int retry = 0;
-            while ((rc = ipc_send(ctx->fd_ctrl, IPC_MSG_FINISH, fin_buf, (uint32_t)fin_total)) == -2) {
-                usleep(1000);
-                retry++;
-                if (retry % 1000 == 0) {
-                    log_warn_v(202607030000UL, "[W%d-Scanner] IPC_MSG_FINISH EAGAIN retry %d", ctx->worker_id, retry);
+        /* v15.6.0（P0-007 RET_ERROR 状态机）：FINISH 只在扫描成功完成时发送。
+         * 错误路径已由 scan_and_send 上报 IPC_MSG_ERROR，Master 收到 ERROR 即
+         * 销账（pending_tasks--）并置 Worker IDLE，不再等待尾随 FINISH。 */
+        if (!scan_failed) {
+            /* 发送 FINISH 信号，通知 Master 当前任务完成 */
+            IpcFinishPayload fin = { 0, 0, 0 };
+            uint32_t plen = (uint32_t)strlen(path);
+            fin.status = 0; /* OK */
+            fin.path_len = plen;
+            fin.epoch = epoch;  /* v15.6.0: 回带任务 epoch */
+            size_t fin_total = sizeof(fin) + plen;
+            uint8_t *fin_buf = malloc(fin_total);
+            if (fin_buf) {
+                memcpy(fin_buf, &fin, sizeof(fin));
+                memcpy(fin_buf + sizeof(fin), path, plen);
+                int rc;
+                int retry = 0;
+                while ((rc = ipc_send(ctx->fd_ctrl, IPC_MSG_FINISH, fin_buf, (uint32_t)fin_total)) == -2) {
+                    usleep(1000);
+                    retry++;
+                    if (retry % 1000 == 0) {
+                        log_warn_v(202608202330UL, "[W%d-Scanner] IPC_MSG_FINISH EAGAIN retry %d", ctx->worker_id, retry);
+                    }
                 }
+                log_debug("[W%d-Scanner] IPC_MSG_FINISH sent (rc=%d, path=%s, retries=%d)", ctx->worker_id, rc, path, retry);
+                free(fin_buf);
             }
-            log_debug("[W%d-Scanner] IPC_MSG_FINISH sent (rc=%d, path=%s, retries=%d)", ctx->worker_id, rc, path, retry);
-            free(fin_buf);
         }
 
         /* 记录扫描完成 */

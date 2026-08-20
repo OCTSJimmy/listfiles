@@ -10,6 +10,7 @@
  * 进度文件格式（以 --progress-file=task1 为例）：
  * - task1_000000.pbin  已封口的已完成记录分片
  * - task1.dpbin_000000 本次会话的目录完成日志（临时，正常结束后删除）
+ * - task1.dfpbin_000XXX HIST_PUMP_OLD 阶段的目录完成日志（v15.6.0，fpbin 原子对）
  * - task1.spbin        跳过记录（熔断设备上的目录）
  * - task1.fpbin_000XXX 恢复期间隔离新发现子目录的临时分片
  * - task1.archive      zlib 压缩的历史分片归档
@@ -123,28 +124,47 @@ bool verify_pbin_footer(const PbinFooter *f) {
  * ================================================================ */
 
 /**
- * @brief  向 pbin/fpbin 文件写入单条记录
+ * @brief  向 pbin/fpbin 文件写入单条记录（v15.6.0 schema 2，设计 §0.2）
  * @param  fp    FILE*             已打开的可写文件指针，不能为空
  * @param  path  const char*       文件路径，不能为空
  * @param  info  const struct stat* 文件 stat 信息指针，允许为 NULL（此时写入全 0）
  * @return void
  *
- * @note   单条记录格式：[path_len][path][dev][ino][mtime][d_type]
- *         各字段大小与平台相关（size_t、dev_t、ino_t、time_t、unsigned char）。
+ * @note   单条记录格式（schema_version=2）：
+ *         [path_len:size_t][path][d_type:u8][mtime_sec:time_t][mtime_nsec:long]
+ *         [size:off_t][uid:u32][gid:u32][mode:u32][dev:u64][ino:u64][flags:u32]
+ *         - dev/ino 定宽为 u64（仅全量扫描/诊断用，盲信不用）；
+ *         - atime 完全排除（NFS 不可信）；
+ *         - flags 预留（盲信安全字段版本），当前恒写 0；
+ *         - mode 存完整 st_mode（类型位 + 权限位），供盲信命中后原样复用。
+ *         旧格式（schema 1）一律不解析——manifest 缺失或 pbin_schema_version!=2
+ *         时续传/盲信被拒绝（exit 2）。
  */
 void write_pbin_record(FILE *fp, const char *path, const struct stat *info) {
     size_t path_len = strlen(path);
-    dev_t dev = info ? info->st_dev : 0;
-    ino_t ino = info ? info->st_ino : 0;
-    time_t mtime = info ? info->st_mtime : 0;
     unsigned char d_type = info ? mode_to_dtype(info->st_mode) : DT_UNKNOWN;
+    time_t mtime_sec  = info ? info->st_mtim.tv_sec : 0;
+    long   mtime_nsec = info ? info->st_mtim.tv_nsec : 0;
+    off_t  size       = info ? info->st_size : 0;
+    uint32_t uid      = info ? (uint32_t)info->st_uid : 0;
+    uint32_t gid      = info ? (uint32_t)info->st_gid : 0;
+    uint32_t mode     = info ? (uint32_t)info->st_mode : 0;
+    uint64_t dev      = info ? (uint64_t)info->st_dev : 0;
+    uint64_t ino      = info ? (uint64_t)info->st_ino : 0;
+    uint32_t flags    = 0; /* 预留，恒 0 */
 
     fwrite(&path_len, sizeof(size_t), 1, fp);
     fwrite(path, 1, path_len, fp);
-    fwrite(&dev, sizeof(dev_t), 1, fp);
-    fwrite(&ino, sizeof(ino_t), 1, fp);
-    fwrite(&mtime, sizeof(time_t), 1, fp);
     fwrite(&d_type, sizeof(unsigned char), 1, fp);
+    fwrite(&mtime_sec, sizeof(time_t), 1, fp);
+    fwrite(&mtime_nsec, sizeof(long), 1, fp);
+    fwrite(&size, sizeof(off_t), 1, fp);
+    fwrite(&uid, sizeof(uint32_t), 1, fp);
+    fwrite(&gid, sizeof(uint32_t), 1, fp);
+    fwrite(&mode, sizeof(uint32_t), 1, fp);
+    fwrite(&dev, sizeof(uint64_t), 1, fp);
+    fwrite(&ino, sizeof(uint64_t), 1, fp);
+    fwrite(&flags, sizeof(uint32_t), 1, fp);
 }
 
 /**
@@ -246,7 +266,10 @@ bool record_path_batch_append(const Config *cfg, RuntimeState *state, RecordBatc
     if (!batch || !path) return false;
     
     size_t path_len = strlen(path);
-    size_t entry_size = path_len + sizeof(dev_t) + sizeof(ino_t) + sizeof(time_t) + sizeof(unsigned char);
+    /* v15.6.0（§0.2 schema 2）：定长尾部长度 =
+     * d_type(1) + mtime_sec + mtime_nsec + size + uid/gid/mode(3×u32) + dev/ino(2×u64) + flags(u32) */
+    size_t entry_size = path_len + sizeof(unsigned char) + sizeof(time_t) + sizeof(long)
+                      + sizeof(off_t) + 3 * sizeof(uint32_t) + 2 * sizeof(uint64_t) + sizeof(uint32_t);
     
     /* 检查是否需要先 flush */
     if (batch->count >= RECORD_BATCH_COUNT ||
@@ -271,31 +294,50 @@ bool record_path_batch_append(const Config *cfg, RuntimeState *state, RecordBatc
 }
 
 /**
- * @brief  将跳过记录（spbin）追加到磁盘文件
- * @param  cfg    const Config*   全局配置指针，不能为空
- * @param  state  RuntimeState*   运行时状态指针（当前未使用，保留接口一致性）
+ * @brief  向已打开的 spbin 文件写入单条记录（v15.6.0 新格式，P0-005）
+ * @param  fp     FILE*             已打开的可写文件指针，不能为空
  * @param  entry  const SpbinEntry* 跳过记录条目指针，不能为空
  * @return void
  *
- * @note   以追加模式（"ab"）打开 {base}.spbin，写入 SpbinRecordHeader + path 字节。
- *         不执行 fsync，依赖操作系统的缓冲策略。
+ * @note   记录格式：[path_len:u32][path][reason:u8][timestamp:time_t][device_key:64B]。
+ *         device_key 暂填 st_dev 的十进制字符串（NUL 结尾，余量清零）——
+ *         P1-003 将升级为 (fsid, server, export) 三元组。
+ *         本函数不 fflush，由调用方决定刷盘时机。
  */
-void record_skip(const Config *cfg, RuntimeState *state, const SpbinEntry *entry) {
-    (void)state;
-    FILE *fp = fopen(get_spbin_filename(cfg->progress_base), "ab");
+void spbin_file_write_entry(FILE *fp, const SpbinEntry *entry) {
+    if (!fp || !entry || !entry->path) return;
+
+    uint32_t path_len = (uint32_t)strlen(entry->path);
+    char device_key[SPBIN_DEVICE_KEY_LEN] = {0};
+    snprintf(device_key, sizeof(device_key), "%lu", (unsigned long)entry->dev);
+
+    fwrite(&path_len, sizeof(uint32_t), 1, fp);
+    fwrite(entry->path, 1, path_len, fp);
+    fwrite(&entry->reason, sizeof(uint8_t), 1, fp);
+    fwrite(&entry->timestamp, sizeof(time_t), 1, fp);
+    fwrite(device_key, 1, SPBIN_DEVICE_KEY_LEN, fp);
+}
+
+/**
+ * @brief  将跳过记录（spbin）追加到磁盘文件（append-only）
+ * @param  progress_base  const char*        进度文件前缀，不能为空
+ * @param  entry          const SpbinEntry*  跳过记录条目指针，不能为空
+ * @return void
+ *
+ * @note   v15.6.0（P0-005）：替代死代码 record_skip。以追加模式（"ab"）打开
+ *         {base}.spbin 并立即 fflush——跳过记录是崩溃恢复依据，不得滞留在
+ *         stdio 缓冲中。append-only：运行期不随机改写，恢复条目由正常退出时
+ *         的 spbin_compact 统一过滤。
+ */
+void spbin_file_append(const char *progress_base, const SpbinEntry *entry) {
+    if (!progress_base || !entry) return;
+    char *spbin_path = get_spbin_filename(progress_base);
+    FILE *fp = fopen(spbin_path, "ab");
+    free(spbin_path);
     if (!fp) return;
 
-    SpbinRecordHeader hdr = {
-        .path_len = (uint32_t)strlen(entry->path),
-        .dev = entry->dev,
-        .blacklist_time = entry->blacklist_time,
-        .retry_count = entry->retry_count,
-        .probe_interval = entry->probe_interval,
-        .d_type = entry->d_type,
-        .s_status = entry->s_status
-    };
-    fwrite(&hdr, sizeof(hdr), 1, fp);
-    fwrite(entry->path, 1, hdr.path_len, fp);
+    spbin_file_write_entry(fp, entry);
+    fflush(fp);
     fclose(fp);
 }
 
@@ -427,9 +469,44 @@ void fpbin_append(AppContext *ctx, const char *path, const struct stat *st) {
  * @return void
  */
 
+/**
+ * @brief  将 fpbin 内存缓冲刷出到活跃分片并 fflush（v15.6.0，P0-003）
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ *
+ * @note   耐久性顺序要求：父目录"完成"写 dfpbin 之前，其新发现子目录必须已在
+ *         fpbin 落盘（内存缓冲刷出 + fflush 活跃分片）。否则崩溃后父目录在
+ *         dfpbin、子目录丢失 → 恢复时父目录被 completed_set 剪枝 → 子树漏扫。
+ *         由 main_loop.c advance_task_barriers 在 dfpbin_append 前调用。
+ */
+void fpbin_flush(AppContext *ctx) {
+    if (!ctx) return;
+    if (ctx->fpbin_count > 0) {
+        if (!ctx->fpbin_slice_file) {
+            fpbin_open_slice(ctx);
+        }
+        if (ctx->fpbin_slice_file) {
+            for (size_t i = 0; i < ctx->fpbin_count; i++) {
+                write_pbin_record(ctx->fpbin_slice_file, ctx->fpbin_entries[i], &ctx->fpbin_stats[i]);
+            }
+            ctx->fpbin_line_count += ctx->fpbin_count;
+        }
+        for (size_t i = 0; i < ctx->fpbin_count; i++) {
+            free(ctx->fpbin_entries[i]);
+        }
+        ctx->fpbin_count = 0;
+        if (ctx->fpbin_slice_file && ctx->fpbin_line_count >= ctx->cfg.progress_slice_lines) {
+            fpbin_rotate_slice(ctx);
+        }
+    }
+    if (ctx->fpbin_slice_file) {
+        fflush(ctx->fpbin_slice_file);
+    }
+}
+
 /* ================================================================
  * dpbin 完成日志（本次会话临时，正常结束后删除）
- * 格式与 pbin 同构：path | dev | ino | mtime | d_type
+ * 格式与 pbin 同构（v15.6.0 schema 2）：path | d_type | mtime_sec | mtime_nsec | size | uid | gid | mode | dev | ino | flags
  * ================================================================ */
 
 /**
@@ -543,6 +620,123 @@ void dpbin_delete_all(const char *progress_base) {
     free(dir);
 }
 
+/* ================================================================
+ * v15.6.0（P0-003）：dfpbin 完成日志（HIST_PUMP_OLD 阶段，fpbin 原子对）
+ * 格式与 dpbin/pbin 同构（v15.6.0 schema 2）：path | d_type | mtime_sec | mtime_nsec | size | uid | gid | mode | dev | ino | flags + Footer + 轮转
+ * ================================================================ */
+
+/**
+ * @brief  获取指定 dfpbin 分片的文件路径
+ * @param  base   const char*    进度文件基础名（--progress-file 的值），不能为空
+ * @param  index  unsigned long  分片编号，取值范围: >= 0
+ * @return char*  动态分配的字符串，包含完整分片路径；调用者负责 free。
+ */
+char *get_dfpbin_slice_filename(const char *base, unsigned long index) {
+    char *name = safe_malloc(strlen(base) + 32);
+    snprintf(name, strlen(base) + 32, "%s.dfpbin_%06lu", base, index);
+    return name;
+}
+
+/**
+ * @brief  打开或创建新的 dfpbin 活跃分片
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ */
+static void dfpbin_open_slice(AppContext *ctx) {
+    if (ctx->dfpbin_slice_file) {
+        fclose(ctx->dfpbin_slice_file);
+        ctx->dfpbin_slice_file = NULL;
+    }
+    char *p = get_dfpbin_slice_filename(ctx->cfg.progress_base, ctx->dfpbin_write_slice_index);
+    ctx->dfpbin_slice_file = fopen(p, "wb");
+    free(p);
+    ctx->dfpbin_line_count = 0;
+}
+
+/**
+ * @brief  轮转 dfpbin 分片（封口当前分片并创建新分片）
+ * @param  ctx  AppContext*  应用上下文指针，不能为空
+ * @return void
+ */
+static void dfpbin_rotate_slice_internal(AppContext *ctx) {
+    if (ctx->dfpbin_slice_file) {
+        write_pbin_footer(ctx->dfpbin_slice_file, ctx->dfpbin_line_count);
+        fclose(ctx->dfpbin_slice_file);
+        ctx->dfpbin_slice_file = NULL;
+    }
+    ctx->dfpbin_write_slice_index++;
+    dfpbin_open_slice(ctx);
+}
+
+/**
+ * @brief  向 dfpbin 追加一条记录（HIST_PUMP_OLD 阶段目录完成时写入）
+ * @param  ctx   AppContext*         应用上下文指针，不能为空
+ * @param  path  const char*         目录路径，不能为空
+ * @param  st    const struct stat*  目录 stat 信息指针，允许为 NULL
+ * @return void
+ *
+ * @note   复用 dpbin 的写入/轮转逻辑。调用前必须先 fpbin_flush（见
+ *         main_loop.c advance_task_barriers），保证子目录先于父目录落盘。
+ *         当分片行数达到 progress_slice_lines 时自动轮转。
+ */
+void dfpbin_append(AppContext *ctx, const char *path, const struct stat *st) {
+    if (!ctx->dfpbin_slice_file) {
+        dfpbin_open_slice(ctx);
+    }
+    if (!ctx->dfpbin_slice_file) return;
+
+    write_pbin_record(ctx->dfpbin_slice_file, path, st);
+    ctx->dfpbin_line_count++;
+
+    if (ctx->dfpbin_line_count >= ctx->cfg.progress_slice_lines) {
+        dfpbin_rotate_slice_internal(ctx);
+    }
+}
+
+/**
+ * @brief  删除所有 dfpbin 文件（整对抛弃 / --runone 清理时调用）
+ * @param  progress_base  const char*  进度文件基础名，不能为空
+ * @return void
+ *
+ * @note   扫描目录中所有匹配 dfpbin_*. 的文件并删除。
+ *         若 dfpbin 从未创建过（无文件），本函数为空操作。
+ */
+void dfpbin_delete_all(const char *progress_base) {
+    char *dir = strdup(progress_base);
+    char *last_slash = strrchr(dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+    } else {
+        free(dir);
+        dir = strdup(".");
+    }
+
+    DIR *d = opendir(dir);
+    if (!d) {
+        free(dir);
+        return;
+    }
+
+    const char *base_name = last_slash ? last_slash + 1 : progress_base;
+    size_t prefix_len = strlen(base_name) + strlen(".dfpbin_");
+    char *prefix = safe_malloc(prefix_len + 1);
+    snprintf(prefix, prefix_len + 1, "%s.dfpbin_", base_name);
+
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        if (strncmp(entry->d_name, prefix, strlen(prefix)) == 0) {
+            char *full = safe_malloc(strlen(dir) + strlen(entry->d_name) + 2);
+            snprintf(full, strlen(dir) + strlen(entry->d_name) + 2, "%s/%s", dir, entry->d_name);
+            unlink(full);
+            free(full);
+        }
+    }
+
+    free(prefix);
+    closedir(d);
+    free(dir);
+}
+
 /**
  * @brief  修复截断的 pbin 分片（ salvage 有效行，截断后重新封口）
  * @param  path            const char*   分片文件路径，不能为空
@@ -570,14 +764,24 @@ bool pbin_salvage_truncated(const char *path, uint64_t *out_valid_rows) {
         if (fread(path_buf, 1, path_len, fp) != path_len) break;
         /* 可选：检查路径是否为合理字符串，但二进制数据可能恰好匹配，不强制校验 */
 
-        dev_t dev;
-        ino_t ino;
-        time_t mtime;
+        /* v15.6.0（§0.2 schema 2）：定长尾部，与 write_pbin_record 严格对应 */
         unsigned char d_type;
-        if (fread(&dev, sizeof(dev_t), 1, fp) != 1) break;
-        if (fread(&ino, sizeof(ino_t), 1, fp) != 1) break;
-        if (fread(&mtime, sizeof(time_t), 1, fp) != 1) break;
+        time_t mtime_sec;
+        long mtime_nsec;
+        off_t size;
+        uint32_t uid, gid, mode;
+        uint64_t dev, ino;
+        uint32_t flags;
         if (fread(&d_type, sizeof(unsigned char), 1, fp) != 1) break;
+        if (fread(&mtime_sec, sizeof(time_t), 1, fp) != 1) break;
+        if (fread(&mtime_nsec, sizeof(long), 1, fp) != 1) break;
+        if (fread(&size, sizeof(off_t), 1, fp) != 1) break;
+        if (fread(&uid, sizeof(uint32_t), 1, fp) != 1) break;
+        if (fread(&gid, sizeof(uint32_t), 1, fp) != 1) break;
+        if (fread(&mode, sizeof(uint32_t), 1, fp) != 1) break;
+        if (fread(&dev, sizeof(uint64_t), 1, fp) != 1) break;
+        if (fread(&ino, sizeof(uint64_t), 1, fp) != 1) break;
+        if (fread(&flags, sizeof(uint32_t), 1, fp) != 1) break;
 
         valid_offset = ftell(fp);
         valid_rows++;

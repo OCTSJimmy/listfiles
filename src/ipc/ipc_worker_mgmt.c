@@ -52,10 +52,13 @@ void worker_mark_dead(IpcThreadCtx *ctx, bool send_notify) {
             .type = RET_DEAD,
             .slot_id = ctx->slot_id,
             .data = NULL,
-            .data_len = 0
+            .data_len = 0,
+            .epoch = 0
         };
+        /* v15.6.0: 容量 65536，满即设计外异常——RET_DEAD 丢失会导致
+         * Master 永不替换 Worker，log_fatal 暴露，不得静默丢弃 */
         if (!msg_queue_send(ctx->ret_queue, &msg)) {
-            log_error("[IPC-%d] ret_queue full, DEAD message dropped", ctx->slot_id);
+            log_fatal("[IPC-%d] ret_queue full, DEAD message dropped (slot=%d)", ctx->slot_id, ctx->slot_id);
         }
     }
 }
@@ -73,15 +76,18 @@ void worker_timeout_kill(IpcThreadCtx *ctx) {
  * Send return message to master
  * ================================================================ */
 
-void send_return(IpcThreadCtx *ctx, uint32_t type, void *data, size_t len) {
+void send_return(IpcThreadCtx *ctx, uint32_t type, void *data, size_t len, uint64_t epoch) {
     IpcThreadMsg msg = {
         .type = type,
         .slot_id = ctx->slot_id,
         .data = data,
-        .data_len = len
+        .data_len = len,
+        .epoch = epoch
     };
+    /* v15.6.0: 容量 65536，满即设计外异常——RET_BATCH/RET_FINISH 丢失会导致
+     * pending_tasks 永久泄漏、完结检查卡死，log_fatal 暴露，不得静默丢弃 */
     if (!msg_queue_send(ctx->ret_queue, &msg)) {
-        log_error("[IPC-%d] ret_queue full, message type=%u dropped", ctx->slot_id, type);
+        log_fatal("[IPC-%d] ret_queue full, message type=%u slot=%d dropped", ctx->slot_id, type, ctx->slot_id);
         free(data);
     } else {
         log_info_v(202605150000UL, "[IPC-%d] ret_queue send OK (type=%u, len=%zu, queue=%p)", ctx->slot_id, type, len, (void*)ctx->ret_queue);

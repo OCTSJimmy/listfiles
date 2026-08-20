@@ -39,11 +39,17 @@ typedef struct {
     size_t nread;       /* bytes already read in current state */
 } IpcReadFsm;
 
+/* MSG_SCAN payload header, followed by path string (v15.6.0: epoch) */
+typedef struct __attribute__((packed)) {
+    uint64_t epoch;
+} IpcScanHeader;
+
 /* MSG_BATCH payload header, followed by count records:
  *   [uint32_t path_len][char path[path_len]][struct stat st]
  */
 typedef struct __attribute__((packed)) {
     uint32_t count;
+    uint64_t epoch;      /* v15.6.0: 回带任务 epoch，Master 校验防旧 Worker 残留污染 */
 } IpcBatchHeader;
 
 /* MSG_ERROR payload header, followed by path string */
@@ -61,6 +67,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint32_t status;       /* 0=OK, 1=ERROR, 2=TIMEOUT, 3=EMPTY */
     uint32_t path_len;
+    uint64_t epoch;        /* v15.6.0: 回带任务 epoch，Master 校验防旧 Worker 残留污染 */
     /* char path[path_len] follows */
 } IpcFinishPayload;
 

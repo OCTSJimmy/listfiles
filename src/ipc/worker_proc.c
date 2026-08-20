@@ -148,9 +148,23 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
             }
             dir_path[hdr.payload_len] = '\0';
 
+            /* v15.6.0: SCAN payload = IpcScanHeader(epoch) + path */
+            uint64_t task_epoch = 0;
+            const char *scan_path = dir_path;
+            if (hdr.payload_len >= sizeof(IpcScanHeader)) {
+                IpcScanHeader sh;
+                memcpy(&sh, dir_path, sizeof(sh));
+                task_epoch = sh.epoch;
+                scan_path = dir_path + sizeof(IpcScanHeader);
+            } else {
+                log_warn("[Worker-%d] SCAN payload too short (%u), missing epoch header",
+                         worker_id, hdr.payload_len);
+            }
+
             pthread_mutex_lock(&ctx.task_mutex);
-            strncpy(ctx.task_path, dir_path, sizeof(ctx.task_path) - 1);
+            strncpy(ctx.task_path, scan_path, sizeof(ctx.task_path) - 1);
             ctx.task_path[sizeof(ctx.task_path) - 1] = '\0';
+            ctx.task_epoch = task_epoch;
             ctx.task_ready = true;
             pthread_cond_signal(&ctx.task_cond);
             pthread_mutex_unlock(&ctx.task_mutex);
@@ -385,6 +399,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     atomic_store(&slot->state, WORKER_STATE_INITIALIZING);  /* v15.1.1: spawn 初始为 INITIALIZING */
     atomic_store(&slot->last_heartbeat, time(NULL));
     slot->current_dev = 0;
+    slot->current_epoch = 0;  /* v15.6.0: 新 Worker 无在途任务，使旧 epoch 的残留消息必被丢弃 */
     slot->current_path[0] = '\0';
     slot->backlog_paths = NULL;
     slot->backlog_count = 0;
@@ -400,14 +415,28 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
  * @param  slot_id  int          目标 slot 索引，取值范围: [0, pool->num_workers-1]
  * @return bool  返回 true 表示替换成功；false 表示 spawn 新进程失败
  *
- * @note   对存活的旧 Worker 发送 SIGKILL 但不阻塞等待（waitpid WNOHANG），
- *         因为进程可能处于 D-State 不可杀死。旧进程成为僵尸后由主循环周期性收割。
- *         关闭旧 fd_in/fd_out，再调用 worker_pool_spawn 创建新进程。
+ * @note   对存活的旧 Worker 发送 SIGKILL，随后轮询 waitpid(WNOHANG) 确认旧进程
+ *         已被回收（每次间隔 1ms，最多 ~100ms；超时记 WARN 后继续），
+ *         避免其 Scanner 线程在内核完成的残留 write 与新 Worker 数据串扰。
+ *         确认回收后再关闭旧 fd_in/fd_out，调用 worker_pool_spawn 创建新进程。
  */
 bool worker_pool_replace(WorkerPool *pool, int slot_id) {
     WorkerSlot *slot = &pool->slots[slot_id];
     if (atomic_load(&slot->is_alive)) {
-        kill(slot->pid, SIGKILL);
+        pid_t old_pid = slot->pid;
+        kill(old_pid, SIGKILL);
+        /* v15.6.0: SIGKILL 后轮询 waitpid 确认旧进程真正回收（通常 < 1ms），
+         * 旧进程可能处于 D-State 不可杀死，超时记 WARN 后继续 */
+        int st;
+        int waited_ms = 0;
+        while (waitpid(old_pid, &st, WNOHANG) == 0 && waited_ms < 100) {
+            usleep(1000);
+            waited_ms++;
+        }
+        if (waited_ms >= 100) {
+            log_warn("[Replace] waitpid timeout for worker %d (pid=%d), continuing anyway",
+                     slot_id, (int)old_pid);
+        }
         close(slot->fd_cmd);
         if (slot->fd_cmd_rd >= 0) {
             close(slot->fd_cmd_rd);

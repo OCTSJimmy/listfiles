@@ -346,6 +346,15 @@ static void reap_probes(Monitor *mon) {
                         break;
                     }
                 }
+                /* v15.6.0（P0-005）：探测失败更新该设备所有条目的 timestamp/
+                 * retry_count（内存），供跨会话恢复时的退避窗口（30min→2h→6h→24h）
+                 * 判定；落盘由正常退出时的 spbin compaction 统一完成 */
+                for (size_t i = 0; i < ctx->spbin_count; i++) {
+                    if (ctx->spbin_entries[i].dev == mon->active_probe_dev) {
+                        ctx->spbin_entries[i].timestamp = time(NULL);
+                        ctx->spbin_entries[i].retry_count = next_retry;
+                    }
+                }
                 probe_scheduler_push(ctx->probe_scheduler, &task);
                 log_warn_v(202607280930UL, "[Probe] dev %lu retry %u scheduled after %us",
                            (unsigned long)mon->active_probe_dev, next_retry, next_interval);

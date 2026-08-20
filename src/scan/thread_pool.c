@@ -51,6 +51,7 @@ struct ThreadPool {
     pthread_mutex_t completed_mutex;
     
     int event_fd;
+    pthread_cond_t *main_cond;  /* v15.6.0: 批次完成时唤醒主线程（P0-001 屏障及时推进），可 NULL */
     bool stop;
     
     tp_process_fn process_fn;
@@ -111,6 +112,9 @@ static void *worker_thread(void *arg) {
         
         /* 通知主线程 */
         eventfd_write(tp->event_fd, 1);
+        /* v15.6.0: 主循环是 cond_wait 模型，eventfd 要等下轮迭代才被读取——
+         * 完成屏障依赖批次处理进度，裸 signal 及时唤醒避免 100ms 粒度拖慢吞吐 */
+        if (tp->main_cond) pthread_cond_signal(tp->main_cond);
     }
     return NULL;
 }
@@ -126,7 +130,8 @@ static void *worker_thread(void *arg) {
  * @note   创建失败时会自动清理已创建的线程和已分配的内存，不会泄漏资源。
  *         所有线程创建成功后才返回；若有任何线程创建失败，则整体失败。
  */
-ThreadPool* thread_pool_create(int num_threads, int event_fd, tp_process_fn fn, void *user_data) {
+ThreadPool* thread_pool_create(int num_threads, int event_fd, tp_process_fn fn, void *user_data,
+                               pthread_cond_t *main_cond) {
     if (num_threads < 1) num_threads = 1;
     ThreadPool *tp = calloc(1, sizeof(ThreadPool));
     if (!tp) return NULL;
@@ -135,6 +140,7 @@ ThreadPool* thread_pool_create(int num_threads, int event_fd, tp_process_fn fn, 
     tp->event_fd = event_fd;
     tp->process_fn = fn;
     tp->user_data = user_data;
+    tp->main_cond = main_cond;
     tp->stop = false;
     
     pthread_mutex_init(&tp->queue_mutex, NULL);

@@ -43,8 +43,13 @@ typedef struct AppContext {
     Config        cfg;
     RuntimeState  state;
 
-    /* === 去重与参考索引(仅主进程访问) === */
-    FingerprintSet *visited_set;      /* 本次任务防环 */
+    /* === 去重与参考索引(仅主进程访问) ===
+     * v15.6.0（P0-004 统一队列模型）：原 visited_set 拆分为三态集合——
+     * discovered_set：已发现（仅目录，防环/防重复发现；文件不进入，输出 at-least-once）
+     * enqueued_set：  已入队（在 dispatch_queue 或 dspill 中，防重复入队）
+     * completed_set： 已完成（dpbin/dfpbin 合并集加载，差集剪枝） */
+    FingerprintSet *discovered_set;   /* 本次任务防环（仅目录） */
+    FingerprintSet *enqueued_set;     /* 已入队目录（dispatch_queue 或 dspill） */
     FingerprintSet *completed_set;    /* v15.5.0: dpbin 加载的已完成目录集合(恢复时) */
     FingerprintSet *reference_set;    /* 半增量:历史存在性(可能 NULL) */
     ReferenceMap   *reference_map;    /* 半增量:fingerprint -> (mtime, d_type) */
@@ -58,6 +63,17 @@ typedef struct AppContext {
     SpbinEntry     *spbin_entries;
     size_t          spbin_count;
     size_t          spbin_capacity;
+    /* v15.6.0（P0-005）：spbin 路径指纹集合（path-only 指纹，fp_compute(path,0,0)）。
+     * 恢复泵送/dspill 回填时拦截熔断/跳过目录，防止盲目重入队；懒创建。 */
+    FingerprintSet *spbin_set;
+
+    /* === v15.6.0（P1-004）：毒丸目录致死计数 ===
+     * Worker 死亡时正在扫描的目录 path→count（死亡是稀有事件，小型动态数组即可）。
+     * 同一路径累计致死 POISON_DEATH_THRESHOLD 次 → 写 spbin POISON 永久隔离。 */
+    char   **poison_paths;
+    int     *poison_counts;
+    size_t   poison_count;
+    size_t   poison_capacity;
 
     /* === 事件循环 === */
     int             epfd;
@@ -79,7 +95,13 @@ typedef struct AppContext {
     /* === 任务计数 === */
     _Atomic long    pending_tasks;
     _Atomic long    pending_batches;   /* 已提交到线程池但未完成的 batch 数 */
-    bool            resume_active;
+    _Atomic uint64_t epoch_counter;    /* v15.6.0: 目录派发 epoch 计数器（每次成功派发 +1） */
+
+    /* === v15.6.0: 输出三态（P0-002）——每 Worker slot 未 COMMITTED 的输出 batch 数 ===
+     * 主线程提交输出 batch 前 +1（OUTPUT_QUEUED），输出线程 fflush 后 -1（OUTPUT_COMMITTED），
+     * 目录完成屏障要求归零才允许 dpbin。按 num_workers 动态分配（main.c），
+     * 无任务归属的输出（单文件目标等）以 slot_id=-1 提交、不计数。 */
+    _Atomic long   *output_pending;
 
     /* === 输出线程 === */
     AsyncWorker    *async_writer;
@@ -115,6 +137,13 @@ typedef struct AppContext {
     unsigned long   dpbin_write_slice_index;/* 当前 dpbin 分片号 */
     unsigned long   dpbin_line_count;       /* 当前 dpbin 分片行数 */
 
+    /* === v15.6.0: dfpbin 完成日志（P0-003，fpbin 原子对） ===
+     * HIST_PUMP_OLD 阶段完成的父目录写 dfpbin 而非 dpbin；
+     * fpbin 转正时同步合并入 dpbin，恢复时与 fpbin 成对校验，不完整则整对抛弃。 */
+    FILE           *dfpbin_slice_file;       /* 当前活跃 dfpbin 分片文件指针 */
+    unsigned long   dfpbin_write_slice_index;/* 当前 dfpbin 分片号 */
+    unsigned long   dfpbin_line_count;       /* 当前 dfpbin 分片行数 */
+
     /* === v15.5.8: dspill 派发兜底（运行级追加文件，替代 pbin 滑动窗口） ===
      * 队列达到 HIGH_WATER 时被跳推的目录追加写入 {base}.dspill；
      * 加载器按字节游标回填。无分片轮转、无删除竞争、只含跳推目录。
@@ -123,14 +152,22 @@ typedef struct AppContext {
     long            dspill_read_offset; /* 加载游标（字节偏移） */
     unsigned long   dspill_appended;    /* 累计跳推（溢出）目录数 */
     unsigned long   dspill_loaded;      /* 累计从 dspill 回填目录数 */
+    unsigned long   dspill_pending;     /* v15.6.0: 距上次刷盘积累的待刷条数 */
+    time_t          dspill_last_flush;  /* v15.6.0: 上次刷盘时间（1 秒定时刷盘用） */
     pthread_mutex_t dspill_mutex;       /* 写端/读端互斥 */
 
     /* === v15.5.9: redispatch 指数退避（NFS大目录防连续快速失败） === */
-    time_t redispatch_backoff_until[8];  /* 每个 slot 的退避截止时间 */
+    time_t redispatch_backoff_until[MAX_WORKERS];  /* 每个 slot 的退避截止时间 */
+
+    /* === v15.6.0（P0-008）：Run manifest 状态 === */
+    char     run_id[64];              /* 本轮 run_id（<时间戳>-<pid>），启动时生成 */
+    bool     blind_trust;             /* 本轮为盲信扫描（manifest 恒 baseline_eligible=0） */
+    char     baseline_run_id[64];     /* 盲信基准 run_id（非盲信为空串） */
+    time_t   baseline_completed_at;   /* 盲信基准完成时间（审计用） */
 
     /* === v15.5.3: per-slot DEV_TIMEOUT circuit breaker === */
-    char timeout_paths[8][4096];   /* 每个 Worker slot 最近 timeout 的路径 */
-    int  timeout_counts[8];        /* 该路径连续 timeout 次数 */
+    char timeout_paths[MAX_WORKERS][4096];   /* 每个 Worker slot 最近 timeout 的路径 */
+    int  timeout_counts[MAX_WORKERS];        /* 该路径连续 timeout 次数 */
 
     /* === 熔断清单 === */
     FILE           *circuit_breaker_fp;

@@ -14,6 +14,7 @@
 #include "main_loop.h"
 #include "output.h"
 #include "progress.h"
+#include "manifest.h"
 #include "utils.h"
 #include "signals.h"
 #include "log.h"
@@ -47,11 +48,12 @@ static void app_context_init(AppContext *ctx) {
     ctx->next_requeue_worker = 0;
     atomic_init(&ctx->pending_tasks, 0);
     atomic_init(&ctx->pending_batches, 0);
+    atomic_init(&ctx->epoch_counter, 0);  /* v15.6.0: epoch 从 1 开始（自增后生效），0 表示无在途任务 */
     dispatch_queue_init(&ctx->dispatch_queue);
     record_path_batch_init(&ctx->record_batch);
     pthread_mutex_init(&ctx->dspill_mutex, NULL); /* v15.5.8 */
     /* v15.5.9: 初始化 redispatch 退避数组 */
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < MAX_WORKERS; i++) {
         ctx->redispatch_backoff_until[i] = 0;
     }
 }
@@ -83,6 +85,8 @@ static void app_context_destroy(AppContext *ctx) {
         async_worker_shutdown(ctx->async_writer);
         ctx->async_writer = NULL;
     }
+    free(ctx->output_pending);   /* v15.6.0: P0-002 输出三态计数数组 */
+    ctx->output_pending = NULL;
     if (ctx->worker_pool) {
         worker_pool_destroy(ctx->worker_pool);
         ctx->worker_pool = NULL;
@@ -96,9 +100,13 @@ static void app_context_destroy(AppContext *ctx) {
         ctx->dev_mgr = NULL;
     }
     circuit_breaker_close(ctx);
-    if (ctx->visited_set) {
-        fp_set_destroy(ctx->visited_set);
-        ctx->visited_set = NULL;
+    if (ctx->discovered_set) {
+        fp_set_destroy(ctx->discovered_set);
+        ctx->discovered_set = NULL;
+    }
+    if (ctx->enqueued_set) {
+        fp_set_destroy(ctx->enqueued_set);
+        ctx->enqueued_set = NULL;
     }
     if (ctx->completed_set) {
         fp_set_destroy(ctx->completed_set);
@@ -120,9 +128,29 @@ static void app_context_destroy(AppContext *ctx) {
         free(ctx->spbin_entries);
         ctx->spbin_entries = NULL;
     }
+    /* v15.6.0（P0-005）：spbin 路径指纹集合 */
+    if (ctx->spbin_set) {
+        fp_set_destroy(ctx->spbin_set);
+        ctx->spbin_set = NULL;
+    }
+    /* v15.6.0（P1-004）：毒丸目录致死计数 */
+    if (ctx->poison_paths) {
+        for (size_t i = 0; i < ctx->poison_count; i++) {
+            free(ctx->poison_paths[i]);
+        }
+        free(ctx->poison_paths);
+        ctx->poison_paths = NULL;
+    }
+    free(ctx->poison_counts);
+    ctx->poison_counts = NULL;
     if (ctx->fpbin_slice_file) {
         fclose(ctx->fpbin_slice_file);
         ctx->fpbin_slice_file = NULL;
+    }
+    /* v15.6.0: 关闭 dfpbin 原子对句柄（P0-003） */
+    if (ctx->dfpbin_slice_file) {
+        fclose(ctx->dfpbin_slice_file);
+        ctx->dfpbin_slice_file = NULL;
     }
     /* v15.5.8: 关闭 dspill 派发兜底文件句柄 */
     if (ctx->dspill_fp) {
@@ -144,56 +172,104 @@ static void app_context_destroy(AppContext *ctx) {
 }
 
 /**
- * @brief  加载会话配置快照并进行一致性校验
+ * @brief  检查 progress 前缀路径是否存在任何进度文件残留（v15.6.0，P0-008）
+ * @param  base  const char*  进度文件前缀，不能为空
+ * @return bool  存在 .config/.manifest/pbin 分片/archive 任一残留返回 true
+ *
+ * @note   盲信扫描要求新的空 progress 目录（设计 §4.3）：-f 路径有残留即拒绝。
+ */
+static bool progress_base_has_residue(const char *base) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s.config", base);
+    if (access(path, F_OK) == 0) return true;
+    snprintf(path, sizeof(path), "%s.manifest", base);
+    if (access(path, F_OK) == 0) return true;
+    char *slice = get_slice_filename(base, 0);
+    bool found = (access(slice, F_OK) == 0);
+    free(slice);
+    char *arch = get_archive_filename(base);
+    if (access(arch, F_OK) == 0) found = true;
+    free(arch);
+    return found;
+}
+
+/**
+ * @brief  加载会话配置快照并进行一致性校验（v15.6.0：以 manifest 为准）
  * @param  cfg         Config*  指向当前配置结构体的指针，不能为空
- * @param  has_history bool*   输出参数，返回 true 表示检测到历史进度文件(.config)
+ * @param  has_history bool*   输出参数，返回 true 表示检测到历史进度文件
  * @return void
  *
- * @note   读取 {progress_base}.config 文件，校验 path 字段是否与当前 --path 一致。
- *         若不一致则打印错误并 exit(1)。根据 status 字段自动设置 continue_mode。
- *         若 archive 策略与历史记录不一致也直接 exit(1)。
+ * @note   v15.6.0（P0-008）：权威状态来源从 .config 切换为 {base}.manifest——
+ *         旧实现中 finalize 向 .config 追加写积累多行 status，逐行/strstr 匹配
+ *         会命中任意一行（如 Running 后追加 Incomplete 仍被当 Running），
+ *         manifest 为原子写、单行覆盖语义，根除该误判。
+ *         .config 继续按原样写入（兼容性），此处仅读其中的 archive 策略字段。
+ *         兼容性策略（不做双格式解析）：manifest 缺失（旧版本进度）或
+ *         schema_version/pbin_schema_version 与当前（2/2）不一致 → 拒绝续传，
+ *         exit(2)，提示 --runone 重新全量扫描。
+ *         path 不一致、archive 策略不一致同样 exit(2)（进度不兼容）。
  */
 static void load_session_config(Config *cfg, bool *has_history) {
     *has_history = false;
     if (!cfg->progress_base) return;
-    char path[1024];
-    snprintf(path, sizeof(path), "%s.config", cfg->progress_base);
-    if (access(path, F_OK) != 0) return;
+    char config_path[1024];
+    snprintf(config_path, sizeof(config_path), "%s.config", cfg->progress_base);
+    bool config_exists = (access(config_path, F_OK) == 0);
+
+    ManifestInfo m;
+    bool m_ok = manifest_load(cfg->progress_base, &m);
+    if (!config_exists && !m_ok) return;
     *has_history = true;
 
-    FILE *fp = fopen(path, "r");
-    if (!fp) return;
+    if (!m_ok) {
+        log_error("进度文件为旧版本格式（缺少 %s.manifest），无法安全续传/盲信。", cfg->progress_base);
+        log_error("请使用 --runone 重新全量扫描。");
+        exit(2);
+    }
+    if (m.schema_version != MANIFEST_SCHEMA_VERSION
+        || m.pbin_schema_version != PBIN_SCHEMA_VERSION) {
+        log_error("进度文件格式不兼容（manifest schema=%d, pbin schema=%d，当前要求 %d/%d）。",
+                  m.schema_version, m.pbin_schema_version,
+                  MANIFEST_SCHEMA_VERSION, PBIN_SCHEMA_VERSION);
+        log_error("请使用 --runone 重新全量扫描。");
+        exit(2);
+    }
+    if (m.target_path[0] != '\0' && strcmp(cfg->target_path, m.target_path) != 0) {
+        log_error("检测到进度文件与当前路径不一致！");
+        log_error("  历史记录: %s", m.target_path);
+        log_error("  当前指定: %s", cfg->target_path);
+        log_error("建议：使用 --runone 强制重跑，或检查 --progress-file 参数。");
+        exit(2);
+    }
+    if (strcmp(m.status, "Success") == 0 || strcmp(m.status, "Running") == 0
+        || strcmp(m.status, "Incomplete") == 0) {
+        cfg->continue_mode = true;
+    }
 
-    char line[1024];
-    while (fgets(line, sizeof(line), fp)) {
-        char *eq = strchr(line, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        char *key = line;
-        char *val = eq + 1;
-        val[strcspn(val, "\n")] = 0;
-
-        if (strcmp(key, "path") == 0) {
-            if (strcmp(cfg->target_path, val) != 0) {
-                log_error("检测到进度文件与当前路径不一致！");
-                log_error("  历史记录: %s", val);
-                log_error("  当前指定: %s", cfg->target_path);
-                log_error("建议：使用 --runone 强制重跑，或检查 --progress-file 参数。");
-                exit(1);
+    /* archive 策略一致性仍读 .config（manifest 不收录该字段） */
+    if (config_exists) {
+        FILE *fp = fopen(config_path, "r");
+        if (fp) {
+            char line[1024];
+            while (fgets(line, sizeof(line), fp)) {
+                char *eq = strchr(line, '=');
+                if (!eq) continue;
+                *eq = '\0';
+                char *val = eq + 1;
+                val[strcspn(val, "\n")] = 0;
+                if (strcmp(line, "archive") == 0) {
+                    bool hist_archive = atoi(val);
+                    if (hist_archive != cfg->archive) {
+                        log_error("归档策略与历史记录不一致");
+                        log_error("请使用 --runone 重新全量扫描。");
+                        exit(2);
+                    }
+                    break; /* archive 由 save_config_to_disk 单次写入，首行即为有效值 */
+                }
             }
-        } else if (strcmp(key, "status") == 0) {
-            if (strcmp(val, "Success") == 0 || strcmp(val, "Running") == 0) {
-                cfg->continue_mode = true;
-            }
-        } else if (strcmp(key, "archive") == 0) {
-            bool hist_archive = atoi(val);
-            if (hist_archive != cfg->archive) {
-                log_error("归档策略与历史记录不一致");
-                exit(1);
-            }
+            fclose(fp);
         }
     }
-    fclose(fp);
 }
 
 /**
@@ -282,7 +358,54 @@ int main(int argc, char *argv[]) {
     if (!ctx.cfg.runone) {
         load_session_config(&ctx.cfg, &has_history);
     }
+
+    /* v15.6.0（P0-008/P0-011）：盲信扫描启动校验（必须先于 manifest_write_running
+     * 覆盖写 Running，否则基准 manifest 被本轮覆盖、baseline_eligible 无法判定）。
+     * 盲信 = 续传 + skip_interval>0 + 非 runone；规则：
+     * 1. 必须显式 --reference-base 指定基准（旧 progress 路径）；
+     * 2. -f 路径必须无进度文件残留（新空 progress 目录，增量与基准物理隔离）；
+     * 3. 基准 manifest 存在且 baseline_eligible=1、pbin_schema_version=2。
+     * 任一不满足 → 拒绝运行 exit(2)（严重失败：盲信基准不合格）。 */
+    ctx.blind_trust = ctx.cfg.continue_mode && !ctx.cfg.runone && ctx.cfg.skip_interval > 0;
+    if (ctx.blind_trust) {
+        if (!ctx.cfg.reference_base) {
+            log_error("盲信扫描（--skip-interval>0）须用 --reference-base 显式指定盲信基准（旧 progress 路径）。");
+            exit(2);
+        }
+        if (progress_base_has_residue(ctx.cfg.progress_base)) {
+            log_error("盲信扫描要求新的空 progress 目录：%s 已有进度文件残留。", ctx.cfg.progress_base);
+            log_error("请为 -f/--progress-file 指定全新路径（基准经 --reference-base 指定）。");
+            exit(2);
+        }
+        ManifestInfo base_m;
+        if (!manifest_load(ctx.cfg.reference_base, &base_m)) {
+            log_error("盲信基准 %s 缺少 manifest（旧版本进度或不完整），拒绝盲信扫描。",
+                      ctx.cfg.reference_base);
+            log_error("请先用当前版本对目标做全量扫描建立合格基准，或使用 --runone 重新全量扫描。");
+            exit(2);
+        }
+        if (base_m.pbin_schema_version != PBIN_SCHEMA_VERSION || base_m.baseline_eligible != 1) {
+            log_error("盲信基准不合格（%s：baseline_eligible=%d, pbin_schema_version=%d），拒绝盲信扫描。",
+                      ctx.cfg.reference_base, base_m.baseline_eligible, base_m.pbin_schema_version);
+            log_error("请重新全量扫描建立合格基准（status=Success 且无 spbin/dspill/fpbin 残留）。");
+            exit(2);
+        }
+        safe_strcpy(ctx.baseline_run_id, base_m.run_id, sizeof(ctx.baseline_run_id));
+        ctx.baseline_completed_at = base_m.finished_at;
+        log_info("盲信基准校验通过：%s（run_id=%s）", ctx.cfg.reference_base, base_m.run_id);
+    }
+
     interactive_confirm(&ctx.cfg, has_history);
+
+    /* v15.6.0（P0-008）：续传兼容性兜底——有 pbin/archive 二进制残留但无
+     * .config/.manifest（旧版本进度）→ 拒绝续传，不做双格式解析。
+     * （.config/.manifest 存在的情形已由 load_session_config 校验并拦截） */
+    if (ctx.cfg.continue_mode && !ctx.blind_trust && !has_history
+        && progress_base_has_residue(ctx.cfg.progress_base)) {
+        log_error("检测到旧版本进度残留（无 manifest），无法安全续传。");
+        log_error("请使用 --runone 重新全量扫描。");
+        exit(2);
+    }
 
     /* Initialize logging with verbose settings */
     log_init(ctx.cfg.verbose, ctx.cfg.verbose_level);
@@ -301,37 +424,38 @@ int main(int argc, char *argv[]) {
     if (!ctx.cfg.continue_mode || ctx.cfg.runone || !has_history) {
         save_config_to_disk(&ctx.cfg);
     }
+    /* v15.6.0（P0-008）：启动即原子写 status=Running 的 Run manifest
+     * （.new → fsync → rename），覆盖上次运行终态——崩溃残留的状态永远是
+     * Running 而非 Success，修复 .config 追加写多行 status 被误判的链式基准漏洞。
+     * manifest 是唯一权威状态来源，.config 仅为兼容保留。 */
+    manifest_write_running(&ctx);
 
-    /* Pre-allocate fingerprint set */
-    ctx.visited_set = fp_set_create(ctx.cfg.estimated_files);
-    if (!ctx.visited_set) {
-        log_fatal("无法分配 VisitedSet 内存");
-        return 1;
+    /* Pre-allocate fingerprint sets (v15.6.0 P0-004: discovered/enqueued 拆分) */
+    ctx.discovered_set = fp_set_create(ctx.cfg.estimated_files);
+    if (!ctx.discovered_set) {
+        log_fatal("无法分配 DiscoveredSet 内存");
+        return 2; /* v15.6.0: 严重失败 */
+    }
+    ctx.enqueued_set = fp_set_create(ctx.cfg.estimated_files);
+    if (!ctx.enqueued_set) {
+        log_fatal("无法分配 EnqueuedSet 内存");
+        return 2; /* v15.6.0: 严重失败 */
     }
 
-    /* Incremental mode: load reference set/map */
-    if (ctx.cfg.continue_mode && ctx.cfg.skip_interval > 0) {
-        char path[1024];
-        snprintf(path, sizeof(path), "%s.config", ctx.cfg.progress_base);
-        FILE *fp = fopen(path, "r");
-        bool is_success = false;
-        if (fp) {
-            char line[1024];
-            while (fgets(line, sizeof(line), fp)) {
-                if (strstr(line, "status=Success")) {
-                    is_success = true;
-                    break;
-                }
-            }
-            fclose(fp);
+    /* v15.6.0（P0-011）：盲信模式加载基准索引（启动校验已在前置关卡完成）。
+     * 基准经 --reference-base 显式指定，与本轮新空 progress 目录物理隔离；
+     * reference_set/map 以纯路径指纹为 key，收录基准完整历史 stat。 */
+    if (ctx.blind_trust) {
+        log_info("加载盲信基准索引进行盲信扫描...");
+        ctx.reference_set = fp_set_create(ctx.cfg.estimated_files);
+        ctx.reference_map = ref_map_create(ctx.cfg.estimated_files);
+        if (!ctx.reference_set || !ctx.reference_map) {
+            log_fatal("无法分配盲信基准索引内存");
+            app_context_destroy(&ctx);
+            return 2;
         }
-        if (is_success) {
-            log_info("检测到上次任务已完成，加载历史索引进行半增量扫描...");
-            ctx.reference_set = fp_set_create(ctx.cfg.estimated_files);
-            ctx.reference_map = ref_map_create(ctx.cfg.estimated_files);
-            restore_progress_to_memory(&ctx.cfg, &ctx);
-            log_info("历史索引加载完成");
-        }
+        restore_progress_to_memory(&ctx.cfg, &ctx, ctx.cfg.reference_base);
+        log_info("历史索引加载完成");
     }
 
     /* Setup worker context (COW, read-only in workers) */
@@ -346,13 +470,15 @@ int main(int argc, char *argv[]) {
         if (num_workers > 8) num_workers = 8;  // 默认上限 8，防止 NFS 过载
     }
     ctx.worker_pool = worker_pool_create(num_workers);
+    /* v15.6.0: 输出三态（P0-002）——每 slot 未 COMMITTED 输出 batch 计数，按 num_workers 动态分配 */
+    ctx.output_pending = calloc((size_t)num_workers, sizeof(_Atomic long));
     ctx.probe_scheduler = probe_scheduler_create();
     ctx.monitor = monitor_create(&ctx);
 
-    if (!ctx.worker_pool || !ctx.probe_scheduler || !ctx.monitor) {
+    if (!ctx.worker_pool || !ctx.output_pending || !ctx.probe_scheduler || !ctx.monitor) {
         log_fatal("无法初始化进程池");
         app_context_destroy(&ctx);
-        return 1;
+        return 2; /* v15.6.0: 严重失败 */
     }
 
     /* Start monitor thread */
@@ -367,7 +493,7 @@ int main(int argc, char *argv[]) {
     if (!init_ipc_threads(&ctx)) {
         log_fatal("IPC thread initialization failed");
         app_context_destroy(&ctx);
-        return 1;
+        return 2; /* v15.6.0: 严重失败 */
     }
     for (int i = 0; i < num_workers; i++) {
         WorkerSlot *slot = &ctx.worker_pool->slots[i];
@@ -382,52 +508,39 @@ int main(int argc, char *argv[]) {
     /* [FIX] 必须在 restore_progress 之后初始化输出文件，否则 output_slice_num 等状态会被覆盖 */
     init_output_files(&ctx.cfg, &ctx.state);
     init_output_buffers(&ctx);
-    ctx.async_writer = async_worker_init(&ctx.cfg, &ctx.state);
+    ctx.async_writer = async_worker_init(&ctx.cfg, &ctx.state, ctx.output_pending, &ctx.main_cond);
     circuit_breaker_init(&ctx);
 
-    /* v15.5.8: 删除上一运行遗留的 dspill 兜底文件。
-     * 恢复模式下未完成目录会经根目录重扫重新发现（completed_set 只剪枝已完成
-     * 子树），遗留 dspill 若被追加复用会导致重复派发/重复输出，故启动时清理。 */
-    if (ctx.cfg.progress_base) {
-        char *stale_spill = get_dspill_filename(ctx.cfg.progress_base);
-        if (stale_spill) {
-            if (unlink(stale_spill) == 0)
-                log_info("[Dspill] removed stale spill file: %s", stale_spill);
-            free(stale_spill);
-        }
-    }
+    /* v15.6.0（P0-004/P1-001）：dspill 已纳入恢复——restore_progress 会读取
+     * 上一运行遗留的 dspill 兜底文件并经 enqueue_dir 回填（enqueued_set 去重），
+     * 不再在启动时无条件删除。强制重跑（--runone/--clean）由 cleanup_progress 清理。 */
 
     /* Seed root task */
     struct stat root_info;
     if (lstat(ctx.cfg.target_path, &root_info) == 0) {
         ctx.state.root_dev = root_info.st_dev;  /* v15.5.6: 单挂载保护基准 */
         if (S_ISDIR(root_info.st_mode)) {
-            atomic_fetch_add(&ctx.pending_tasks, 1);
-            WorkerSlot *slot = ctx.worker_pool->slots;
-            slot->current_dev = root_info.st_dev;
-            safe_strcpy(slot->current_path, ctx.cfg.target_path, sizeof(slot->current_path));
-
-            CmdScanPayload *scan = malloc(sizeof(CmdScanPayload));
-            if (!scan) {
-                log_fatal("根任务内存分配失败");
-                app_context_destroy(&ctx);
-                return 1;
-            }
-            scan->path_len = (uint32_t)strlen(ctx.cfg.target_path);
-            scan->dev = root_info.st_dev;
-            safe_strcpy(scan->path, ctx.cfg.target_path, sizeof(scan->path));
-
-            IpcThreadMsg msg = {
-                .type = CMD_SCAN,
-                .slot_id = 0,
-                .data = scan,
-                .data_len = sizeof(*scan)
-            };
-            if (!msg_queue_send(ctx.ipc_cmd_queues[0], &msg)) {
-                log_fatal("根任务发送失败: cmd_queue full");
-                free(scan);
-                app_context_destroy(&ctx);
-                return 1;
+            /* v15.6.0: 根任务统一经 enqueue_dir → dispatch_queue →
+             * dispatch_from_queue 派发，由派发路径负责 pending_tasks++、epoch
+             * 分配、Worker BUSY 状态与 dpbin。
+             * 此前旁路直发 CMD_SCAN：不占 BUSY 态，READY 后 slot 被判 IDLE，
+             * dispatch 会把第二个任务叠上同一 Worker，且 epoch 未登记，
+             * 根任务的 BATCH/FINISH 被 epoch 校验全部误杀 → pending_tasks 泄漏卡死
+             * （回归用例7 dspill 场景复现）。
+             * v15.6.0（P0-004）：改走统一入队入口后，恢复场景下根任务若已在
+             * completed_set 则被剪枝（其子目录由 pbin 泵送覆盖），若泵送差集
+             * 也含根目录则 enqueued_set 防重，根目录只会入队一次。 */
+            enqueue_dir(&ctx, ctx.cfg.target_path, &root_info);
+            /* 防御：根任务必须已入队、已落 dspill 或已被 completed_set 剪枝，
+             * 否则扫描将空跑（原直推路径此处为 log_fatal） */
+            if (dispatch_queue_count(&ctx.dispatch_queue) == 0 && !ctx.dspill_fp) {
+                uint8_t root_fp[FP_SIZE];
+                fp_compute(ctx.cfg.target_path, root_info.st_dev, root_info.st_ino, root_fp);
+                if (!ctx.completed_set || !fp_set_contains(ctx.completed_set, root_fp)) {
+                    log_fatal("根任务入队失败");
+                    app_context_destroy(&ctx);
+                    return 2; /* v15.6.0: 严重失败 */
+                }
             }
         } else {
             /* Single file target */
@@ -437,7 +550,7 @@ int main(int argc, char *argv[]) {
     } else {
         log_fatal("Cannot access target path %s", ctx.cfg.target_path);
         app_context_destroy(&ctx);
-        return 1;
+        return 2; /* v15.6.0: 严重失败 */
     }
 
     if (!ctx.cfg.mute) {
@@ -468,7 +581,39 @@ int main(int argc, char *argv[]) {
         ctx.state.has_error = true;
     }
 
-    finalize_progress(&ctx.cfg, &ctx.state);
+    /* v15.6.0（P0-005）：正常退出时 spbin compaction——过滤已恢复（RECOVERED）
+     * 条目后重写 {base}.spbin，须先于 finalize_progress（archive 模式会把
+     * spbin 归档进 {base}.archive，此处保证归档的是压缩后的版本） */
+    spbin_compact(&ctx);
+
+    /* v15.6.0（P0-008）：先关停异步输出线程并刷盘，保证 manifest 的
+     * output_offset/输出尾部完整性校验基于落盘后的最终内容 */
+    if (ctx.async_writer) {
+        async_worker_shutdown(ctx.async_writer);
+        ctx.async_writer = NULL;
+    }
+    if (ctx.state.output_fp && ctx.state.output_fp != stdout) {
+        fflush(ctx.state.output_fp);
+    }
+
+    /* v15.6.0（P0-008）：dspill 残留字节统计（manifest 字段 + baseline_eligible
+     * 判定条件），须先于成功路径的 dspill 删除 */
+    long dspill_residue = 0;
+    if (ctx.cfg.progress_base) {
+        char *spill = get_dspill_filename(ctx.cfg.progress_base);
+        struct stat spill_st;
+        if (spill && stat(spill, &spill_st) == 0
+            && spill_st.st_size > (off_t)ctx.dspill_read_offset) {
+            dspill_residue = (long)(spill_st.st_size - (off_t)ctx.dspill_read_offset);
+        }
+        free(spill);
+    }
+
+    bool archive_ok = finalize_progress(&ctx.cfg, &ctx.state);
+    /* v15.6.0（P0-008）：写终态 Run manifest（.new → fsync → rename 原子切换），
+     * 含 status/baseline_eligible 判定；部分完成时 manifest_finalize 会置
+     * has_error，保证退出码为 1（部分完成） */
+    manifest_finalize(&ctx, dspill_residue, archive_ok);
     /* v15.5.0: Delete temporary dpbin after successful completion */
     if (ctx.cfg.continue_mode && ctx.cfg.progress_base) {
         dpbin_delete_all(ctx.cfg.progress_base);
@@ -488,8 +633,12 @@ int main(int argc, char *argv[]) {
     free(ctx.cfg.output_file);
     free(ctx.cfg.output_split_dir);
     free(ctx.cfg.progress_base);
+    free(ctx.cfg.reference_base); /* v15.6.0: --reference-base */
     free(ctx.cfg.format);
     free(ctx.cfg.resume_file);
 
+    /* v15.6.0 退出码语义（§9.6）：0=完全完成；1=部分完成（跳过/spbin 残留/
+     * dspill 残留/熔断清单非空）；2=严重失败（盲信基准不合格、进度不兼容、
+     * 初始化致命错误）；3=架构不匹配（预留，本期不接平台检查） */
     return ctx.state.has_error ? 1 : 0;
 }

@@ -81,6 +81,8 @@ void ipc_thread_ctx_destroy(IpcThreadCtx *ctx) {
     if (ctx->fd_data >= 0) close(ctx->fd_data);
     if (ctx->fd_ctrl >= 0) close(ctx->fd_ctrl);
     if (ctx->epfd >= 0) close(ctx->epfd);
+    /* v15.6.0: 释放替换窗口期暂存但未补发的 CMD_SCAN */
+    if (ctx->has_pending_scan) free(ctx->pending_scan.data);
     free(ctx);
 }
 

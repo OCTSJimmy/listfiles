@@ -64,6 +64,50 @@ static unsigned long count_file_lines(const char *path) {
     return lines;
 }
 
+/**
+ * @brief  截断输出文件不完整的最后一条记录（v15.6.0，P0-002 崩溃恢复）
+ * @param  path  const char*  输出文件路径
+ * @return void
+ *
+ * @note   continue 模式打开已有输出文件前调用：seek 到末尾反向扫描最后一个 '\n'，
+ *         其后的残缺尾部（上次崩溃时写了一半的记录）ftruncate 掉；
+ *         文件为空或末尾即 '\n' 则不动；全文无 '\n' 则整体视为残缺记录清空。
+ *         恢复语义为"截断损坏尾部"，不精确回滚到 dpbin offset（允许重复行）。
+ */
+static void truncate_incomplete_tail(const char *path) {
+    int fd = open(path, O_RDWR);
+    if (fd < 0) return;
+
+    off_t size = lseek(fd, 0, SEEK_END);
+    if (size <= 0) { close(fd); return; }
+
+    char buf[4096];
+    off_t scan_end = size;
+    off_t last_nl = -1;
+    while (scan_end > 0 && last_nl < 0) {
+        off_t chunk = scan_end < (off_t)sizeof(buf) ? scan_end : (off_t)sizeof(buf);
+        off_t start = scan_end - chunk;
+        if (lseek(fd, start, SEEK_SET) < 0) break;
+        ssize_t got = read(fd, buf, (size_t)chunk);
+        if (got != chunk) break;
+        for (ssize_t i = got - 1; i >= 0; i--) {
+            if (buf[i] == '\n') { last_nl = start + i; break; }
+        }
+        scan_end = start;
+    }
+
+    off_t keep = (last_nl < 0) ? 0 : last_nl + 1;
+    if (keep < size) {
+        if (ftruncate(fd, keep) == 0) {
+            log_info("[Output] 截断输出文件残缺尾部: %s (%ld -> %ld 字节)",
+                     path, (long)size, (long)keep);
+        } else {
+            log_warn("[Output] 截断输出文件残缺尾部失败: %s (errno=%d)", path, errno);
+        }
+    }
+    close(fd);
+}
+
 void cleanup_compiled_format(Config *cfg) {
     if (!cfg->compiled_format) return;
     
@@ -239,6 +283,8 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
                 char slice_path[1024];
                 snprintf(slice_path, sizeof(slice_path), "%s/" OUTPUT_SLICE_FORMAT,
                          cfg->output_split_dir, state->output_slice_num);
+                /* v15.6.0: 只截断最大编号（最后）分片的残缺尾部，再统计行数 */
+                truncate_incomplete_tail(slice_path);
                 state->output_line_count = count_file_lines(slice_path);
                 verbose_printf(cfg, 1, "恢复输出分片: slice=%lu, lines=%lu\n",
                                state->output_slice_num, state->output_line_count);
@@ -248,6 +294,8 @@ void init_output_files(const Config *cfg, RuntimeState *state) {
             }
         } else if (cfg->is_output_file && cfg->output_file) {
             state->output_slice_num = 1;
+            /* v15.6.0: 截断单文件输出的残缺尾部，再统计行数 */
+            truncate_incomplete_tail(cfg->output_file);
             state->output_line_count = count_file_lines(cfg->output_file);
             verbose_printf(cfg, 1, "恢复输出行数: %lu\n", state->output_line_count);
         } else {

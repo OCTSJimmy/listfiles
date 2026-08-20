@@ -22,7 +22,6 @@
 #define RET_ERROR      12  /* Worker error (device-level) */
 #define RET_DEAD       13  /* Worker died (timeout/epoll error) */
 #define RET_EXIT       14  /* Worker normal exit */
-#define MSG_DROP       15  /* CMD_SCAN dropped during replacement window */
 #define RET_DEV_TIMEOUT 16  /* Worker scanner self-detected timeout */
 #define RET_READY      17  /* Worker initialization complete */
 #define RET_FINISH     18  /* Worker task complete */
@@ -31,14 +30,17 @@
 /**
  * @brief  Unified message structure for Master <-> IPC Thread queues
  *
- * All messages are fixed-size (pointer-based) for lock-free queue compatibility.
+ * All messages are fixed-size (pointer-based) for ring-buffer queue storage.
  * The `data` pointer is malloc'd by sender and free'd by receiver.
+ * v15.6.0: `epoch` 由 RET_BATCH/RET_FINISH 携带（其余消息为 0），
+ * Master 校验 epoch 匹配以丢弃旧 Worker 残留数据。
  */
 typedef struct {
     uint32_t type;      /* CMD_* or RET_* */
     int      slot_id;   /* Worker slot index [0, num_workers-1] */
     void    *data;      /* Type-specific payload (malloc'd) */
     size_t   data_len;  /* Payload length in bytes */
+    uint64_t epoch;     /* v15.6.0: task epoch (RET_BATCH/RET_FINISH only) */
 } IpcThreadMsg;
 
 /* ================================================================
@@ -50,6 +52,7 @@ typedef struct {
     char     path[4096];
     uint32_t path_len;
     uint64_t dev;       /* device id for tracking */
+    uint64_t epoch;     /* v15.6.0: task epoch, forwarded to Worker */
 } CmdScanPayload;
 
 /* CMD_REPLACE payload */
@@ -76,10 +79,5 @@ typedef struct {
 } RetErrorPayload;
 
 /* RET_DEAD / RET_EXIT: no payload needed (data = NULL) */
-
-/* MSG_DROP payload */
-typedef struct {
-    char path[4096];
-} DropPayload;
 
 #endif

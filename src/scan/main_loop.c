@@ -36,6 +36,27 @@
 
 static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
     log_debug("[Bus] received type=%u slot=%d len=%zu", msg->type, msg->slot_id, msg->data_len);
+
+    /* v15.6.0: RET_BATCH/RET_FINISH 校验 epoch，丢弃旧 Worker 残留数据 */
+    if (msg->type == RET_BATCH || msg->type == RET_FINISH) {
+        int sid = msg->slot_id;
+        if (sid < 0 || sid >= ctx->worker_pool->num_workers) {
+            log_warn("丢弃过期 epoch 消息: slot=%d epoch=%lu current=(invalid slot)",
+                     sid, (unsigned long)msg->epoch);
+            free(msg->data);
+            msg->data = NULL;
+            return;
+        }
+        uint64_t current = ctx->worker_pool->slots[sid].current_epoch;
+        if (msg->epoch != current) {
+            log_warn("丢弃过期 epoch 消息: slot=%d epoch=%lu current=%lu",
+                     sid, (unsigned long)msg->epoch, (unsigned long)current);
+            free(msg->data);
+            msg->data = NULL;
+            return;
+        }
+    }
+
     switch (msg->type) {
         case RET_BATCH: {
             log_debug_v(202605150000UL, "[Bus] Worker %d BATCH (len=%zu)", msg->slot_id, msg->data_len);
@@ -53,9 +74,12 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             if (msg->data_len >= sizeof(RetErrorPayload)) {
                 RetErrorPayload *err = (RetErrorPayload*)msg->data;
                 IpcErrorHeader hdr = { err->errno_code, err->dev };
+                /* v15.6.0（P0-007 RET_ERROR 状态机补全）：Worker 协议已改为错误路径
+                 * 只发 IPC_MSG_ERROR（不再尾随空 BATCH/FINISH），Master 在此一次性完成
+                 * 销账（pending_tasks--）、Worker 置 IDLE、写 spbin、设备探测调度。
+                 * Worker 立即可被再派发（新 epoch）；旧任务的滞留 BATCH 会被 epoch
+                 * 校验丢弃——这是正确行为（目录将整体重扫），无需特殊处理。 */
                 main_loop_handle_error(ctx, msg->slot_id, &hdr, err->path);
-                /* v15.1.1: 设备级错误不替换 Worker，Worker 回到 IDLE */
-                atomic_store(&ctx->worker_pool->slots[msg->slot_id].state, WORKER_STATE_IDLE);
             }
             break;
         }
@@ -84,9 +108,11 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
         }
         case RET_FINISH: {
             log_info_v(202605150000UL, "[Bus] Worker %d FINISH (pending_tasks=%ld)", msg->slot_id, atomic_load(&ctx->pending_tasks));
-            atomic_fetch_sub(&ctx->pending_tasks, 1);
-            atomic_store(&ctx->worker_pool->slots[msg->slot_id].state, WORKER_STATE_IDLE); /* v15.1.0 */
-            /* Task completed, Worker is now IDLE */
+            /* v15.6.0（P0-001 完成屏障）：FINISH 仅推进到 DT_BATCHES_RECEIVED——
+             * 不再立即 pending_tasks--、不再置 IDLE。待本任务全部 BATCH 被线程池
+             * 处理完且输出全部 COMMITTED 后，由 advance_task_barriers 统一完结
+             * （dpbin_append、pending_tasks--、Worker 置 IDLE 可被再次派发）。 */
+            ctx->worker_pool->slots[msg->slot_id].task_state = DT_BATCHES_RECEIVED;
             break;
         }
         case RET_DEAD: {
@@ -109,23 +135,6 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             cleanup_dead_worker_slot(ctx, msg->slot_id, false);
             break;
         }
-        case MSG_DROP: {
-            if (msg->data_len >= sizeof(DropPayload)) {
-                DropPayload *drop = (DropPayload*)msg->data;
-                char *dup = strdup(drop->path);
-                /* v15.5.8: 任务派发时已 pending_tasks+1，Worker 拒收（Replacement 窗口）
-                 * 退回队列后将由 dispatch 重新 +1，此处必须销账，否则计数永久泄漏
-                 * （R3 完结面板 pending=4 即此泄漏），完结检查永远无法通过或误判。 */
-                atomic_fetch_sub(&ctx->pending_tasks, 1);
-                if (!dispatch_queue_push(&ctx->dispatch_queue, dup, NULL)) {
-                    /* 队列满/OOM 导致任务真正丢失——记入熔断清单，非零退出码暴露 */
-                    log_error("[Bus] MSG_DROP requeue failed, task LOST: %s", path_log_mask(drop->path));
-                    circuit_breaker_record(ctx, "TASK_DROP_LOST", drop->path, 0, 0);
-                    free(dup);
-                }
-            }
-            break;
-        }
         default: {
             log_error("[Bus] Worker %d UNKNOWN message type=%u (len=%zu)",
                      msg->slot_id, msg->type, msg->data_len);
@@ -145,29 +154,83 @@ void main_loop_handle_heartbeat(AppContext *ctx, int worker_id, uint64_t timesta
     atomic_store(&ctx->worker_pool->slots[worker_id].last_heartbeat, (time_t)timestamp);
 }
 
+/**
+ * @brief  RET_ERROR 完整处理（v15.6.0，P0-007 状态机补全 + P0-005 spbin 落盘）
+ * @param  ctx        AppContext*          应用上下文指针，不能为空
+ * @param  worker_id  int                  上报错误的 Worker slot 编号
+ * @param  err        const IpcErrorHeader* 错误码与设备号，不能为空
+ * @param  path       const char*          出错的目录路径，不能为空
+ * @return void
+ *
+ * @note   状态机流转：BUSY --RET_ERROR--> IDLE，目录任务语义 = DEVICE_WAITING
+ *         （在 spbin 中等待设备恢复重入队或跨会话恢复，不写 dpbin、不重入队）。
+ *         处理顺序（先落 spbin 后销账，崩溃不一致时宁可 spbin 多记）：
+ *         1. reason 分类（P1-002 errno 分类矩阵）：EACCES/EPERM → PERMISSION(4)；
+ *            ETIMEDOUT → TIMEOUT(2)；EIO/ENODEV/ESTALE → PROBE_FAIL(1)；
+ *            未知 errno → PROBE_FAIL 保守处理 + log_warn；
+ *         2. 记熔断清单（沿用原语义：设备级记 DEV_TIMEOUT/EIO，其余记 DIR_ERROR）；
+ *         3. 写 spbin（内存 + spbin_set + 磁盘 append-only，见 spbin_write_record）；
+ *         4. 设备级错误（TIMEOUT/PROBE_FAIL 类）→ dev_mgr_mark_probing +
+ *            push probe_task（沿用 probe_scheduler 敢死队探测状态机；
+ *            ETIMEDOUT 原来 mark_dead，现按设计改 probing 语义）；
+ *            PERMISSION 类不做设备探测；
+ *         5. 放弃该任务的完成屏障（task_state=DT_NONE，batches 计数清零，
+ *            不写 dpbin——目录未完成，留给 spbin/Reset 援救），
+ *            pending_tasks--（Worker 已释放任务），Worker 置 IDLE 可被再派发。
+ *         旧任务的滞留 BATCH 会被 epoch 校验丢弃——正确行为，目录将整体重扫。
+ */
 void main_loop_handle_error(AppContext *ctx, int worker_id, const IpcErrorHeader *err, const char *path) {
-    (void)worker_id;
-    if (err->errno_code == ETIMEDOUT || err->errno_code == EIO) {
-        dev_t dev = (dev_t)err->dev;
-        log_error("[Monitor] Worker error on dev %lu: %s (errno=%d)",
-                (unsigned long)dev, path, err->errno_code);
+    dev_t dev = (dev_t)err->dev;
 
-        const char *reason = (err->errno_code == ETIMEDOUT) ? "DEV_TIMEOUT" : "EIO";
-        circuit_breaker_record(ctx, reason, path, dev, 0);
+    /* 1. reason 分类 */
+    uint8_t reason;
+    bool device_level;
+    switch ((int)err->errno_code) {
+        case EACCES:
+        case EPERM:
+            reason = SP_REASON_PERMISSION;
+            device_level = false;
+            break;
+        case ETIMEDOUT:
+            reason = SP_REASON_TIMEOUT;
+            device_level = true;
+            break;
+        case EIO:
+        case ENODEV:
+        case ESTALE:
+            reason = SP_REASON_PROBE_FAIL;
+            device_level = true;
+            break;
+        default:
+            log_warn("[Error] Worker %d unknown errno=%u on %s, 按 PROBE_FAIL 保守处理",
+                     worker_id, err->errno_code, path_log_mask(path));
+            reason = SP_REASON_PROBE_FAIL;
+            device_level = true;
+            break;
+    }
 
-        if (dev_mgr_get_state(ctx->dev_mgr, dev) != DEV_STATE_DEAD) {
-            dev_mgr_mark_dead(ctx->dev_mgr, dev);
-            ctx->state.has_error = true;
+    log_error("[Monitor] Worker %d error on dev %lu: %s (errno=%u, reason=%u)",
+              worker_id, (unsigned long)dev, path_log_mask(path), err->errno_code, reason);
 
-            SpbinEntry entry = {0};
-            entry.path = strdup(path);
-            entry.dev = dev;
-            entry.blacklist_time = time(NULL);
-            entry.retry_count = 0;
-            entry.probe_interval = PROBE_INTERVAL_INITIAL;
-            entry.d_type = DT_DIR;
-            entry.s_status = SP_STATUS_PROBING;
-            spbin_append(ctx, &entry);
+    /* 2. 熔断清单 */
+    if (device_level) {
+        const char *cb_reason = (err->errno_code == ETIMEDOUT) ? "DEV_TIMEOUT" : "EIO";
+        circuit_breaker_record(ctx, cb_reason, path, dev, 0);
+        ctx->state.has_error = true;
+    } else {
+        /* v15.5.7: 目录级错误（如 EACCES 权限拒绝）不触发设备惩罚与探测 */
+        char cb_reason[64];
+        snprintf(cb_reason, sizeof(cb_reason), "DIR_ERROR(errno=%u)", err->errno_code);
+        circuit_breaker_record(ctx, cb_reason, path, dev, 0);
+    }
+
+    /* 3. 写 spbin（先落盘后销账——崩溃不一致时宁可 spbin 多记，恢复时多扫不漏扫） */
+    spbin_write_record(ctx, path, reason, dev);
+
+    /* 4. 设备级错误 → PROBING + 敢死队探测（设备已在探测/判死则复用现有任务） */
+    if (device_level && ctx->dev_mgr && ctx->probe_scheduler) {
+        if (dev_mgr_get_state(ctx->dev_mgr, dev) == DEV_STATE_NORMAL) {
+            dev_mgr_mark_probing(ctx->dev_mgr, dev);
 
             ProbeTask task = {0};
             task.dev = dev;
@@ -178,14 +241,17 @@ void main_loop_handle_error(AppContext *ctx, int worker_id, const IpcErrorHeader
             task.s_status = SP_STATUS_PROBING;
             probe_scheduler_push(ctx->probe_scheduler, &task);
         }
-    } else {
-        /* v15.5.7: 目录级非超时/IO错误（如 EACCES 权限拒绝、ESTALE 等）此前完全静默——
-         * 目录（及其整棵子树）被跳过但扫描仍以成功退出。现记入熔断清单并累加
-         * skipped_count（不触发设备惩罚与探测）。 */
-        char reason[64];
-        snprintf(reason, sizeof(reason), "DIR_ERROR(errno=%u)", err->errno_code);
-        circuit_breaker_record(ctx, reason, path, (dev_t)err->dev, 0);
     }
+
+    /* 5. 放弃完成屏障 + 销账 + Worker 置 IDLE（目录不重入队，避免重试风暴） */
+    if (worker_id >= 0 && ctx->worker_pool && worker_id < ctx->worker_pool->num_workers) {
+        WorkerSlot *slot = &ctx->worker_pool->slots[worker_id];
+        slot->task_state = DT_NONE;
+        atomic_store(&slot->batches_received, 0);
+        atomic_store(&slot->batches_processed, 0);
+        atomic_store(&slot->state, WORKER_STATE_IDLE);
+    }
+    atomic_fetch_sub(&ctx->pending_tasks, 1);
 }
 
 void main_loop_handle_exit(AppContext *ctx, int worker_id) {
@@ -300,6 +366,89 @@ static void wait_for_ipc_messages(AppContext *ctx, int timeout_ms) {
 }
 
 /* ================================================================
+ * v15.6.0: 目录任务完成屏障推进（P0-001/P0-002，仅主线程调用）
+ * ================================================================ */
+
+/**
+ * @brief  推进所有 slot 的在途任务屏障状态机
+ * @param  ctx  AppContext*  应用上下文
+ * @return void
+ *
+ * @note   对 task_state >= DT_BATCHES_RECEIVED（已收 FINISH）的 slot 逐级检查：
+ *         1. batches_processed == batches_received → DT_BATCHES_PROCESSED
+ *            （空目录 FINISH 时 0==0 直通；协议空批次照常计数、自然闭环）
+ *         2. output_pending[slot] == 0（该任务输出全部 COMMITTED）→ 此刻才
+ *            dpbin_append（dpbin 写入时机从 dispatch 迁移至此），随后
+ *            pending_tasks--、task_state=DT_COMPLETED、Worker 置 IDLE
+ *            （Worker 只有此时才可被再次派发）
+ *         dpbin 跳过条件沿用原派发处语义：st_dev==0 的重入队任务（无 stat）不写。
+ */
+static int advance_task_barriers(AppContext *ctx) {
+    int completed = 0;
+    for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
+        WorkerSlot *slot = &ctx->worker_pool->slots[i];
+        /* 只处理两个中间态：DT_COMPLETED 已完结（必须跳过，防止重复 dpbin/pending_tasks--），
+         * DT_NONE/DT_SCANNING 未到 FINISH */
+        if (slot->task_state != DT_BATCHES_RECEIVED && slot->task_state != DT_BATCHES_PROCESSED)
+            continue;
+
+        /* DT_BATCHES_RECEIVED → DT_BATCHES_PROCESSED */
+        if (atomic_load(&slot->batches_processed) < atomic_load(&slot->batches_received))
+            continue;
+        slot->task_state = DT_BATCHES_PROCESSED;
+
+        /* DT_BATCHES_PROCESSED → DT_COMPLETED：等输出线程 COMMITTED */
+        if (ctx->output_pending && atomic_load(&ctx->output_pending[i]) > 0)
+            continue;
+
+        /* v15.6.0: dpbin 落盘前先把已发现条目的 pbin 记录持久化（内存批量缓冲 +
+         * stdio 缓冲全部刷出）。否则崩溃后本目录已在 completed_set 而其子目录
+         * 的 pbin 记录丢失，恢复时被 completed_set 剪枝 → 子树永久漏扫。
+         * record_batch 仅主线程读写（追加发生在 drain 回调），此处flush无竞态。 */
+        record_path_batch_flush(&ctx->cfg, &ctx->state, &ctx->record_batch);
+        if (ctx->state.write_slice_file) fflush(ctx->state.write_slice_file);
+
+        /* v15.6.0: dpbin/dfpbin 与 pbin 同生共死——completed_set 剪枝的安全前提是
+         * "已完成目录的子树记录可在恢复时从 pbin 泵送闭环"。pbin 全量记录后
+         * （--clean 除外，record_path 内部早退），dpbin 同样仅在非 clean 时写入；
+         * 两者必须同时存在或同时缺席，否则崩溃续传后剪枝失去 pbin 泵送兜底
+         * → 子树永久漏扫（v15.6.0 回归实测 58 文件）。 */
+        if (slot->current_st.st_dev != 0 && !ctx->cfg.clean) {
+            if (ctx->hist_pump_state == HIST_PUMP_OLD) {
+                /* v15.6.0（P0-003 fpbin/dfpbin 原子对）：HIST_PUMP_OLD 阶段完成的
+                 * 父目录写 dfpbin 而非 dpbin。耐久性顺序与 pbin→dpbin 同款：
+                 * dfpbin_append 前先 fpbin_flush（内存缓冲刷出 + fflush 活跃分片）
+                 * ——父目录"完成"前其新发现子目录必须已在 fpbin 落盘，否则崩溃后
+                 * 父目录在 dfpbin、子目录丢失 → 恢复时父目录被剪枝 → 子树漏扫。 */
+                fpbin_flush(ctx);
+                dfpbin_append(ctx, slot->current_path, &slot->current_st);
+                /* dfpbin 同样刷出 stdio 缓冲，保证 fpbin→dfpbin 的落盘顺序 */
+                if (ctx->dfpbin_slice_file) fflush(ctx->dfpbin_slice_file);
+            } else {
+                dpbin_append(ctx, slot->current_path, &slot->current_st);
+                /* dpbin 同样刷出 stdio 缓冲，保证 pbin→dpbin 的落盘顺序 */
+                if (ctx->dpbin_slice_file) fflush(ctx->dpbin_slice_file);
+            }
+            /* v15.6.0（P0-004）：运行期同步 completed_set，
+             * 作为 enqueue_dir 差集剪枝的运行时依据（恢复时由 dpbin 加载重建） */
+            if (ctx->completed_set) {
+                uint8_t fp[FP_SIZE];
+                fp_compute(slot->current_path, slot->current_st.st_dev,
+                           slot->current_st.st_ino, fp);
+                fp_set_insert(ctx->completed_set, fp);
+            }
+        }
+        atomic_fetch_sub(&ctx->pending_tasks, 1);
+        slot->task_state = DT_COMPLETED;
+        atomic_store(&slot->state, WORKER_STATE_IDLE); /* v15.1.0：仅此时可被再次派发 */
+        completed++;
+        log_debug_v(202608202330UL, "[Barrier] Worker %d task COMPLETED: %s (pending_tasks=%ld)",
+                    i, path_log_mask(slot->current_path), atomic_load(&ctx->pending_tasks));
+    }
+    return completed;
+}
+
+/* ================================================================
  * Main loop: Message Bus (v13.0.0) — pthread_cond_wait, no epoll
  * ================================================================ */
 
@@ -312,7 +461,7 @@ void main_loop_run(AppContext *ctx) {
     }
 
     ctx->thread_pool = thread_pool_create(ctx->cfg.master_threads, ctx->event_fd,
-                                          batch_dedup_worker, ctx);
+                                          batch_dedup_worker, ctx, &ctx->main_cond);
     if (!ctx->thread_pool) {
         log_fatal("Thread pool creation failed");
         close(ctx->event_fd);
@@ -322,9 +471,14 @@ void main_loop_run(AppContext *ctx) {
 
     ctx->running = true;
 
+    /* v15.6.0: 自适应等待——上一轮有任何进展（消息/批次/屏障完结）时下一轮
+     * 零等待直接处理，避免 cond 信号不排队导致的丢失唤醒把流水线拖到
+     * 100ms 粒度（小目录场景吞吐骤降 10 倍+，回归实测）；空闲时才睡满 100ms。 */
+    bool made_progress = false;
+
     while (ctx->running) {
-        /* 1. Block on cond_wait for IPC messages (100ms timeout) */
-        wait_for_ipc_messages(ctx, 100);
+        /* 1. Block on cond_wait for IPC messages (100ms timeout; 0 if busy) */
+        wait_for_ipc_messages(ctx, made_progress ? 0 : 100);
 
         /* v15.0.2 debug: 每 ~10s 打印一次主循环状态 */
         static int loop_counter = 0;
@@ -336,6 +490,7 @@ void main_loop_run(AppContext *ctx) {
         }
 
         /* 2. Drain all IPC return queues */
+        bool progress_this_round = false;
         for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
             pthread_mutex_lock(&ctx->ipc_ret_queues[i]->mutex);
             size_t head = ctx->ipc_ret_queues[i]->head;
@@ -350,18 +505,23 @@ void main_loop_run(AppContext *ctx) {
             }
             if (drained > 0) {
                 log_debug("[Main] Drained %d messages from ret_queue[%d]", drained, i);
+                progress_this_round = true;
             }
         }
 
         /* 3. Drain thread pool completed batches */
-        drain_completed_batches(ctx);
+        if (drain_completed_batches(ctx) > 0) progress_this_round = true;
         /* Also drain eventfd counter to avoid stale notifications */
         if (ctx->event_fd >= 0) {
             uint64_t n;
             while (read(ctx->event_fd, &n, sizeof(n)) > 0) {
-                drain_completed_batches(ctx);
+                if (drain_completed_batches(ctx) > 0) progress_this_round = true;
             }
         }
+
+        /* 3.5 v15.6.0: 推进目录任务完成屏障（P0-001/P0-002）——
+         * 已收 FINISH 的任务等待批次处理完 + 输出 COMMITTED 后才完结 */
+        if (advance_task_barriers(ctx) > 0) progress_this_round = true;
 
         /* 4. Pump historical pbin directories */
         if (ctx->hist_pump_state == HIST_PUMP_OLD || ctx->hist_pump_state == HIST_PUMP_NEW) {
@@ -393,9 +553,11 @@ void main_loop_run(AppContext *ctx) {
             && ctx->dspill_fp) {
             load_dirs_from_dspill(ctx, DISPATCH_QUEUE_LOAD_BATCH);
         }
+        /* v15.6.0（P0-004）：dspill 定时刷盘挂点（1000 条或 1 秒，whichever first） */
+        dspill_flush_check(ctx, false);
 
         /* 8. Termination check */
-        if (atomic_load(&ctx->pending_tasks) == 0 && !ctx->resume_active
+        if (atomic_load(&ctx->pending_tasks) == 0
             && atomic_load(&ctx->pending_batches) == 0
             && dispatch_queue_count(&ctx->dispatch_queue) == 0
             && ctx->hist_pump_state == HIST_PUMP_DONE) {
@@ -407,6 +569,8 @@ void main_loop_run(AppContext *ctx) {
                 int loaded = load_dirs_from_dspill(ctx, DISPATCH_QUEUE_LOAD_BATCH);
                 if (loaded > 0 || dispatch_queue_count(&ctx->dispatch_queue) > 0)
                     continue;
+                /* v15.6.0（P0-004）：强制刷盘后再统计残留字节（刷盘已改缓冲批量） */
+                dspill_flush_check(ctx, true);
                 char *spill_path = get_dspill_filename(ctx->cfg.progress_base);
                 if (spill_path) {
                     struct stat st;
@@ -423,6 +587,9 @@ void main_loop_run(AppContext *ctx) {
             stop_all_ipc_threads(ctx);
             ctx->running = false;
         }
+
+        /* v15.6.0: 本轮有进展则下一轮零等待（流水线满速），无进展才睡满 100ms */
+        made_progress = progress_this_round;
     }
 
     drain_completed_batches(ctx);

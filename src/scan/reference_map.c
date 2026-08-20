@@ -1,9 +1,10 @@
 /**
  * @file reference_map.c
- * @brief 指纹 → (mtime, d_type) 映射表实现
+ * @brief 纯路径指纹 → 完整历史 stat 映射表实现（v15.6.0，P0-011）
  *
- * 基于开放寻址法（线性探测）的哈希表，用于支撑半增量扫描中的 blind-trust 机制。
- * 当文件/目录的 mtime 超过 skip_interval 未变化时，可直接复用历史记录中的元数据，
+ * 基于开放寻址法（线性探测）的哈希表，用于支撑盲信扫描中的 blind-trust 机制。
+ * 当文件路径命中基准且 mtime 超过 skip_interval 未变化时，可直接复用基准 pbin
+ * （schema 2）记录的完整元数据（mtime/mtime_nsec/size/uid/gid/mode/d_type），
  * 避免重复的 lstat 系统调用，显著降低 I/O 开销。
  *
  * 本模块与 fingerprint_set.c 使用相同的 splitmix64 哈希函数，确保哈希一致性。
@@ -98,18 +99,25 @@ void ref_map_destroy(ReferenceMap *map) {
 }
 
 /**
- * @brief  向映射表中插入或更新一条指纹记录
- * @param  map     ReferenceMap*           目标映射表指针，不能为空
- * @param  fp      const uint8_t[FP_SIZE]  16 字节文件指纹，不能为空
- * @param  mtime   time_t                  文件最后修改时间，取值范围: 有效 Unix 时间戳
- * @param  d_type  uint8_t                 文件类型（DT_REG/DT_DIR/DT_LNK 等），取值范围: linux/dirent.h 中定义的 d_type 常量
+ * @brief  向映射表中插入或更新一条指纹记录（v15.6.0：完整历史 stat）
+ * @param  map         ReferenceMap*           目标映射表指针，不能为空
+ * @param  fp          const uint8_t[FP_SIZE]  16 字节纯路径指纹（xxHash3-128(path)），不能为空
+ * @param  mtime       time_t                  基准记录 mtime（秒）
+ * @param  mtime_nsec  long                    基准记录 mtime 纳秒部分
+ * @param  size        off_t                   基准记录文件大小
+ * @param  uid         uint32_t                基准记录属主
+ * @param  gid         uint32_t                基准记录属组
+ * @param  mode        uint32_t                基准记录完整 st_mode（类型位 + 权限位）
+ * @param  d_type      uint8_t                 文件类型（DT_REG/DT_DIR/DT_LNK 等）
  * @return void
  *
- * @note   若指纹已存在，则覆盖更新其 mtime 和 d_type。
+ * @note   若指纹已存在，则覆盖更新全部 stat 字段。
  *         当负载因子超过 0.75（count*2 >= capacity*3）时自动扩容至 2 倍容量，
  *         并重新哈希所有已有条目。
  */
-void ref_map_insert(ReferenceMap *map, const uint8_t fp[FP_SIZE], time_t mtime, uint8_t d_type) {
+void ref_map_insert(ReferenceMap *map, const uint8_t fp[FP_SIZE],
+                    time_t mtime, long mtime_nsec, off_t size,
+                    uint32_t uid, uint32_t gid, uint32_t mode, uint8_t d_type) {
     /* 是否需要扩容 */
     if (map->count * 2 >= map->capacity * 3) {
         size_t old_cap = map->capacity;
@@ -124,8 +132,9 @@ void ref_map_insert(ReferenceMap *map, const uint8_t fp[FP_SIZE], time_t mtime, 
 
         for (size_t i = 0; i < old_cap; i++) {
             if (old_meta[i] == 1) {
-                ref_map_insert(map, old_entries[i].fingerprint,
-                               old_entries[i].mtime, old_entries[i].d_type);
+                const ReferenceEntry *e = &old_entries[i];
+                ref_map_insert(map, e->fingerprint, e->mtime, e->mtime_nsec,
+                               e->size, e->uid, e->gid, e->mode, e->d_type);
             }
         }
         free(old_meta);
@@ -141,14 +150,24 @@ void ref_map_insert(ReferenceMap *map, const uint8_t fp[FP_SIZE], time_t mtime, 
             /* 空槽，插入 */
             memcpy(map->entries[pos].fingerprint, fp, FP_SIZE);
             map->entries[pos].mtime = mtime;
+            map->entries[pos].mtime_nsec = mtime_nsec;
+            map->entries[pos].size = size;
+            map->entries[pos].uid = uid;
+            map->entries[pos].gid = gid;
+            map->entries[pos].mode = mode;
             map->entries[pos].d_type = d_type;
             map->meta[pos] = 1;
             map->count++;
             return;
         }
         if (m == 1 && memcmp(map->entries[pos].fingerprint, fp, FP_SIZE) == 0) {
-            /* 已存在，覆盖更新（mtime/d_type 可能变化） */
+            /* 已存在，覆盖更新（stat 字段可能变化） */
             map->entries[pos].mtime = mtime;
+            map->entries[pos].mtime_nsec = mtime_nsec;
+            map->entries[pos].size = size;
+            map->entries[pos].uid = uid;
+            map->entries[pos].gid = gid;
+            map->entries[pos].mode = mode;
             map->entries[pos].d_type = d_type;
             return;
         }

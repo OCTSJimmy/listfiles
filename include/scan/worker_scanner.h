@@ -22,6 +22,7 @@ typedef struct {
     char   task_path[4096];
     bool   task_ready;
     bool   stop_flag;
+    uint64_t task_epoch;    /* v15.6.0: 当前任务 epoch（随 CMD_SCAN 下发，BATCH/FINISH 回带） */
 
     /* Scanner 进度监控 */
     pthread_mutex_t progress_mutex;

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <sys/stat.h>
 
 /* 单个 batch 去重任务 */
@@ -18,7 +19,8 @@ typedef void (*tp_process_fn)(TPBatch *batch, void *user_data);
 
 typedef struct ThreadPool ThreadPool;
 
-ThreadPool* thread_pool_create(int num_threads, int event_fd, tp_process_fn fn, void *user_data);
+ThreadPool* thread_pool_create(int num_threads, int event_fd, tp_process_fn fn, void *user_data,
+                               pthread_cond_t *main_cond);
 void thread_pool_destroy(ThreadPool *tp);
 
 /* 提交 batch 去重任务。成功返回 true，队列满返回 false（调用方应降级同步处理） */

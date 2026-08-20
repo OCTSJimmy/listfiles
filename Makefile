@@ -54,10 +54,15 @@ $(BINDIR)/$(TARGET): $(OBJECTS)
 
 # 编译规则: 定义了如何从一个 .c 文件编译成一个 .o 文件
 # $< 代表规则的第一个依赖 (即对应的 .c 文件)
+# -MMD -MP: 生成头文件依赖 (.d)，头文件变更（如 AppContext 布局）必须触发全量重编，
+#           否则新旧 .o 混用同一结构体的不同偏移，产生难以复现的诡异崩溃
 $(OBJDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(dir $@)
 	@echo "===> Compiling $<..."
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+# 引入自动生成的头文件依赖
+-include $(OBJECTS:.o=.d)
 
 # 清理规则: 删除所有生成的文件
 clean:

@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <time.h>
 #include <sys/epoll.h>
 #include <poll.h>
@@ -109,7 +110,7 @@ dispatch:
                     RetHeartbeatPayload *ret = malloc(sizeof(RetHeartbeatPayload));
                     if (ret) {
                         ret->timestamp = hb->timestamp;
-                        send_return(ctx, RET_HEARTBEAT, ret, sizeof(*ret));
+                        send_return(ctx, RET_HEARTBEAT, ret, sizeof(*ret), 0);
                     }
                 }
                 free(payload);
@@ -134,7 +135,7 @@ dispatch:
                         }
                         send_return(ctx,
                                     hdr.msg_type == IPC_MSG_ENTRY_ERROR ? RET_ENTRY_ERROR : RET_ERROR,
-                                    ret, sizeof(*ret));
+                                    ret, sizeof(*ret), 0);
                     }
                 }
                 free(payload);
@@ -156,7 +157,7 @@ dispatch:
                         } else {
                             ret->path[0] = '\0';
                         }
-                        send_return(ctx, RET_DEV_TIMEOUT, ret, sizeof(*ret));
+                        send_return(ctx, RET_DEV_TIMEOUT, ret, sizeof(*ret), 0);
                     }
                 }
                 free(payload);
@@ -164,7 +165,7 @@ dispatch:
             }
             case IPC_MSG_READY: {
                 log_debug_v(202605181600UL, "[IPC-%d] received READY, forwarding RET_READY", ctx->slot_id);
-                send_return(ctx, RET_READY, NULL, 0);
+                send_return(ctx, RET_READY, NULL, 0, 0);
                 free(payload);
                 break;
             }
@@ -172,6 +173,18 @@ dispatch:
                 if (hdr.payload_len >= sizeof(IpcFinishPayload)) {
                     IpcFinishPayload *fin = (IpcFinishPayload*)payload;
                     log_info("[IPC-%d] received FINISH (path_len=%u), forwarding RET_FINISH", ctx->slot_id, fin->path_len);
+                    /* v15.6.0: 转发 FINISH 前先排空 fd_data 中该任务的全部 BATCH。
+                     * fd_data/fd_ctrl 是独立通道，Master 若先消费 FINISH 会把 Worker
+                     * 置 IDLE 并派发新任务（epoch 递增），滞留的旧 BATCH 会被 epoch
+                     * 校验误杀（文件+子目录丢失）。Worker 协议保证 BATCH 全部写完
+                     * 才写 FINISH，故 FINISH 可读时所有 BATCH 字节已在 fd_data
+                     * 内核缓冲，排至 EAGAIN 即完整。Phase 2 的 ALL_BATCHES_RECEIVED
+                     * 屏障将在此基础上提供完整的目录级闭环。 */
+                    for (int guard = 0; guard < 100000 && ctx->fd_data >= 0; guard++) {
+                        struct pollfd pfd = { .fd = ctx->fd_data, .events = POLLIN };
+                        if (poll(&pfd, 1, 0) <= 0 || !(pfd.revents & POLLIN)) break;
+                        read_data_message(ctx);
+                    }
                     size_t path_len = fin->path_len;
                     if (path_len > 4095) path_len = 4095;
                     char *path_buf = malloc(path_len + 1);
@@ -180,14 +193,15 @@ dispatch:
                             memcpy(path_buf, (char*)payload + sizeof(IpcFinishPayload), path_len);
                         }
                         path_buf[path_len] = '\0';
-                        send_return(ctx, RET_FINISH, path_buf, path_len + 1);
+                        /* v15.6.0: 回带 pipe 中解析出的 epoch */
+                        send_return(ctx, RET_FINISH, path_buf, path_len + 1, fin->epoch);
                     }
                 }
                 free(payload);
                 break;
             }
             case IPC_MSG_EXIT: {
-                send_return(ctx, RET_EXIT, NULL, 0);
+                send_return(ctx, RET_EXIT, NULL, 0, 0);
                 worker_mark_dead(ctx, false);
                 free(payload);
                 break;
@@ -305,7 +319,14 @@ void read_data_message(IpcThreadCtx *ctx) {
 
         log_debug_v(202605181600UL, "[IPC-%d] received BATCH (net_payload=%u), forwarding RET_BATCH",
                     ctx->slot_id, net_payload_len);
-        send_return(ctx, RET_BATCH, payload, net_payload_len);
+        /* v15.6.0: 从 BATCH payload 头解析 epoch，随 RET_BATCH 携带给 Master 校验 */
+        uint64_t epoch = 0;
+        if (net_payload_len >= sizeof(IpcBatchHeader)) {
+            IpcBatchHeader bh;
+            memcpy(&bh, payload, sizeof(bh));
+            epoch = bh.epoch;
+        }
+        send_return(ctx, RET_BATCH, payload, net_payload_len, epoch);
         /* ownership transferred */
     }
 }
@@ -320,26 +341,35 @@ void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
             CmdScanPayload *scan = (CmdScanPayload*)cmd->data;
             if (!scan) break;
             if (ctx->fd_cmd < 0) {
-                /* Replacement 窗口期：fd_cmd 尚未就绪，通知 Master 重入队 */
-                DropPayload *drop = malloc(sizeof(DropPayload));
-                if (drop) {
-                    safe_strcpy(drop->path, scan->path, sizeof(drop->path));
-                    IpcThreadMsg drop_msg = {
-                        .type = MSG_DROP,
-                        .slot_id = ctx->slot_id,
-                        .data = drop,
-                        .data_len = sizeof(*drop)
-                    };
-                    if (!msg_queue_send(ctx->ret_queue, &drop_msg)) {
-                        log_warn("[IPC-%d] MSG_DROP send failed, leaking path", ctx->slot_id);
-                        free(drop);
-                    } else if (ctx->master_cond) {
-                        pthread_cond_signal(ctx->master_cond);
-                    }
+                /* v15.6.0: Replacement 窗口期（fd_cmd 尚未就绪）——暂存该 CMD_SCAN
+                 * （每 IPC 线程一条 pending slot），待 CMD_REPLACE 完成后补发；
+                 * 若 CMD_REPLACE 长时间未到，由心跳超时路径自然处理。
+                 * Master 按 IDLE 状态派发，同 slot 同时只有一条在途 SCAN，
+                 * pending 已被占用属设计外异常，log_fatal 暴露。 */
+                if (ctx->has_pending_scan) {
+                    log_fatal("[IPC-%d] pending CMD_SCAN slot occupied, overwriting (old=%s)",
+                              ctx->slot_id, ((CmdScanPayload*)ctx->pending_scan.data)->path);
+                    free(ctx->pending_scan.data);
                 }
+                ctx->pending_scan = *cmd;
+                ctx->has_pending_scan = true;
+                cmd->data = NULL; /* 所有权转移至 pending_scan */
+                log_info_v(202608202330UL, "[IPC-%d] CMD_SCAN stashed during replacement window (path=%s)",
+                           ctx->slot_id, path_log_mask(scan->path));
                 break;
             }
-            int rc = ipc_send(ctx->fd_cmd, IPC_MSG_SCAN, scan->path, scan->path_len);
+            /* v15.6.0: SCAN wire payload = IpcScanHeader(epoch) + path */
+            uint32_t scan_total = (uint32_t)sizeof(IpcScanHeader) + scan->path_len;
+            uint8_t *scan_buf = malloc(scan_total);
+            if (!scan_buf) {
+                log_fatal("[IPC-%d] CMD_SCAN malloc(%u) failed", ctx->slot_id, scan_total);
+                break;
+            }
+            IpcScanHeader sh = { scan->epoch };
+            memcpy(scan_buf, &sh, sizeof(sh));
+            memcpy(scan_buf + sizeof(sh), scan->path, scan->path_len);
+            int rc = ipc_send(ctx->fd_cmd, IPC_MSG_SCAN, scan_buf, scan_total);
+            free(scan_buf);
             if (rc == -2) {
                 /* EAGAIN */
                 ctx->eagain_retry_count++;
@@ -351,8 +381,10 @@ void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
                     break;
                 }
                 /* push back to queue for retry */
+                /* v15.6.0: 容量 65536，重推失败属设计外异常——SCAN 丢失会导致
+                 * pending_tasks 泄漏，log_fatal 暴露，不得静默丢弃 */
                 if (!msg_queue_send(ctx->cmd_queue, cmd)) {
-                    log_warn("[IPC-%d] CMD_SCAN EAGAIN, cmd_queue full, dropping %s",
+                    log_fatal("[IPC-%d] CMD_SCAN EAGAIN, cmd_queue full, cannot requeue %s",
                             ctx->slot_id, scan->path);
                 } else {
                     cmd->data = NULL; /* prevent double free */
@@ -371,15 +403,22 @@ void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
             CmdReplacePayload *rep = (CmdReplacePayload*)cmd->data;
             if (!rep) break;
 
-            /* Close old fds */
+            /* Close old fds — v15.6.0: close 前先把旧 fd 设为非阻塞并 read 到 EAGAIN，
+             * drain 掉旧 Worker 残留在 pipe 中的数据，避免污染新 Worker 通道 */
             if (ctx->fd_cmd >= 0) { close(ctx->fd_cmd); ctx->fd_cmd = -1; }
             if (ctx->fd_data >= 0) {
                 if (ctx->epfd >= 0) epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->fd_data, NULL);
+                int fl = fcntl(ctx->fd_data, F_GETFL);
+                if (fl >= 0) fcntl(ctx->fd_data, F_SETFL, fl | O_NONBLOCK);
+                drain_fd(ctx->fd_data);
                 close(ctx->fd_data);
                 ctx->fd_data = -1;
             }
             if (ctx->fd_ctrl >= 0) {
                 if (ctx->epfd >= 0) epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->fd_ctrl, NULL);
+                int fl = fcntl(ctx->fd_ctrl, F_GETFL);
+                if (fl >= 0) fcntl(ctx->fd_ctrl, F_SETFL, fl | O_NONBLOCK);
+                drain_fd(ctx->fd_ctrl);
                 close(ctx->fd_ctrl);
                 ctx->fd_ctrl = -1;
             }
@@ -426,6 +465,15 @@ void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
             log_info("[IPC-%d] Worker replaced (pid=%d, fd_data=%d, fd_ctrl=%d)",
                     ctx->slot_id, (int)ctx->pid, ctx->fd_data, ctx->fd_ctrl);
             ctx->eagain_retry_count = 0;
+
+            /* v15.6.0: 补发替换窗口期暂存的 CMD_SCAN */
+            if (ctx->has_pending_scan) {
+                IpcThreadMsg pending = ctx->pending_scan;
+                ctx->pending_scan.data = NULL;
+                ctx->has_pending_scan = false;
+                log_info("[IPC-%d] resending stashed CMD_SCAN after REPLACE", ctx->slot_id);
+                handle_cmd(ctx, &pending);
+            }
             break;
         }
         case CMD_STOP: {

@@ -4,7 +4,44 @@
 
 ---
 
-## [15.5.9] - 2026-08-09
+## [15.6.0] - 2026-08-20
+
+### Architecture：12 项 P0 设计闭环（Design-todo-v15.6.0 全部落地）
+
+**P0 — Critical（12 项全部闭环）：**
+- **P0-012 epoch 机制 + waitpid 确认**：Worker 替换引入 epoch 代次标记，旧 Worker 残留数据（FINISH/BATCH/心跳）经 waitpid 确认死亡后按 epoch 过滤，杜绝死亡 Worker 的迟到消息污染新 Worker 账目。
+- **P0-006 IPC 队列扩容 + MSG_DROP 废除**：IPC 命令队列扩容至 65536，正常路径禁止 MSG_DROP——队列满时阻塞等待而非丢弃重派，消除 MSG_DROP 回队不销账导致的 pending_tasks 永久泄漏。
+- **P0-001 目录任务完成屏障**：目录任务以 FINISH 到达 + 该目录全部 BATCH 提交为完成屏障，修复 FINISH/BATCH 竞态下目录被提前记账完成、后续批次无家可归的问题。
+- **P0-002 输出三态状态机**：输出条目 DISCOVERED → OUTPUT_QUEUED → OUTPUT_COMMITTED 三态流转，Worker 死亡时未 COMMITTED 的输出批次（`output_pending` 按 slot 计数）随目录重扫回滚，保证输出不多不少。
+- **P0-009 目录任务生命周期状态机**：目录任务全生命周期状态机化（发现/入队/派发/完成/出错），所有转移有明确记账，完结校验以状态机账目为准。
+- **P0-004 三集合统一队列模型**：visited_set 拆分为 discovered_set（仅目录去重）+ enqueued_set（派发去重）+ completed_set（完成记账），背压/恢复/重扫统一经 `enqueue_dir` 入口做差集剪枝，消除背压竞态。
+- **P0-003 fpbin/dfpbin 原子对**：恢复期间新发现子目录隔离写入 fpbin、已完成目录写 dfpbin，二者构成原子对支持二次崩溃恢复——恢复过程本身被 KILL 后仍可再次恢复，不漏扫不重扫。
+- **P0-010 Reset 援救机制**：崩溃恢复矩阵补全 Reset 援救路径——恢复中遇到无法对账的残留状态时回退到安全的全量重扫语义，而非带伤续跑。
+- **P0-005 spbin 五原因码恢复路径 + 毒丸隔离（含 P1-004）**：spbin 记录携带五类原因码，恢复时按原因码分别走重试/跳过/设备等待路径；正常退出时 spbin compaction（过滤 RECOVERED 条目重写）；毒丸目录隔离，不再阻塞同设备其他目录。
+- **P0-007 RET_ERROR 状态机补全**：出错目录不重入队、登记 enqueued_set 后等待设备恢复，`record_path` 绕过集合去重直写 pbin（P0-007 起出错目录的恢复不再依赖重派发）。
+- **P0-008 Run manifest + baseline_eligible + archive 原子切换**：新增 `{base}.manifest`（`.new → fsync → rename` 原子写，单行覆盖语义）为唯一权威状态来源；启动即写 status=Running 覆盖上次终态，修复 .config 追加写多行 status 被 strstr 误判的链式基准漏洞；baseline_eligible=1 需同时满足：status=Success、spbin 清零、dspill 排空、无 fpbin/dfpbin 残留、archive 校验通过、输出尾部完整、非盲信运行。
+- **P0-011 pbin schema 2 + 盲信纯路径 key + 完整历史 stat 复用 + --reference-base**：pbin 升级为 schema 2（`[path_len][path][d_type][mtime_sec][mtime_nsec][size][uid][gid][mode][dev][ino][flags]`，atime 完全排除）；盲信基准经 `--reference-base` 显式指定（须 baseline_eligible=1 且 pbin_schema_version=2），本轮 `-f` 必须为新空目录（增量与基准物理隔离）；reference_set/map 以纯路径指纹为 key 收录基准完整历史 stat，盲信命中时复用 size/mtime/uid/gid/mode 免 lstat；盲信结果 baseline_eligible=0，不能链式作为下次基准。
+
+**其他变更：**
+- **修复 Worker 轮询计数器整数溢出段错误**：`next_dispatch_worker` 由无限自增改为取模回卷——自适应零等待主循环下原实现约 2 分钟即溢出为负，导致 `slots[-15]` 野读 SIGSEGV（回归用例 2 实测偶发崩溃，基线 v15.5.9 潜伏同病但低速循环下不可达）。
+- **修复 per-slot 数组越界导致的派发活锁**：`redispatch_backoff_until`/`timeout_paths`/`timeout_counts` 由硬编码 `[8]` 改为 `[MAX_WORKERS=64]`，`--worker-count` 增加上限钳制——此前 wid≥8 时越界读到相邻 `run_id` 的 ASCII 字节被当作巨大退避截止时间，低号 Worker 全忙时主线程在 dispatch 阶段永久空转（单实例约 6%、6 并发压测 32/120 轮复现；修复后 120/120 全通过）。
+- **Makefile 增加 `-MMD -MP` 头文件依赖跟踪**：头文件变更（如 AppContext 布局）现在会触发全量重编，杜绝新旧目标文件混用结构体偏移。
+- **pbin 全量记录**：record_path 不再要求 `-c` 模式，全量扫描同样记录 pbin，保证任何成功运行都可作为盲信基准/恢复来源。
+- **主循环自适应等待**：main_loop 由固定轮询改为条件变量 + 自适应退避等待，修复 cond 丢失唤醒导致的吞吐下降（实测曾降 10 倍），空转 CPU 与吞吐兼得。
+- **退出码语义统一（§9.6）**：0=完全完成；1=部分完成（跳过/spbin 残留/dspill 残留/熔断清单非空/输出尾部不完整）；2=严重失败（盲信基准不合格、进度不兼容、初始化致命错误）；3=架构不匹配（预留）。
+
+**⚠️ 破坏性变更：**
+- **旧格式进度文件不兼容**：v15.6.0 之前的 pbin/config 进度（无 manifest、schema 1）不能续传、不能作为盲信基准。检测到旧残留时拒绝续传（exit 2），必须使用 `--runone` 重新全量扫描建立新基准。
+
+**修改的文件**（详见 `fix_documents/fixed_15.6.0_P0_all_in_one.md`）：
+- `include/core/config.h` — VERSION "15.6.0"，IPC 队列容量 65536，PBIN_SCHEMA_VERSION 2
+- `include/core/app_context.h` / `include/output/manifest.h` / `include/output/progress.h` / `include/output/spbin.h` / `include/scan/main_loop.h` / `include/scan/reference_map.h` / `include/ipc/worker_proc.h` / `include/output/async_worker.h`
+- `src/core/main.c` / `src/core/cmdline.c` — 盲信门禁、`--reference-base`、manifest 生命周期、退出码语义
+- `src/scan/*`（main_loop / dispatch / batch_processor / worker_scanner / thread_pool / reference_map）— epoch、屏障、三态、统一队列、RET_ERROR、自适应等待
+- `src/output/*`（manifest / progress / progress_archive / progress_io / output_format / async_worker / monitor）— manifest、fpbin/dfpbin、spbin 恢复、Reset 援救、archive 原子切换
+- `tests/run_regression.sh` — 新增用例 10-13（崩溃-续传一致性、二次崩溃 fpbin/dfpbin、盲信门禁、不完整运行不可作基准）
+
+---
 
 ### Fixed：NFS 大目录场景下 DEV_TIMEOUT 误判深度加固
 

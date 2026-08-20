@@ -41,11 +41,12 @@ void show_help() {
     printf("  -c, --continue         启用智能续传/增量模式\n");
     printf("      --runone           强制全量扫描 (忽略历史进度)\n");
     printf("  -y, --yes              跳过启动时的交互式确认\n");
-    printf("      --skip-interval=秒 设置半增量扫描的时间阈值 (默认: 0)\n");
+    printf("      --skip-interval=秒 设置盲信扫描的时间阈值 (默认: 0)\n");
+    printf("      --reference-base=路径 盲信扫描基准（旧 progress 前缀，须 baseline_eligible=1，v15.6.0）\n");
     printf("      --batch-size=数量  Worker batch 大小 (默认: %d)\n", DEFAULT_BATCH_SIZE);
     printf("      --estimated-files=数量 预估文件数,用于预分配内存 (默认: %u)\n", (unsigned)DEFAULT_ESTIMATED_FILES);
     printf("      --master-threads=数量  Master 去重线程数 (默认: %d)\n", DEFAULT_MASTER_THREADS);
-    printf("      --worker-count=数量  Worker 进程数 (默认: 自动, 上限 8)\n");
+    printf("      --worker-count=数量  Worker 进程数 (默认: 自动, 上限 %d)\n", MAX_WORKERS);
     printf("  -t, --timeout=秒       心跳超时时间 (默认: %d)\n", HEARTBEAT_TIMEOUT_SEC);
     printf("\n输出控制:\n");
     printf("  -f, --progress-file=文件 进度文件/历史记录前缀 (默认: progress)\n");
@@ -167,6 +168,7 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"verbose-version", required_argument, 0, 27},
         {"progress-slice-lines", required_argument, 0, 28},
         {"strict-nlink", no_argument, 0, 29},
+        {"reference-base", required_argument, 0, 30}, /* v15.6.0（P0-011）：盲信基准路径 */
         {0, 0, 0, 0}
     };
 
@@ -250,6 +252,12 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 26:
                 cfg->worker_count = atoi(optarg);
                 if (cfg->worker_count < 1) cfg->worker_count = 0;
+                /* v15.6.0: 钳制到 MAX_WORKERS——per-slot 数组按 MAX_WORKERS 定长，
+                 * 超限会越界读写 AppContext（派发活锁/状态损坏，回归实测） */
+                if (cfg->worker_count > MAX_WORKERS) {
+                    log_warn("--worker-count=%d 超过上限 %d，已钳制", cfg->worker_count, MAX_WORKERS);
+                    cfg->worker_count = MAX_WORKERS;
+                }
                 break;
             case 't':
                 cfg->heartbeat_timeout = atol(optarg);
@@ -270,6 +278,10 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
                 break;
             case 29: /* v15.5.8: --strict-nlink 目录完备性 oracle */
                 cfg->strict_nlink = true;
+                break;
+            case 30: /* v15.6.0（P0-011）：--reference-base 显式指定盲信基准 */
+                free(cfg->reference_base);
+                cfg->reference_base = strdup(optarg);
                 break;
             case 'h': show_help(); return 2;
             default:
