@@ -1,10 +1,10 @@
 # listfiles 架构设计文档
 
-> 文档版本：v15.6.0  
-> 最后更新：2026-08-21  
+> 文档版本：v15.6.1  
+> 最后更新：2026-08-25  
 > 对应代码版本：`dev` 分支工作区（未提交）  
-> 前序版本：v15.5.9  
-> 实现依据：`fix_documents/fixed_15.6.0_P0_all_in_one.md`（12 项 P0 + 实现期缺陷实录）
+> 前序版本：v15.6.0  
+> 实现依据：`fix_documents/fixed_15.6.1_P0_incident_hotfix.md`（生产事故热修复 P0-101~109 + 实现期缺陷实录）；v15.6.0 基线见 `fix_documents/fixed_15.6.0_P0_all_in_one.md`
 
 ---
 
@@ -349,13 +349,16 @@ util/     — 日志、xxhash
 |------|------|------|----------|
 | **Master 进程** | 1 | 消息总线、任务调度、进度管理、监控 | 整个运行期 |
 | **IPC 线程** | N（= Worker 数） | 每 Worker 一个，独立 epoll + 心跳 + SIGKILL | 与 Master 同寿 |
-| **Worker 进程** | N（默认 `min(2×CPU, 8)`，上限 64） | 执行实际扫描 | 动态替换 |
+| **Worker 进程** | N（默认 `min(2×CPU, 8)`，上限 64） | 执行实际扫描 | 死亡后经预备役补位 |
+| **预备役 Worker（spare）** | N（= Worker 数，v15.6.1） | 启动期预 fork 的完整 Worker，待命中 | 随 Master 退出 |
 | **Scanner 线程** | N（每 Worker 一个） | 阻塞 IO（readdir/lstat） | 与 Worker 同寿 |
 | **去重线程池** | 4（默认） | CPU 密集型 batch 去重 | 与 Master 同寿 |
 | **异步输出线程** | 1 | 写输出文件 | 与 Master 同寿 |
 | **Monitor 线程** | 1 | 秒表面板、设备探测调度、**敢死队探测进程**收割 | 与 Master 同寿 |
 
 **收割职责唯一 owner**：Worker 僵尸进程由**主线程**收割（主循环每轮 `waitpid(-1, WNOHANG)`，替换前 `waitpid` 确认旧进程死亡）；Monitor 线程只收割自己 fork 的敢死队探测进程（`reap_probes`）。二者不交叉。
+
+**fork 时序约束（v15.6.1，P0-107）**：全部 fork（初始 Worker + spare）集中在**单线程期、巨型指纹集合（estimated-files 预分配）分配之前、一切 pthread_create 之前**；运行期**零 fork**——Worker 替换只从 spare 池启用。刚性依据（生产事故）：严格超售（`vm.overcommit_memory=2`）下 fork 按全额 VSZ 计 commit，大 VSZ 进程运行期 fork 必败（ENOMEM）；多线程进程 fork 的子进程继承锁状态可能永久死锁。Worker 子进程入口第一时间切无锁日志模式（`log_set_forked_child`）。盲信模式的基准索引是 Worker 的 COW 只读上下文，须在 fork 前加载（该功能已整体押后）。
 
 ### 5.2 Worker 状态机
 
@@ -392,8 +395,13 @@ util/     — 日志、xxhash
 | BUSY | RET_FINISH（epoch 匹配） | BUSY（屏障推进中） | task_state→DT_BATCHES_RECEIVED，**不立即销账**；待批次处理完且输出 COMMITTED 后由 advance_task_barriers 统一完结（dpbin、pending_tasks--、IDLE） |
 | BUSY | RET_ERROR | IDLE | **错误路径一处销账**：RET_ERROR 处理器内 pending_tasks--、Worker 置 IDLE、目录写 spbin、设备进 PROBING；不再发 FINISH、不经完成屏障、不重入队 |
 | BUSY | heartbeat_timeout (120s) | DEAD | SIGKILL + waitpid + drain + replace |
-| BUSY | RET_DEV_TIMEOUT | DEAD | SIGKILL + waitpid + drain + replace |
-| DEAD | cleanup + replace | INITIALIZING | spawn 新 Worker，IPC 线程更新 fd/pid、重置 FSM |
+| BUSY | RET_DEV_TIMEOUT（同代校验通过） | DEAD | **先 SIGKILL 旧 Worker** + cleanup + spare 启用（v15.6.1） |
+| DEAD | cleanup + replace | INITIALIZING | **从 spare 池启用预 fork Worker（运行期零 fork，v15.6.1）**，IPC 线程更新 fd/pid、重置 FSM |
+
+**关键变更（v15.6.1，P0-101/102/109）**：
+- **死亡类消息同代校验**：RET_DEAD/RET_DEV_TIMEOUT/RET_EXIT（及 RET_ERROR/RET_ENTRY_ERROR）携带上报时刻的 (pid, epoch)，Master 仅受理 `reported_pid == slot->pid` 的同代消息——修复旧 stale 判定反转导致真实死亡被 100% 误吞的缺陷；跨代迟到消息一律丢弃。
+- **cleanup 销账精确化**：仅 DT_SCANNING 由 cleanup 销账（orphaned 不叠加）；DT_BATCHES_RECEIVED/PROCESSED 由完成屏障照常完结销账（免重扫，替换延迟到屏障完结后）；空闲 Worker 死亡不销账。
+- **RET_EXIT 携带在途任务 = 非预期死亡**：在途目录重入队 + 全局告警；"正常退出"的合法时机仅 STOP 之后。
 
 **关键变更（v15.6.0）**：
 - **epoch 机制**：每次派发附带递增 epoch（原子计数器），写入 `slot->current_epoch`；Worker 返回的 BATCH/FINISH 携带 epoch，Master 校验不匹配即丢弃——旧 Worker 的迟到消息不会污染新账目。
@@ -427,19 +435,22 @@ while (running) {
     // 2. 处理返回消息：
     //    - RET_BATCH(epoch)  → epoch 匹配 ? thread_pool 提交去重 : 丢弃
     //    - RET_FINISH(epoch) → epoch 匹配 ? slot→DT_BATCHES_RECEIVED : 丢弃
-    //    - RET_DEAD   → waitpid 确认 + drain + cleanup + spawn + send_replace_to_ipc
-    //    - RET_ERROR  → 一处销账（pending_tasks--、IDLE）、写 spbin、
+    //    - RET_DEAD   → 同代校验（pid 匹配才受理，v15.6.1）→ 先杀后清 + cleanup + spare 启用
+    //    - RET_ERROR  → 同代校验（v15.6.1）+ 一处销账（pending_tasks--、IDLE）、写 spbin、
     //                   device_mgr_mark_probing，不重入队
-    //    - RET_DEV_TIMEOUT → 同 RET_DEAD
+    //    - RET_DEV_TIMEOUT → 同 RET_DEAD（Worker 侧同一任务只报一次，v15.6.1 节流）
+    //    - RET_EXIT   → 同代校验；携带在途任务 = 非预期死亡（重入队 + 告警，v15.6.1）
     //    - RET_READY  → Worker→IDLE
     // 3. drain_completed_batches（线程池完成回调，推进 batches_processed）
     // 4. advance_task_barriers（仅主线程）：完结已达屏障的目录任务
     //    （写 dpbin、pending_tasks--、Worker 置 IDLE）
     // 5. 泵送历史 pbin 目录（恢复时）
     // 6. 收割 Worker 僵尸进程（waitpid(-1, WNOHANG)，唯一 owner）
+    // 6.5 替换死亡 Worker（spare 池；屏障接管态 DT_BATCHES_* 的 slot 延迟替换）
     // 7. dispatch_from_queue（派发 dispatch_queue 中的任务）
     // 8. dspill 回填（dispatch_queue < LOW_WATER 时）
-    // 9. 终止条件检查：pending_tasks==0 && dispatch_queue 空 &&
+    // 9. 账目不变量：pending_tasks < 0 → log_fatal + _exit(2)（v15.6.1）；
+    //    终止条件检查：pending_tasks<=0 && dispatch_queue 空 &&
     //    dspill 排空 && 无历史可泵送（完结硬性断言，见 §9.5）
 }
 ```
@@ -804,14 +815,19 @@ gzip 压缩的 pbin 块 + spbin 块。`block_type = 0/1` 区分。
 ```
 IPC 线程检测超时/error/hup
     ├── SIGKILL Worker（不阻塞等待，避免 D-State 挂起）
-    └── send_return(RET_DEAD)
+    └── send_return(RET_DEAD / RET_DEV_TIMEOUT / RET_EXIT，携带 pid+epoch，v15.6.1)
         ▼
-Main: waitpid 确认旧进程死亡（替换前置条件，v15.6.0）
+Main: 同代校验（reported_pid == slot->pid，否则按跨代残留丢弃，v15.6.1）
+      waitpid 确认旧进程死亡（替换前置条件，v15.6.0；cleanup 内先杀后清，v15.6.1）
       close 前旧 fd 设非阻塞 drain 至 EAGAIN（清除旧 Worker 残留数据）
-      cleanup_dead_worker_slot() → current_path 重入队（未完结目录回滚重扫）
-      worker_pool_replace() → spawn 新 Worker
+      cleanup_dead_worker_slot() → current_path 重入队（未完结目录回滚重扫）；
+                                   销账精确化：仅 DT_SCANNING 销账，DT_BATCHES_*
+                                   由完成屏障照常完结（免重扫），空闲死亡不销账（v15.6.1）
+      worker_pool_replace() → 从 spare 池启用预 fork Worker（运行期零 fork，v15.6.1）；
+                              spare 耗尽 → 全局告警 + 降额运行，看门狗兜底（§9.5）
       send_replace_to_ipc() → IPC 线程更新 fd/pid，重置 FSM
-      （此后旧 epoch 的迟到 BATCH/FINISH/心跳一律被 epoch 校验过滤）
+      （此后旧 epoch 的迟到 BATCH/FINISH/心跳一律被 epoch 校验过滤，
+        旧 pid 的死亡类消息一律被同代校验过滤，v15.6.1）
 ```
 
 ### 9.2 设备级熔断
@@ -837,7 +853,15 @@ Main: waitpid 确认旧进程死亡（替换前置条件，v15.6.0）
 ### 9.5 扫描完整性断言
 
 - nlink oracle（`--strict-nlink`）：`st_nlink - 2` 应等于子目录数
-- **完结硬性断言**：`pending_tasks==0` && dispatch_queue 空 && dspill 排空到 EOF && 无历史可泵送，任一不满足即部分完成（exit 1）
+- **账目不变量（v15.6.1，P0-104）**：主循环每轮巡检 `pending_tasks < 0` → 立即
+  `log_fatal` + 杀光存活 Worker + `_exit(2)`——账目 bug 秒级暴露，不得死等
+- **有效进展看门狗（v15.6.1，P0-105）**：monitor 线程监督 file+dir 计数——无增长且
+  仍有应做工作（pending_tasks!=0 或 dispatch_queue 非空或存在 BUSY Worker）持续超
+  `--stall-timeout`（默认 900s，须大于最大退避 300s）→ 输出现场（全 slot 状态/账目/
+  队列深度）并按 `--stall-action=exit|abort` 终止。设备探测等待/spbin 积压场景
+  pending==0 且队列空，不误报。设计要点：主循环 tick 看门狗对"活而无效"（循环在转
+  但无进展）无效，必须按有效进展判定
+- **完结硬性断言**：`pending_tasks<=0` && dispatch_queue 空 && dspill 排空到 EOF && 无历史可泵送，任一不满足即部分完成（exit 1）
 - 熔断清单非空 → exit 1
 - spbin 残留 / fpbin/dfpbin 残留 / archive 校验失败 / 输出尾部不完整 → status=Incomplete、`baseline_eligible=0`（§8.7）
 
@@ -925,13 +949,21 @@ Makefile 已启用 `-MMD -MP` 头文件依赖跟踪（v15.6.0）：头文件变�
 
 pbin/fpbin/dpbin/dfpbin/archive 的二进制字段宽度（`size_t`、`time_t`、`long` 等）与平台相关，**进度文件仅同机同架构可续传/作基准**，不保证跨架构、跨字长、跨端序。退出码 3（架构不匹配）为**预留**：本期未接入运行时平台签名强制校验，跨架构使用进度文件属未定义行为，须 `--runone` 重新建立。
 
-### 工程约束（v15.6.0 收尾）
+### 工程约束
 
-- **版本号**：`VERSION "15.6.0"`、`VERSION_NAME "v15.6.0"`、`VERSION_CODE 202608202300UL`（`include/core/config.h`）。
-- **版本限定日志写死调用点**：本期新增的 4 处版本限定日志（CMD_SCAN 暂存 / CircuitBreaker 退避 / Barrier 完结 / FINISH EAGAIN 重试）直接写死时间戳字面量 `202608202330UL`，不定义宏——防止宏值随版本递进被一改全改、旧日志被不断宽限而失去门控意义。
+- **版本号**：`VERSION "15.6.1"`、`VERSION_NAME "v15.6.1"`、`VERSION_CODE 202608241500UL`（`include/core/config.h`）。
+- **版本限定日志写死调用点**：v15.6.0 周期的 4 处版本限定日志写死 `202608202330UL`；v15.6.1 新增的版本限定日志写死 `202608241500UL`。均不定义宏——防止宏值随版本递进被一改全改、旧日志被不断宽限而失去门控意义。
 - **门控严格遵循规则**（config.h 注释）：
   1. 可能导致文件元数据被忽略或丢失的异常日志，不得被版本门控，必须归属于全局日志（引用 VERSION_CODE 的 `log_*` 宏）；
   2. error 类型日志不得被版本门控——`log_error`/`log_fatal` 在宏定义层固定引用 VERSION_CODE，结构上无法被门控。
+  v15.6.1 按此规则清扫了 DEV_TIMEOUT 全链路、cmd_queue 满丢 SCAN、熔断跳过写 spbin、FINISH 发送最终失败等历史违规点（生产事故两天无人察觉的直接原因就是这些日志被旧门控码吞掉）。
+- **运行环境注意**：生产运行日志务必重定向到文件（`2> run.log`）；严格超售（`vm.overcommit_memory=2`）环境下 v15.6.1 运行期零 fork，启动期关注 `[Spare]` 日志确认预备役就绪。
+
+### 典型参数补充（v15.6.1）
+```bash
+# 有效进展看门狗（默认 900s 触发；0=禁用；动作 exit|abort）
+./listfiles -p /public2/data -f /tmp/progress --stall-timeout=900 --stall-action=exit
+```
 
 ### NFS 挂载要求
 ```bash
@@ -956,3 +988,4 @@ mount -t nfs -o soft,timeo=6000,retrans=3 server:/public2 /public2
 | v15.0.0 | 2026-05 | 三通道分离 + IPC 状态机 | mutex 阻塞心跳 |
 | v15.5.9 | 2026-08 | NFS 大目录防误判加固 | HEARTBEAT_TIMEOUT 过严 |
 | v15.6.0 | 2026-08 | 目录任务完成屏障 + 输出三态 + fpbin/dfpbin 原子对 + 三集合统一队列 + Run manifest + epoch 机制 + spbin 恢复路径 + pbin schema 2 盲信门禁 | FINISH/BATCH 竞态、输出无状态、二次崩溃恢复、背压竞态、MSG_DROP 丢任务、RET_ERROR 空转、状态无权威来源、盲信前提不受强制、旧 Worker 残留污染；另修复 next_dispatch_worker 溢出段错误与 per-slot 数组越界活锁 |
+| v15.6.1 | 2026-08 | 死亡类消息 (pid,epoch) 同代校验 + 预备役 Worker 池（运行期零 fork）+ fork 时序前移 + 有效进展看门狗 + 账目不变量 | /public4 生产事故：RET_DEAD stale 判定反转吞噬真实死亡、cleanup 无条件销账致 pending=-6、RET_EXIT 丢在途目录致子树静默丢失、严格超售下 fork ENOMEM 静默 54h、DEV_TIMEOUT 链路日志被门控吞掉、无"活而无效"看门狗 |

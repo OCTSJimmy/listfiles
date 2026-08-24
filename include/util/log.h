@@ -83,4 +83,11 @@ void log_raw(const char *fmt, ...);
  */
 void log_vraw(const char *fmt, va_list args);
 
+/* v15.6.1（P0-107c）：fork 子进程无锁日志模式。
+ * 多线程进程 fork 出的子进程可能继承"被持有"的 stdio 锁（持锁线程在子进程中
+ * 不存在），调用 flockfile 将永久死锁。Worker 子进程入口（worker_main）第一
+ * 时间调用本函数，此后日志走无锁 write(2) 组装输出（牺牲同进程内多行日志的
+ * 原子交错保护，换取不死锁）。 */
+void log_set_forked_child(void);
+
 #endif /* LOG_H */

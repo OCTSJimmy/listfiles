@@ -2,8 +2,14 @@
  * @file worker_proc.c
  * @brief Worker 进程池管理与 Worker 子进程主入口
  *
- * Master 侧：创建、销毁、替换 Worker 子进程，管理双向管道。
+ * Master 侧：创建、销毁、替换 Worker 子进程，管理双向管道与预备役池。
  * Worker 侧：worker_main 入口，创建 Scanner 线程，维护 IPC 心跳循环。
+ *
+ * v15.6.1（P0-107/P0-108）：
+ * - 全部 fork 集中在单线程期（初始 Worker + 预备役 spare 池），运行期零 fork；
+ *   严格超售（vm.overcommit_memory=2）下 fork 按全额 VSZ 计 commit，Master 大 VSZ
+ *   时运行期 fork 必败且原实现完全静默（生产事故 R8，54h 空转）。
+ * - spawn/fork 失败路径全部全局 log_error。
  */
 #define _GNU_SOURCE
 #include "worker_proc.h"
@@ -37,8 +43,13 @@
  *         - IPC 线程（本函数，即主线程）：专职维护 fd_cmd/fd_ctrl 通信与心跳
  *         fd_cmd 设为非阻塞，主线程通过 poll(5s) 循环同时处理：
  *         读任务、发心跳、响应 STOP。Scanner 卡住不影响心跳。
+ *         v15.6.1：入口第一时间切到无锁日志模式（fork 子进程可能继承被持有的
+ *         stdio 锁，flockfile 会永久死锁——生产事故 R7）。
  */
 void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
+    /* v15.6.1（P0-107c）：必须是子进程的第一个动作，早于任何可能打日志的调用 */
+    log_set_forked_child();
+
     /* 设置 fd_cmd 为非阻塞，使 IPC 线程可用 poll 循环 */
     int flags = fcntl(fd_cmd, F_GETFL);
     if (flags >= 0) {
@@ -55,6 +66,7 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
         .last_progress = time(NULL),
         .scanner_active = false,
         .current_dev = 0,
+        .dev_timeout_reported = false,
     };
     pthread_mutex_init(&ctx.task_mutex, NULL);
     pthread_cond_init(&ctx.task_cond, NULL);
@@ -112,7 +124,7 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
                 continue;
             }
             if (rc != 0) {
-                log_warn("[Worker-%d] recv_header failed: %d", worker_id, rc);
+                log_warn("[Worker-%d] recv_header failed: %d, exiting", worker_id, rc);
                 break;
             }
 
@@ -141,8 +153,15 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
             log_debug("[Worker-%d] received SCAN (payload_len=%u)", worker_id, hdr.payload_len);
 
             char *dir_path = malloc(hdr.payload_len + 1);
-            if (!dir_path) break;
+            if (!dir_path) {
+                /* v15.6.1（P0-106）：原为静默 break——Worker 无声退出是生产事故 R9 的
+                 * 掩盖层之一，退出出口必须全部有声 */
+                log_error("[Worker-%d] malloc(%u) failed for SCAN path, exiting",
+                          worker_id, hdr.payload_len + 1);
+                break;
+            }
             if (ipc_recv_payload(fd_cmd, dir_path, hdr.payload_len) != 0) {
+                log_warn("[Worker-%d] SCAN payload recv failed, exiting", worker_id);
                 free(dir_path);
                 break;
             }
@@ -165,6 +184,7 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
             strncpy(ctx.task_path, scan_path, sizeof(ctx.task_path) - 1);
             ctx.task_path[sizeof(ctx.task_path) - 1] = '\0';
             ctx.task_epoch = task_epoch;
+            ctx.dev_timeout_reported = false; /* v15.6.1（P0-102）：新任务复位节流标志 */
             ctx.task_ready = true;
             pthread_cond_signal(&ctx.task_cond);
             pthread_mutex_unlock(&ctx.task_mutex);
@@ -173,6 +193,10 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
         }
 
         if (pfd.revents & (POLLERR | POLLHUP)) {
+            /* v15.6.1（P0-106）：原为静默 break——Master 侧管道关闭即 Worker 被判弃，
+             * 必须留痕 */
+            log_warn("[Worker-%d] fd_cmd POLLERR/POLLHUP (revents=0x%x), exiting",
+                     worker_id, pfd.revents);
             break;
         }
         /* Scanner progress timeout check */
@@ -185,23 +209,31 @@ void worker_main(int fd_cmd, int fd_data, int fd_ctrl, int worker_id) {
                               ? cfg->heartbeat_timeout
                               : HEARTBEAT_TIMEOUT_SEC;
             if (difftime(now, scanner_last) > timeout_sec) {
-                log_error_v(202607030000UL, "[Worker-%d] Scanner stuck for %ds on %s, reporting to master",
-                          worker_id, timeout_sec, ctx.task_path);
-                IpcErrorHeader eh = { ETIMEDOUT, (uint64_t)ctx.current_dev };
-                char stuck_path[4096];
-                pthread_mutex_lock(&ctx.task_mutex);
-                strncpy(stuck_path, ctx.task_path, sizeof(stuck_path) - 1);
-                stuck_path[sizeof(stuck_path) - 1] = '\0';
-                pthread_mutex_unlock(&ctx.task_mutex);
-                uint32_t plen = (uint32_t)strlen(stuck_path);
-                size_t err_total = sizeof(eh) + sizeof(plen) + plen;
-                uint8_t *err_buf = malloc(err_total);
-                if (err_buf) {
-                    memcpy(err_buf, &eh, sizeof(eh));
-                    memcpy(err_buf + sizeof(eh), &plen, sizeof(plen));
-                    memcpy(err_buf + sizeof(eh) + sizeof(plen), stuck_path, plen);
-                    ipc_send(fd_ctrl, IPC_MSG_DEV_TIMEOUT, err_buf, (uint32_t)err_total);
-                    free(err_buf);
+                /* v15.6.1（P0-102）：同一任务只报一次 DEV_TIMEOUT——原实现每 5s 重发，
+                 * Master 对每条都 cleanup，换代后滞留消息对新一代 slot 重复销账，
+                 * pending_tasks 被打成负数（生产事故 R2） */
+                if (!ctx.dev_timeout_reported) {
+                    ctx.dev_timeout_reported = true;
+                    /* v15.6.1（P0-106）：解除版本门控——scanner 卡死意味着该目录元数据
+                     * 可能丢失，按既定规则必须全局可见 */
+                    log_error("[Worker-%d] Scanner stuck for %ds on %s, reporting to master",
+                              worker_id, timeout_sec, ctx.task_path);
+                    IpcErrorHeader eh = { ETIMEDOUT, (uint64_t)ctx.current_dev };
+                    char stuck_path[4096];
+                    pthread_mutex_lock(&ctx.task_mutex);
+                    strncpy(stuck_path, ctx.task_path, sizeof(stuck_path) - 1);
+                    stuck_path[sizeof(stuck_path) - 1] = '\0';
+                    pthread_mutex_unlock(&ctx.task_mutex);
+                    uint32_t plen = (uint32_t)strlen(stuck_path);
+                    size_t err_total = sizeof(eh) + sizeof(plen) + plen;
+                    uint8_t *err_buf = malloc(err_total);
+                    if (err_buf) {
+                        memcpy(err_buf, &eh, sizeof(eh));
+                        memcpy(err_buf + sizeof(eh), &plen, sizeof(plen));
+                        memcpy(err_buf + sizeof(eh) + sizeof(plen), stuck_path, plen);
+                        ipc_send(fd_ctrl, IPC_MSG_DEV_TIMEOUT, err_buf, (uint32_t)err_total);
+                        free(err_buf);
+                    }
                 }
             }
         }
@@ -248,7 +280,7 @@ WorkerPool* worker_pool_create(int num_workers) {
  * @param  pool  WorkerPool*  要销毁的进程池指针，允许传入 NULL（空操作）
  * @return void
  *
- * @note   对存活的 Worker 发送 SIGKILL（不阻塞等待，避免 D-State 挂起），
+ * @note   对存活的 Worker 与全部预备役发送 SIGKILL（不阻塞等待，避免 D-State 挂起），
  *         关闭所有管道 fd，释放 backlog_paths 中的路径内存。
  *         最后以非阻塞方式收割所有僵尸子进程（waitpid(-1, WNOHANG)）。
  */
@@ -269,8 +301,18 @@ void worker_pool_destroy(WorkerPool *pool) {
         }
         free(slot->backlog_paths);
     }
+    /* v15.6.1（P0-107b）：清理预备役——未启用的 spare 也是子进程，不得留孤儿 */
+    for (int i = 0; i < pool->spare_count; i++) {
+        SpareWorker *sp = &pool->spares[i];
+        if (sp->pid > 0) kill(sp->pid, SIGKILL);
+        if (sp->fd_cmd >= 0) close(sp->fd_cmd);
+        if (sp->fd_cmd_rd >= 0) close(sp->fd_cmd_rd);
+        if (sp->fd_data >= 0) close(sp->fd_data);
+        if (sp->fd_ctrl >= 0) close(sp->fd_ctrl);
+    }
+    free(pool->spares);
     /* Non-blocking reap of any zombie children */
-    for (int i = 0; i < pool->num_workers * 3; i++) {
+    for (int i = 0; i < (pool->num_workers + pool->spare_total) * 3; i++) {
         if (waitpid(-1, NULL, WNOHANG) <= 0) break;
     }
     free(pool->slots);
@@ -294,23 +336,33 @@ static void enlarge_pipe(int fd) {
 }
 
 /**
- * @brief  在指定 slot 中 fork 一个新的 Worker 子进程
- * @param  pool     WorkerPool*  目标进程池指针，不能为空
- * @param  slot_id  int          目标 slot 索引，取值范围: [0, pool->num_workers-1]
- * @return bool  返回 true 表示 fork 成功；false 表示失败（管道创建失败或 fork 失败）
+ * @brief  创建一组 Worker 管道并 fork 一个子进程（内部原语，v15.6.1 抽取）
+ * @param  worker_id     int     子进程日志用编号（初始 Worker 为 slot 号，spare 为 -1）
+ * @param  out_fd_cmd_w  int*    输出：Master 写端（M→W 命令）
+ * @param  out_fd_cmd_rd int*    输出：Master 侧保留的读端（cleanup drain 用）
+ * @param  out_fd_data_r int*    输出：Master 读端（W→M BATCH）
+ * @param  out_fd_ctrl_r int*    输出：Master 读端（W→M 控制信号）
+ * @param  out_pid       pid_t*  输出：子进程 pid
+ * @return bool  成功 true；失败 false（已全局 log_error，含 errno）
  *
- * @note   创建双向 pipe2(O_CLOEXEC)，子进程关闭无关 fd 后进入 worker_main 循环。
- *         Master 的 fd_in 写端设置为非阻塞（O_NONBLOCK），配合 backlog 机制防止双向管道死锁。
- *         成功后会初始化 slot 的心跳时间和积压队列。
+ * @note   v15.6.1（P0-108）：所有失败路径必须全局留痕——fork ENOMEM 曾在生产
+ *         环境静默失败 54 小时（严格超售下按全额 VSZ 计 commit）。
+ *         v15.6.1（P0-107a）：本原语只允许在单线程期调用。
  */
-bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
+static bool spawn_one_worker(int worker_id, int *out_fd_cmd_w, int *out_fd_cmd_rd,
+                             int *out_fd_data_r, int *out_fd_ctrl_r, pid_t *out_pid) {
     int cmd_pipe[2], data_pipe[2], ctrl_pipe[2];
-    if (pipe2(cmd_pipe, O_CLOEXEC) != 0) return false;
+    if (pipe2(cmd_pipe, O_CLOEXEC) != 0) {
+        log_error("[Spawn] pipe2(cmd) failed: errno=%d (%s)", errno, strerror(errno));
+        return false;
+    }
     if (pipe2(data_pipe, O_CLOEXEC) != 0) {
+        log_error("[Spawn] pipe2(data) failed: errno=%d (%s)", errno, strerror(errno));
         close(cmd_pipe[0]); close(cmd_pipe[1]);
         return false;
     }
     if (pipe2(ctrl_pipe, O_CLOEXEC) != 0) {
+        log_error("[Spawn] pipe2(ctrl) failed: errno=%d (%s)", errno, strerror(errno));
         close(cmd_pipe[0]); close(cmd_pipe[1]);
         close(data_pipe[0]); close(data_pipe[1]);
         return false;
@@ -326,13 +378,13 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     if (data_flags >= 0) {
         fcntl(data_pipe[0], F_SETFL, data_flags | O_NONBLOCK);
     } else {
-        log_warn("[worker_pool_spawn] fcntl(F_GETFL) on fd_data failed: errno=%d", errno);
+        log_warn("[Spawn] fcntl(F_GETFL) on fd_data failed: errno=%d", errno);
     }
     int ctrl_flags = fcntl(ctrl_pipe[0], F_GETFL);
     if (ctrl_flags >= 0) {
         fcntl(ctrl_pipe[0], F_SETFL, ctrl_flags | O_NONBLOCK);
     } else {
-        log_warn("[worker_pool_spawn] fcntl(F_GETFL) on fd_ctrl failed: errno=%d", errno);
+        log_warn("[Spawn] fcntl(F_GETFL) on fd_ctrl failed: errno=%d", errno);
     }
 
     /* Worker write ends must be non-blocking to prevent bidirectional pipe deadlock */
@@ -340,17 +392,20 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     if (wdata_flags >= 0) {
         fcntl(data_pipe[1], F_SETFL, wdata_flags | O_NONBLOCK);
     } else {
-        log_warn("[worker_pool_spawn] fcntl(F_GETFL) on fd_data_wr failed: errno=%d", errno);
+        log_warn("[Spawn] fcntl(F_GETFL) on fd_data_wr failed: errno=%d", errno);
     }
     int wctrl_flags = fcntl(ctrl_pipe[1], F_GETFL);
     if (wctrl_flags >= 0) {
         fcntl(ctrl_pipe[1], F_SETFL, wctrl_flags | O_NONBLOCK);
     } else {
-        log_warn("[worker_pool_spawn] fcntl(F_GETFL) on fd_ctrl_wr failed: errno=%d", errno);
+        log_warn("[Spawn] fcntl(F_GETFL) on fd_ctrl_wr failed: errno=%d", errno);
     }
 
     pid_t pid = fork();
     if (pid < 0) {
+        /* v15.6.1（P0-108）：fork 失败必须全局留痕。ENOMEM 多为严格超售下
+         * VSZ 过大——请检查 vm.overcommit_memory 与 --estimated-files */
+        log_error("[Spawn] fork failed: errno=%d (%s)", errno, strerror(errno));
         close(cmd_pipe[0]); close(cmd_pipe[1]);
         close(data_pipe[0]); close(data_pipe[1]);
         close(ctrl_pipe[0]); close(ctrl_pipe[1]);
@@ -372,7 +427,7 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
             }
         }
 
-        worker_main(cmd_pipe[0], data_pipe[1], ctrl_pipe[1], slot_id);
+        worker_main(cmd_pipe[0], data_pipe[1], ctrl_pipe[1], worker_id);
         _exit(0);
     }
 
@@ -386,15 +441,30 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     if (flags >= 0) {
         fcntl(cmd_pipe[1], F_SETFL, flags | O_NONBLOCK);
     } else {
-        log_warn("[worker_pool_spawn] fcntl(F_GETFL) on fd_cmd failed: errno=%d", errno);
+        log_warn("[Spawn] fcntl(F_GETFL) on fd_cmd failed: errno=%d", errno);
     }
 
+    *out_fd_cmd_w  = cmd_pipe[1];
+    *out_fd_cmd_rd = cmd_pipe[0];
+    *out_fd_data_r = data_pipe[0];
+    *out_fd_ctrl_r = ctrl_pipe[0];
+    *out_pid = pid;
+    return true;
+}
+
+/**
+ * @brief  将 fork 出的子进程装入 slot（内部辅助，v15.6.1 抽取）
+ * @note   spawn 与 spare 启用共用；初始化 slot 全部运行时字段，
+ *         新 Worker 无在途任务，旧 epoch 的残留消息必被丢弃。
+ */
+static void slot_attach(WorkerPool *pool, int slot_id, pid_t pid,
+                        int fd_cmd_w, int fd_cmd_rd, int fd_data_r, int fd_ctrl_r) {
     WorkerSlot *slot = &pool->slots[slot_id];
     slot->pid = pid;
-    slot->fd_cmd = cmd_pipe[1];
-    slot->fd_cmd_rd = cmd_pipe[0];
-    slot->fd_data = data_pipe[0];
-    slot->fd_ctrl = ctrl_pipe[0];
+    slot->fd_cmd = fd_cmd_w;
+    slot->fd_cmd_rd = fd_cmd_rd;
+    slot->fd_data = fd_data_r;
+    slot->fd_ctrl = fd_ctrl_r;
     atomic_store(&slot->is_alive, true);
     atomic_store(&slot->state, WORKER_STATE_INITIALIZING);  /* v15.1.1: spawn 初始为 INITIALIZING */
     atomic_store(&slot->last_heartbeat, time(NULL));
@@ -406,19 +476,78 @@ bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
     slot->backlog_capacity = 0;
     atomic_flag_clear(&slot->cleanup_done);
     atomic_fetch_add(&pool->active_count, 1);
+}
+
+/**
+ * @brief  在指定 slot 中 fork 一个新的 Worker 子进程（仅限单线程启动期调用）
+ * @param  pool     WorkerPool*  目标进程池指针，不能为空
+ * @param  slot_id  int          目标 slot 索引，取值范围: [0, pool->num_workers-1]
+ * @return bool  返回 true 表示 fork 成功；false 表示失败（管道创建失败或 fork 失败，
+ *               已全局 log_error——v15.6.1 P0-108）
+ *
+ * @note   v15.6.1（P0-107a）：本函数只允许在单线程启动期调用；运行期替换一律
+ *         走 worker_pool_replace 的 spare 池，运行期禁止 fork。
+ */
+bool worker_pool_spawn(WorkerPool *pool, int slot_id) {
+    pid_t pid;
+    int fd_cmd_w, fd_cmd_rd, fd_data_r, fd_ctrl_r;
+    if (!spawn_one_worker(slot_id, &fd_cmd_w, &fd_cmd_rd, &fd_data_r, &fd_ctrl_r, &pid)) {
+        return false;
+    }
+    slot_attach(pool, slot_id, pid, fd_cmd_w, fd_cmd_rd, fd_data_r, fd_ctrl_r);
     return true;
 }
 
 /**
- * @brief  替换指定 slot 中的 Worker 子进程（杀死旧进程并 spawn 新进程）
+ * @brief  fork 预备役 Worker 池（仅限单线程启动期调用，v15.6.1 P0-107b）
+ * @param  pool   WorkerPool*  目标进程池指针，不能为空
+ * @param  count  int          spare 数量（建议 = num_workers）
+ * @return bool   true = 至少一个 spare 就绪；false = 全部失败
+ *
+ * @note   spare 是完整的 Worker 子进程（READY/心跳写入管道缓冲，被启用前无人读取，
+ *         缓冲可承载数年心跳）。单个 spare fork 失败即停止继续 fork（连续失败大概率
+ *         是资源级问题），缩减 spare 数并全局告警；spare 为空时运行期无法替换死亡
+ *         Worker，扫描将降额运行（不致命）。
+ */
+bool worker_pool_spawn_spares(WorkerPool *pool, int count) {
+    if (!pool || count <= 0) return false;
+    pool->spares = calloc((size_t)count, sizeof(SpareWorker));
+    if (!pool->spares) {
+        log_error("[Spare] calloc(%d) failed，预备役为空", count);
+        return false;
+    }
+    int ok = 0;
+    for (int i = 0; i < count; i++) {
+        SpareWorker *sp = &pool->spares[ok];
+        if (!spawn_one_worker(-1, &sp->fd_cmd, &sp->fd_cmd_rd, &sp->fd_data, &sp->fd_ctrl, &sp->pid)) {
+            log_error("[Spare] 第 %d/%d 个 spare fork 失败，预备役缩减为 %d 个", i + 1, count, ok);
+            break;
+        }
+        ok++;
+    }
+    pool->spare_count = ok;
+    pool->spare_total = ok;
+    if (ok == 0) {
+        log_error("[Spare] 预备役为空：运行期 Worker 死亡将无法替换，扫描将降额运行");
+    } else {
+        log_info("[Spare] 预备役 Worker %d 个就绪", ok);
+    }
+    return ok > 0;
+}
+
+/**
+ * @brief  替换指定 slot 中的 Worker 子进程（杀死旧进程并启用 spare）
  * @param  pool     WorkerPool*  目标进程池指针，不能为空
  * @param  slot_id  int          目标 slot 索引，取值范围: [0, pool->num_workers-1]
- * @return bool  返回 true 表示替换成功；false 表示 spawn 新进程失败
+ * @return bool  返回 true 表示替换成功；false 表示无 spare 可用（已全局 log_error，
+ *               扫描降额运行——v15.6.1 P0-108）
  *
  * @note   对存活的旧 Worker 发送 SIGKILL，随后轮询 waitpid(WNOHANG) 确认旧进程
  *         已被回收（每次间隔 1ms，最多 ~100ms；超时记 WARN 后继续），
  *         避免其 Scanner 线程在内核完成的残留 write 与新 Worker 数据串扰。
- *         确认回收后再关闭旧 fd_in/fd_out，调用 worker_pool_spawn 创建新进程。
+ *         v15.6.1（P0-107b）：替换不再 fork，改从预备役池取启动期预 fork 的
+ *         spare——运行期零 fork，彻底消除严格超售下 fork ENOMEM 与多线程
+ *         fork 锁继承两类风险。
  */
 bool worker_pool_replace(WorkerPool *pool, int slot_id) {
     WorkerSlot *slot = &pool->slots[slot_id];
@@ -448,7 +577,21 @@ bool worker_pool_replace(WorkerPool *pool, int slot_id) {
         atomic_store(&slot->state, WORKER_STATE_DEAD);  /* v15.1.0 */
         atomic_fetch_sub(&pool->active_count, 1);
     }
-    return worker_pool_spawn(pool, slot_id);
+
+    /* v15.6.1（P0-107b/P0-108）：spare 耗尽只告警一次（主循环每 100ms 重试，
+     * 不节流会刷屏）；耗尽后扫描以剩余 Worker 降额运行，由有效进展看门狗兜底 */
+    if (pool->spare_count <= 0) {
+        if (!pool->spare_exhausted_logged) {
+            pool->spare_exhausted_logged = true;
+            log_error("[Replace] 预备役 Worker 已耗尽，slot %d 无法替换，扫描降额运行", slot_id);
+        }
+        return false;
+    }
+    SpareWorker sp = pool->spares[--pool->spare_count];
+    log_warn("[Replace] slot %d 启用预备役 Worker (pid=%d)，剩余 spare %d/%d",
+             slot_id, (int)sp.pid, pool->spare_count, pool->spare_total);
+    slot_attach(pool, slot_id, sp.pid, sp.fd_cmd, sp.fd_cmd_rd, sp.fd_data, sp.fd_ctrl);
+    return true;
 }
 
 /**

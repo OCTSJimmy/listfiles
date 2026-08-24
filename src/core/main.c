@@ -430,17 +430,14 @@ int main(int argc, char *argv[]) {
      * manifest 是唯一权威状态来源，.config 仅为兼容保留。 */
     manifest_write_running(&ctx);
 
-    /* Pre-allocate fingerprint sets (v15.6.0 P0-004: discovered/enqueued 拆分) */
-    ctx.discovered_set = fp_set_create(ctx.cfg.estimated_files);
-    if (!ctx.discovered_set) {
-        log_fatal("无法分配 DiscoveredSet 内存");
-        return 2; /* v15.6.0: 严重失败 */
-    }
-    ctx.enqueued_set = fp_set_create(ctx.cfg.estimated_files);
-    if (!ctx.enqueued_set) {
-        log_fatal("无法分配 EnqueuedSet 内存");
-        return 2; /* v15.6.0: 严重失败 */
-    }
+    /* v15.6.1（P0-107a）：fork 时序前移——全部 fork（初始 Worker + 预备役）集中在
+     * 单线程期、巨型指纹集合分配之前、一切 pthread_create 之前。刚性约束（生产事故
+     * R7/R8，见 Design-todo-v15.6.1.md）：
+     * 1. 严格超售（vm.overcommit_memory=2）下 fork 按全额 VSZ 计 commit，
+     *    estimated-files 预分配把 VSZ 吹大后运行期 fork 必败（ENOMEM，54h 静默）；
+     * 2. 多线程进程 fork 的子进程继承锁状态，可能永久死锁。
+     * 盲信模式的基准索引（reference_set/map）是 Worker 的 COW 只读上下文，必须在
+     * fork 前加载——盲信场景不在本优化覆盖范围（该功能已整体押后）。 */
 
     /* v15.6.0（P0-011）：盲信模式加载基准索引（启动校验已在前置关卡完成）。
      * 基准经 --reference-base 显式指定，与本轮新空 progress 目录物理隔离；
@@ -473,21 +470,56 @@ int main(int argc, char *argv[]) {
     /* v15.6.0: 输出三态（P0-002）——每 slot 未 COMMITTED 输出 batch 计数，按 num_workers 动态分配 */
     ctx.output_pending = calloc((size_t)num_workers, sizeof(_Atomic long));
     ctx.probe_scheduler = probe_scheduler_create();
-    ctx.monitor = monitor_create(&ctx);
 
-    if (!ctx.worker_pool || !ctx.output_pending || !ctx.probe_scheduler || !ctx.monitor) {
+    if (!ctx.worker_pool || !ctx.output_pending || !ctx.probe_scheduler) {
         log_fatal("无法初始化进程池");
         app_context_destroy(&ctx);
         return 2; /* v15.6.0: 严重失败 */
     }
 
-    /* Start monitor thread */
-    pthread_create(&ctx.monitor->tid, NULL, monitor_thread_entry, ctx.monitor);
-
-    /* Spawn all workers before any restore/replay (needed for resume dispatch) */
+    /* v15.6.1（P0-107a/P0-108）：单线程期 fork 全部初始 Worker + 预备役 spare，
+     * 此后运行期零 fork。单个初始 fork 失败：slot 置 pid=-1，交由运行期替换环路
+     * 用 spare 补位自愈；全部失败则致命。 */
+    int spawned = 0;
     for (int i = 0; i < num_workers; i++) {
-        worker_pool_spawn(ctx.worker_pool, i);
+        if (worker_pool_spawn(ctx.worker_pool, i)) {
+            spawned++;
+        } else {
+            ctx.worker_pool->slots[i].pid = -1;  /* 交给运行期 spare 补位 */
+        }
     }
+    if (spawned == 0) {
+        log_fatal("无法 fork 任何 Worker（原因见上方 errno），终止运行");
+        app_context_destroy(&ctx);
+        return 2;
+    }
+    if (spawned < num_workers) {
+        log_error("仅 %d/%d 个 Worker fork 成功，降额启动", spawned, num_workers);
+    }
+    worker_pool_spawn_spares(ctx.worker_pool, num_workers);
+
+    /* Pre-allocate fingerprint sets (v15.6.0 P0-004: discovered/enqueued 拆分)
+     * v15.6.1：移到全部 fork 之后——缩小 fork 时 VSZ（严格超售下 fork 按全额 VSZ
+     * 计 commit）；这些集合仅 Master 侧使用，Worker 不访问。 */
+    ctx.discovered_set = fp_set_create(ctx.cfg.estimated_files);
+    if (!ctx.discovered_set) {
+        log_fatal("无法分配 DiscoveredSet 内存");
+        return 2; /* v15.6.0: 严重失败 */
+    }
+    ctx.enqueued_set = fp_set_create(ctx.cfg.estimated_files);
+    if (!ctx.enqueued_set) {
+        log_fatal("无法分配 EnqueuedSet 内存");
+        return 2; /* v15.6.0: 严重失败 */
+    }
+
+    /* v15.6.1（P0-107a）：monitor 创建与线程启动必须在全部 fork 之后 */
+    ctx.monitor = monitor_create(&ctx);
+    if (!ctx.monitor) {
+        log_fatal("无法初始化进程池");
+        app_context_destroy(&ctx);
+        return 2;
+    }
+    pthread_create(&ctx.monitor->tid, NULL, monitor_thread_entry, ctx.monitor);
 
     /* v13.0.0: Initialize IPC threads and send initial REPLACE */
     if (!init_ipc_threads(&ctx)) {
@@ -497,6 +529,9 @@ int main(int argc, char *argv[]) {
     }
     for (int i = 0; i < num_workers; i++) {
         WorkerSlot *slot = &ctx.worker_pool->slots[i];
+        /* v15.6.1：启动 fork 失败的 slot（pid=-1）留给运行期 spare 补位，
+         * 不得把未初始化的 fd 发给 IPC 线程 */
+        if (!atomic_load(&slot->is_alive)) continue;
         send_replace_to_ipc(&ctx, i, slot->fd_cmd, slot->fd_data, slot->fd_ctrl, slot->pid);
     }
 

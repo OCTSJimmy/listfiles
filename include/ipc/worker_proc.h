@@ -51,10 +51,27 @@ typedef struct {
     atomic_flag cleanup_done;   /* 防止 monitor 和 epoll 并发 cleanup 的竞态 */
 } WorkerSlot;
 
+/* v15.6.1（P0-107）：预备役 Worker——单线程期随初始 Worker 一起 fork，
+ * 运行期替换只从 spare 池取，运行期永不 fork。
+ * 根因：严格超售（vm.overcommit_memory=2）下 fork 按全额 VSZ 计 commit，
+ * Master 因 estimated-files 预分配而有数十 GB VSZ，运行期 fork 必败且原实现
+ * 完全静默（生产事故 R8）。 */
+typedef struct {
+    pid_t pid;
+    int   fd_cmd;      /* master write end */
+    int   fd_cmd_rd;   /* master read end（cleanup drain 用，与 slot 语义一致） */
+    int   fd_data;     /* master read end */
+    int   fd_ctrl;     /* master read end */
+} SpareWorker;
+
 typedef struct {
     WorkerSlot *slots;
     int         num_workers;
     _Atomic int active_count;
+    SpareWorker *spares;                  /* spare 数组，[0, spare_count) 可用 */
+    int         spare_count;              /* 剩余可用 spare 数 */
+    int         spare_total;              /* 启动时 fork 的 spare 总数（审计用） */
+    bool        spare_exhausted_logged;   /* spare 耗尽告警只打一次（替换每 100ms 重试） */
 } WorkerPool;
 
 /* Master-side */

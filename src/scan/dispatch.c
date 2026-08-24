@@ -24,6 +24,8 @@
 #include <time.h>
 #include <stdatomic.h>
 #include <dirent.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 /* ================================================================
  * IPC helper: send CMD_SCAN to IPC thread
@@ -49,7 +51,8 @@ bool send_scan_to_ipc(AppContext *ctx, int wid, const char *path, uint64_t dev) 
 
     if (!msg_queue_send(ctx->ipc_cmd_queues[wid], &msg)) {
         atomic_fetch_sub(&ctx->epoch_counter, 1);  /* 回滚未生效的 epoch */
-        log_warn_v(202607030000UL, "[Dispatch] cmd_queue[%d] full, dropping %s", wid, path_log_mask(path));
+        /* v15.6.1（P0-106）：cmd_queue 满（容量 65536）属设计外异常，必须全局可见 */
+        log_warn("[Dispatch] cmd_queue[%d] full, dropping %s", wid, path_log_mask(path));
         free(scan);
         return false;
     }
@@ -226,7 +229,8 @@ static bool circuit_breaker_check(AppContext *ctx, int wid, const char *path) {
     }
 
     if (ctx->timeout_counts[wid] >= CIRCUIT_BREAKER_THRESHOLD) {
-        log_warn_v(202607030000UL, "[CircuitBreaker] Path timed out %d times, skipping: %s",
+        /* v15.6.1（P0-106）：熔断跳过会写 spbin（目录被永久跳过），必须全局可见 */
+        log_warn("[CircuitBreaker] Path timed out %d times, skipping: %s",
                    ctx->timeout_counts[wid], path_log_mask(path));
         circuit_breaker_record(ctx, "PATH_TIMEOUT", path, 0, ctx->timeout_counts[wid]);
         /* v15.6.0（P0-005）：目录级熔断达阈值统一写 spbin（CIRCUIT_BREAKER），
@@ -285,12 +289,43 @@ static int poison_note_death(AppContext *ctx, const char *path) {
  * Cleanup dead worker slot (v13.0.0: no epoll DEL, IPC thread handles fd)
  * ================================================================ */
 
+/**
+ * @brief  清理死亡 Worker 的 slot（v13.0.0: no epoll DEL, IPC thread handles fd）
+ * @param  ctx                 AppContext*  应用上下文
+ * @param  worker_id           int          slot 编号
+ * @param  redispatch_current  bool         true=死亡/超时语义（先杀后清+在途任务重入队）；
+ *                                          false=RET_EXIT 无在途任务语义
+ *
+ * @note   v15.6.1 修订（P0-102/P0-103）：
+ *         1. 先杀后清：redispatch_current=true 且 pid>0 时先 SIGKILL 并限时收割——
+ *            DEV_TIMEOUT 语义是"scanner 卡住"，进程仍活着，不杀会导致新旧两代并存；
+ *         2. 销账精确化：仅 DT_SCANNING 由本函数销账（1+orphaned）；
+ *            DT_BATCHES_RECEIVED/PROCESSED 已由完成屏障接管（BATCH 到齐，屏障照常
+ *            完结并销账，本函数不动 task_state、不销账、不重入队——避免重复销账，
+ *            且该任务免重扫）；DT_NONE/DT_COMPLETED 无账可销——空闲 Worker 死亡
+ *            不得 pending--（原实现无条件销账，启动期 6 连退直接把 pending_tasks
+ *            打成 -6，生产事故 R2）。
+ */
 void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_current) {
     if (!ctx || !ctx->worker_pool) return;
     if (worker_id < 0 || worker_id >= ctx->worker_pool->num_workers) return;
     WorkerSlot *slot = &ctx->worker_pool->slots[worker_id];
     if (!atomic_load(&slot->is_alive) && slot->pid == -1) return;
     if (atomic_flag_test_and_set(&slot->cleanup_done)) return;
+
+    /* v15.6.1（P0-103）：先杀后清 */
+    if (redispatch_current && slot->pid > 0) {
+        kill(slot->pid, SIGKILL);
+        int st, waited_ms = 0;
+        while (waitpid(slot->pid, &st, WNOHANG) == 0 && waited_ms < 100) {
+            usleep(1000);
+            waited_ms++;
+        }
+        if (waited_ms >= 100) {
+            log_warn("[Cleanup] waitpid timeout for worker %d (pid=%d), continuing anyway",
+                     worker_id, (int)slot->pid);
+        }
+    }
 
     /* Drain fd_cmd_rd to count orphaned SCAN tasks */
     int orphaned = 0;
@@ -323,19 +358,34 @@ void cleanup_dead_worker_slot(AppContext *ctx, int worker_id, bool redispatch_cu
         slot->fd_ctrl = -1;
     }
 
-    atomic_fetch_sub(&ctx->pending_tasks, 1 + orphaned);
-
-    /* v15.6.0: 在途任务屏障复位（P0-001）——重派发时由 dispatch_from_queue 重新初始化 */
-    atomic_store(&slot->batches_received, 0);
-    atomic_store(&slot->batches_processed, 0);
-    slot->task_state = DT_NONE;
+    /* v15.6.1（P0-102）：销账精确化（规则见函数头注释）。
+     * 注意 orphaned 与 DT_SCANNING 的+1 不得叠加：单 slot 单在途任务，管道里未消费的
+     * SCAN 就是当前任务本身——orphaned>0 必然等价于 DT_SCANNING（原实现 1+orphaned
+     * 在此情形双倍销账）。orphaned>0 而 task_state 非 DT_SCANNING 属设计外异常：
+     * 不销账（宁可账目偏多由看门狗/不变量暴露，不得打负）。 */
+    bool barrier_owns = (slot->task_state == DT_BATCHES_RECEIVED
+                      || slot->task_state == DT_BATCHES_PROCESSED);
+    if (!barrier_owns) {
+        if (orphaned > 0 && slot->task_state != DT_SCANNING) {
+            log_warn("[Cleanup] Worker %d orphaned=%d 但 task_state=%d —— 设计外异常，不销账",
+                     worker_id, orphaned, slot->task_state);
+        }
+        long dec = (slot->task_state == DT_SCANNING) ? 1 : 0;
+        if (dec > 0) atomic_fetch_sub(&ctx->pending_tasks, dec);
+        /* 在途任务屏障复位——重派发时由 dispatch_from_queue 重新初始化 */
+        atomic_store(&slot->batches_received, 0);
+        atomic_store(&slot->batches_processed, 0);
+        slot->task_state = DT_NONE;
+    }
 
     /* v15.5.3: Circuit breaker for DEV_TIMEOUT redispatch loop
      * v15.5.9: 增加指数退避——同一目录连续超时后，redispatch 前等待
      * 30s -> 120s -> 300s，给 NFS 大目录喘息时间
      * v15.6.0（P1-004）：毒丸隔离优先——同一目录累计致死 Worker 3 次
-     * 直接写 spbin POISON 永久隔离，不再重入队，不计入设备级错误统计 */
-    if (redispatch_current && slot->current_path[0] != '\0') {
+     * 直接写 spbin POISON 永久隔离，不再重入队，不计入设备级错误统计
+     * v15.6.1（P0-102）：屏障接管态（DT_BATCHES_*）不重入队、不记毒丸——
+     * 任务由完成屏障照常完结 */
+    if (!barrier_owns && redispatch_current && slot->current_path[0] != '\0') {
         int deaths = poison_note_death(ctx, slot->current_path);
         if (deaths >= POISON_DEATH_THRESHOLD) {
             log_warn("[Poison] 目录已累计致死 Worker %d 次，隔离进 spbin(POISON) 永久跳过: %s",

@@ -26,6 +26,10 @@
  * ================================================================ */
 
 void worker_mark_dead(IpcThreadCtx *ctx, bool send_notify) {
+    /* v15.6.1（P0-101）：捕获死亡 pid/epoch 供 Master 同代校验（须在清空 ctx->pid 前） */
+    pid_t dead_pid = ctx->pid;
+    uint64_t dead_epoch = ctx->current_epoch;
+
     if (ctx->fd_cmd >= 0) {
         close(ctx->fd_cmd);
         ctx->fd_cmd = -1;
@@ -48,12 +52,20 @@ void worker_mark_dead(IpcThreadCtx *ctx, bool send_notify) {
     atomic_store(&ctx->waiting_replace, true);
 
     if (send_notify) {
+        RetDeathPayload *pl = malloc(sizeof(*pl));
+        if (!pl) {
+            /* v15.6.1: DEAD 丢失会导致 Master 永不替换/销账——不得静默 */
+            log_fatal("[IPC-%d] malloc failed for DEAD payload (slot=%d)", ctx->slot_id, ctx->slot_id);
+            return;
+        }
+        pl->reported_pid = dead_pid;
+        pl->epoch = dead_epoch;
         IpcThreadMsg msg = {
             .type = RET_DEAD,
             .slot_id = ctx->slot_id,
-            .data = NULL,
-            .data_len = 0,
-            .epoch = 0
+            .data = pl,
+            .data_len = sizeof(*pl),
+            .epoch = dead_epoch
         };
         /* v15.6.0: 容量 65536，满即设计外异常——RET_DEAD 丢失会导致
          * Master 永不替换 Worker，log_fatal 暴露，不得静默丢弃 */

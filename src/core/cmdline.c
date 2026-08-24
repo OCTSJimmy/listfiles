@@ -48,6 +48,8 @@ void show_help() {
     printf("      --master-threads=数量  Master 去重线程数 (默认: %d)\n", DEFAULT_MASTER_THREADS);
     printf("      --worker-count=数量  Worker 进程数 (默认: 自动, 上限 %d)\n", MAX_WORKERS);
     printf("  -t, --timeout=秒       心跳超时时间 (默认: %d)\n", HEARTBEAT_TIMEOUT_SEC);
+    printf("      --stall-timeout=秒 无有效进展看门狗阈值, 0=禁用 (默认: %d, v15.6.1)\n", DEFAULT_STALL_TIMEOUT_SEC);
+    printf("      --stall-action=动作 看门狗触发动作: exit(默认, 退出码2) | abort(core dump)\n");
     printf("\n输出控制:\n");
     printf("  -f, --progress-file=文件 进度文件/历史记录前缀 (默认: progress)\n");
     printf("  -o, --output=文件      将结果写入指定文件 (默认: %s)\n", DEFAULT_OUTPUT_FILE);
@@ -107,6 +109,8 @@ void init_config(Config *cfg) {
     cfg->quote = false;
     cfg->include_dir = false;
     cfg->heartbeat_timeout = HEARTBEAT_TIMEOUT_SEC;
+    cfg->stall_timeout = DEFAULT_STALL_TIMEOUT_SEC;
+    cfg->stall_action = STALL_ACTION_EXIT;
     cfg->batch_size = DEFAULT_BATCH_SIZE;
     cfg->estimated_files = DEFAULT_ESTIMATED_FILES;
     cfg->master_threads = DEFAULT_MASTER_THREADS;
@@ -169,6 +173,8 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
         {"progress-slice-lines", required_argument, 0, 28},
         {"strict-nlink", no_argument, 0, 29},
         {"reference-base", required_argument, 0, 30}, /* v15.6.0（P0-011）：盲信基准路径 */
+        {"stall-timeout", required_argument, 0, 31},  /* v15.6.1（P0-105）：无有效进展看门狗阈值（秒），0=禁用 */
+        {"stall-action", required_argument, 0, 32},   /* v15.6.1（P0-105）：看门狗动作 exit|abort */
         {0, 0, 0, 0}
     };
 
@@ -282,6 +288,19 @@ int parse_arguments(int argc, char *argv[], Config *cfg) {
             case 30: /* v15.6.0（P0-011）：--reference-base 显式指定盲信基准 */
                 free(cfg->reference_base);
                 cfg->reference_base = strdup(optarg);
+                break;
+            case 31: /* v15.6.1（P0-105）：有效进展看门狗阈值（秒），0=禁用 */
+                cfg->stall_timeout = atoi(optarg);
+                if (cfg->stall_timeout < 0) cfg->stall_timeout = DEFAULT_STALL_TIMEOUT_SEC;
+                break;
+            case 32: /* v15.6.1（P0-105）：看门狗动作 exit|abort */
+                if (strcmp(optarg, "abort") == 0) {
+                    cfg->stall_action = STALL_ACTION_ABORT;
+                } else if (strcmp(optarg, "exit") == 0) {
+                    cfg->stall_action = STALL_ACTION_EXIT;
+                } else {
+                    log_warn("无效的 stall-action: %s，使用默认 exit", optarg);
+                }
                 break;
             case 'h': show_help(); return 2;
             default:

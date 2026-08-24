@@ -4,6 +4,61 @@
 
 ---
 
+## [15.6.1] - 2026-08-24
+
+### Fixed：/public4 生产事故热修复（Worker 生命周期可靠性，P0-101~109）
+
+事故摘要：/public4 全量扫描运行 2d18h 后 6/8 Worker 死亡、`pending_tasks=-6`、主循环
+空转 54 小时、零日志。取证全记录见 `Design-todo-v15.6.1.md`，实现细节与验证证据见
+`fix_documents/fixed_15.6.1_P0_incident_hotfix.md`。
+
+**P0 — Critical（9 项全部闭环）：**
+- **P0-101 死亡类消息同代校验**：RET_DEAD/RET_DEV_TIMEOUT/RET_EXIT（及 RET_ERROR/
+  RET_ENTRY_ERROR）携带 IPC 线程观测到的 (pid, epoch)，Master 仅受理
+  `reported_pid == slot->pid` 的同代消息——修复旧 stale 判定反转导致真实死亡被 100%
+  误吞（崩溃 Worker 永不清理/替换/销账）的最重缺陷。
+- **P0-102 cleanup 销账精确化 + DEV_TIMEOUT 节流**：仅 DT_SCANNING 由 cleanup 销账
+  （orphaned 不叠加，单 slot 单在途任务语义）；屏障接管态（DT_BATCHES_*）由完成屏障
+  销账完结、免重扫，替换延迟到屏障完结后；空闲 Worker 死亡不再销账（原实现无条件
+  `pending--`，启动期 6 连退直接把账目打成 -6）；Worker 侧同一任务只报一次
+  DEV_TIMEOUT（原实现每 5s 重发，是跨代重复销账级联的放大器）。
+- **P0-103 DEV_TIMEOUT 先杀后清**：cleanup 先 SIGKILL 并限时收割，消除新旧两代并存
+  窗口（原实现靠 CMD_REPLACE 关 fd 让旧 Worker EPIPE 自杀）。
+- **P0-104 账目不变量**：`pending_tasks < 0` 立即 log_fatal + _exit(2)；完结条件
+  改 `<= 0`。账目 bug 秒级暴露，不得死等。
+- **P0-105 有效进展看门狗**：monitor 线程监督 file+dir 计数——无增长且仍有应做工作
+  持续超 `--stall-timeout`（默认 900s，须大于最大退避 300s）→ 输出现场并按
+  `--stall-action=exit|abort` 终止。主循环 tick 看门狗对"活而无效"无效，故按有效
+  进展判定。
+- **P0-106 日志门控违规清扫**：DEV_TIMEOUT 全链路、cmd_queue 满丢 SCAN、熔断跳过
+  写 spbin、FINISH 发送最终失败、Worker 退出出口（POLLHUP/recv/malloc）、Worker
+  替换事件——全部解除门控或补日志，默认级别可见。
+- **P0-107 fork 安全三件套**：全部 fork 前移到单线程期 + 巨型指纹集合分配之前
+  （严格超售下小 VSZ fork 必成功，多线程 fork 锁继承风险同时消除）；预备役 Worker
+  池（启动期预 fork num_workers 个 spare，运行期替换零 fork，spare 耗尽响亮降额）；
+  子进程无锁日志模式（规避 flockfile 继承死锁）。
+- **P0-108 spawn/fork 失败必须有声**：所有 fork/pipe 失败路径全局 log_error 含
+  errno——修复严格超售下 fork ENOMEM 静默 54 小时的根因性无声。
+- **P0-109 RET_EXIT 携带在途任务 = 非预期死亡**：在途目录重入队 + 全局 log_error——
+  修复原实现丢弃在途目录且不留痕导致的子树静默丢失（1.9 亿 vs 8 亿缺口的真凶）。
+
+**实现期缺陷实录**（混沌压测暴露并同轮修复，详见 fixed 文档 §3）：
+- 迟到 RET_ERROR 跨代误销账（已纳入同代校验）；
+- orphaned 与在途任务双倍销账（已按单在途语义精确化）。
+
+**验证**：回归 19/19（新增用例 14：kill -9 Worker spare 补位；用例 15：全灭+spare
+耗尽看门狗 exit=2）；6 并发 × 8 轮压测 48/48；混沌 kill 压测 40/40。
+
+**⚠️ 运维提示：**
+- 生产重跑请从头全量（不用 --continue）；日志务必重定向到文件（`2> run.log`）。
+- 严格超售（`vm.overcommit_memory=2`）环境：本版本运行期零 fork，理论免疫 fork
+  ENOMEM；启动期请关注 `[Spare]` 日志确认预备役就绪。
+
+**修改的文件**（详见 fixed 文档 §6）：`include/{core,ipc,output,scan,util}/*`、
+`src/{core,ipc,output,scan,util}/*` 共 18 个源文件 + `tests/run_regression.sh`。
+
+---
+
 ## [15.6.0] - 2026-08-20
 
 ### Architecture：12 项 P0 设计闭环（Design-todo-v15.6.0 全部落地）

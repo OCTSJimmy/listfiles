@@ -580,6 +580,12 @@ void *worker_scanner_thread(void *arg) {
                         log_warn_v(202608202330UL, "[W%d-Scanner] IPC_MSG_FINISH EAGAIN retry %d", ctx->worker_id, retry);
                     }
                 }
+                /* v15.6.1（P0-106）：FINISH 发送最终失败意味着 Master 永不完结该任务
+                 * （完成屏障卡死、目录不上 dpbin）——属于元数据丢失风险，必须全局日志 */
+                if (rc != 0) {
+                    log_error("[W%d-Scanner] IPC_MSG_FINISH send FAILED (rc=%d, path=%s) —— Master 将无法完结该任务",
+                              ctx->worker_id, rc, path);
+                }
                 log_debug("[W%d-Scanner] IPC_MSG_FINISH sent (rc=%d, path=%s, retries=%d)", ctx->worker_id, rc, path, retry);
                 free(fin_buf);
             }

@@ -124,6 +124,10 @@ dispatch:
                     if (ret) {
                         ret->errno_code = eh->errno_code;
                         ret->dev = eh->dev;
+                        /* v15.6.1（P0-101）：回带 pid/epoch 供 Master 同代校验
+                         * （RET_DEV_TIMEOUT 必须；ERROR/ENTRY_ERROR 仅作诊断） */
+                        ret->reported_pid = ctx->pid;
+                        ret->epoch = ctx->current_epoch;
                         if (hdr.payload_len > sizeof(IpcErrorHeader) + sizeof(uint32_t)) {
                             const char *src = (const char*)payload + sizeof(IpcErrorHeader) + sizeof(uint32_t);
                             size_t plen = hdr.payload_len - sizeof(IpcErrorHeader) - sizeof(uint32_t);
@@ -148,6 +152,10 @@ dispatch:
                     if (ret) {
                         ret->errno_code = eh->errno_code;
                         ret->dev = eh->dev;
+                        /* v15.6.1（P0-101）：回带 pid/epoch 供 Master 同代校验
+                         * （RET_DEV_TIMEOUT 必须；ERROR/ENTRY_ERROR 仅作诊断） */
+                        ret->reported_pid = ctx->pid;
+                        ret->epoch = ctx->current_epoch;
                         if (hdr.payload_len > sizeof(IpcErrorHeader) + sizeof(uint32_t)) {
                             const char *src = (const char*)payload + sizeof(IpcErrorHeader) + sizeof(uint32_t);
                             size_t plen = hdr.payload_len - sizeof(IpcErrorHeader) - sizeof(uint32_t);
@@ -201,7 +209,17 @@ dispatch:
                 break;
             }
             case IPC_MSG_EXIT: {
-                send_return(ctx, RET_EXIT, NULL, 0, 0);
+                /* v15.6.1（P0-101）：EXIT 携带 pid/epoch 供 Master 同代校验；
+                 * 必须在 worker_mark_dead 清空 ctx->pid 之前填充 */
+                RetDeathPayload *pl = malloc(sizeof(*pl));
+                if (pl) {
+                    pl->reported_pid = ctx->pid;
+                    pl->epoch = ctx->current_epoch;
+                    send_return(ctx, RET_EXIT, pl, sizeof(*pl), 0);
+                } else {
+                    log_error("[IPC-%d] malloc failed for EXIT payload", ctx->slot_id);
+                    send_return(ctx, RET_EXIT, NULL, 0, 0);
+                }
                 worker_mark_dead(ctx, false);
                 free(payload);
                 break;
@@ -340,6 +358,9 @@ void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
         case CMD_SCAN: {
             CmdScanPayload *scan = (CmdScanPayload*)cmd->data;
             if (!scan) break;
+            /* v15.6.1（P0-101）：记录当前任务 epoch，死亡类消息（RET_DEAD/
+             * RET_DEV_TIMEOUT/RET_EXIT）回带供 Master 同代校验 */
+            ctx->current_epoch = scan->epoch;
             if (ctx->fd_cmd < 0) {
                 /* v15.6.0: Replacement 窗口期（fd_cmd 尚未就绪）——暂存该 CMD_SCAN
                  * （每 IPC 线程一条 pending slot），待 CMD_REPLACE 完成后补发；
@@ -431,6 +452,7 @@ void handle_cmd(IpcThreadCtx *ctx, IpcThreadMsg *cmd) {
             atomic_store(&ctx->last_heartbeat, time(NULL));
             ctx->spawn_time = time(NULL);  /* v15.1.1: record spawn time for startup_timeout */
             atomic_store(&ctx->waiting_replace, false);
+            ctx->current_epoch = 0;  /* v15.6.1（P0-101）：新一代无在途任务 */
 
             /* v15.4.0: reset FSM states for new Worker */
             ctx->ctrl_fsm.state = IPC_READ_IDLE;

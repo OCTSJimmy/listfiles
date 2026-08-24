@@ -75,9 +75,20 @@ typedef struct {
 typedef struct {
     uint32_t errno_code;
     uint64_t dev;
+    /* v15.6.1（P0-101）：死亡类消息同代校验——上报时 IPC 线程观测到的 worker pid
+     * 与该 slot 当前任务 epoch。Master 仅当 reported_pid == slot->pid 时受理
+     * （RET_DEV_TIMEOUT），否则按跨代残留丢弃。RET_ERROR/RET_ENTRY_ERROR 顺带填充
+     * 仅作诊断，不参与校验。 */
+    pid_t    reported_pid;
+    uint64_t epoch;
     char     path[4096];
 } RetErrorPayload;
 
-/* RET_DEAD / RET_EXIT: no payload needed (data = NULL) */
+/* v15.6.1（P0-101）：RET_DEAD / RET_EXIT 载荷。此前无载荷（data=NULL）无法做
+ * 同代校验，真实死亡被 main_loop.c 的"stale 判定"100% 误吞（生产事故 R1）。 */
+typedef struct {
+    pid_t    reported_pid;  /* IPC 线程观测到的死亡/退出 worker pid */
+    uint64_t epoch;         /* 该 slot 当前任务 epoch（无在途任务为 0） */
+} RetDeathPayload;
 
 #endif

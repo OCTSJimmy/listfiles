@@ -16,10 +16,10 @@ struct DeviceManager;
 // 全局常量与宏
 // =======================================================
 
-#define VERSION "15.6.0"
-#define VERSION_NAME "v15.6.0"
-#define VERSION_CODE 202608202300UL
-/* 版本限定日志的门控码不写宏：直接在调用点写死时间戳字面量（本周期为 202608202330UL），
+#define VERSION "15.6.1"
+#define VERSION_NAME "v15.6.1"
+#define VERSION_CODE 202608241500UL
+/* 版本限定日志的门控码不写宏：直接在调用点写死时间戳字面量（本周期为 202608241500UL），
  * 防止宏值随版本递进被一改全改、旧日志被不断宽限而失去门控意义。
  * **严格遵循**：当程序异常以至于可能导致文件元数据被忽略或者有可能丢失时，需要输出的
  * 日志信息不得被版本门控，必须归属于全局日志（引用 VERSION_CODE 的 log_* 宏）。
@@ -67,6 +67,12 @@ struct DeviceManager;
 #define PROBE_TIMEOUT_SEC 5        // 探针5秒不返回视为设备死亡
 #define MONITOR_INTERVAL_MS 500    // Monitor 线程主频 (500ms)
 #define CHECK_INTERVAL_SEC 1       // 巡检频率 (1秒)
+
+/* v15.6.1（P0-105）：有效进展看门狗。阈值必须大于最大 redispatch 退避（300s），
+ * 默认 900s；--stall-timeout=0 禁用。动作：exit=杀 Worker 后 _exit(2)，abort=core。 */
+#define DEFAULT_STALL_TIMEOUT_SEC 900
+#define STALL_ACTION_EXIT  0
+#define STALL_ACTION_ABORT 1
 
 #define DEFAULT_BATCH_SIZE 1024
 #define DEFAULT_ESTIMATED_FILES 10000000
@@ -209,6 +215,10 @@ typedef struct {
     char *last_cmd_args; 
 
     int heartbeat_timeout;
+
+    /* === v15.6.1（P0-105）：有效进展看门狗 === */
+    int stall_timeout;          // --stall-timeout 秒，0=禁用（默认 DEFAULT_STALL_TIMEOUT_SEC）
+    int stall_action;           // --stall-action：STALL_ACTION_EXIT / STALL_ACTION_ABORT
     
     /* === 新增：进程模型与性能参数 === */
     int batch_size;             // Worker batch 大小，默认 1024

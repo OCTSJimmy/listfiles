@@ -23,6 +23,8 @@ typedef struct {
     int             fd_data;        /* Current Worker data read end (W→M BATCH) */
     int             fd_ctrl;        /* Current Worker ctrl read end (W→M signals) */
     pid_t           pid;            /* Current Worker pid */
+    uint64_t        current_epoch;  /* v15.6.1（P0-101）：当前在途任务 epoch（CMD_SCAN 时记录，
+                                     * CMD_REPLACE 清零），死亡类消息回带供 Master 同代校验 */
     _Atomic bool    waiting_replace;/* Set after DEAD, cleared after REPLACE */
     int             eagain_retry_count; /* EAGAIN retry counter (reset on REPLACE) */
     pthread_cond_t *master_cond;    /* Signal master thread when message sent */

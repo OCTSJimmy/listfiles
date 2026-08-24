@@ -26,6 +26,10 @@
 #      （baseline_eligible=0）→ exit 2
 #  13. 不完整运行不可作基准（P0-008）：EACCES 子目录 → exit 1 + status=Incomplete
 #      + baseline_eligible=0 + spbin_count>=1；以它为基准盲信 → exit 2
+#  14. kill -9 Worker 中段（v15.6.1 P0-101/102/103/107）：spare 池补位，
+#      输出 == 基线，stderr 有 DEAD/预备役日志，无 INVARIANT（账目不为负）
+#  15. Worker 全灭 + spare 耗尽（v15.6.1 P0-105/108）：有效进展看门狗
+#      --stall-timeout=5 触发，exit=2，有 [Watchdog]/耗尽日志，无静默挂起
 #
 # 注意（用例 10/11）：kill 时序在慢机器上可能偏早/偏晚——断言只依赖"最终输出
 # == 基线"，不依赖崩溃具体位置；若首轮在 kill 前已跑完（小树上可能），该用例
@@ -358,6 +362,52 @@ else
     else
         bad "用例13b" "exit=$rc（预期 2）"
     fi
+fi
+
+# ================================================================
+say "== 用例 14: kill -9 Worker 中段（v15.6.1 P0-101/102/103/107 spare 补位）=="
+"$LF" -p "$CTREE" -F "%p %s" -D -O "$WORK/out14" -f "$WORK/prog14" \
+    --max-slice 50000 --yes --worker-count 8 --batch-size 256 -M \
+    > /dev/null 2> "$WORK/case14.log" &
+LF_PID=$!
+sleep 1
+KILLED=0
+for wp in $(pgrep -P $LF_PID); do
+    kill -9 $wp 2>/dev/null && KILLED=$((KILLED+1))
+    [ $KILLED -ge 3 ] && break
+done
+wait $LF_PID; rc=$?
+collect "$WORK/out14" | LC_ALL=C sort -u > "$WORK/out14.sorted"
+if [ $rc -eq 0 ] && [ "$KILLED" -ge 1 ] \
+    && cmp -s "$WORK/out14.sorted" "$WORK/case10_baseline.sorted" \
+    && grep -q 'DEAD' "$WORK/case14.log" && grep -q '预备役' "$WORK/case14.log" \
+    && ! grep -q 'INVARIANT' "$WORK/case14.log"; then
+    ok "用例14 kill -9 $KILLED 个 Worker 后 spare 补位，输出与基线一致"
+else
+    bad "用例14" "exit=$rc killed=$KILLED；diff: $(diff "$WORK/out14.sorted" "$WORK/case10_baseline.sorted" | wc -l) 行；log: $(tail -3 "$WORK/case14.log" | tr '\n' ' ')"
+fi
+
+# ================================================================
+say "== 用例 15: Worker 全灭 + spare 耗尽 → 看门狗（v15.6.1 P0-105/108）=="
+"$LF" -p "$CTREE" -F "%p %s" -D -O "$WORK/out15" -f "$WORK/prog15" \
+    --max-slice 50000 --yes --worker-count 8 --batch-size 256 -M \
+    --stall-timeout 5 > /dev/null 2> "$WORK/case15.log" &
+LF_PID=$!
+sleep 0.5
+# 反复杀光全部子进程（初始 8 + 预备役 8），直至 spare 耗尽再无子进程
+for round in $(seq 1 60); do
+    children=$(pgrep -P $LF_PID)
+    [ -z "$children" ] && break
+    for wp in $children; do kill -9 $wp 2>/dev/null; done
+    sleep 0.2
+done
+wait $LF_PID; rc=$?
+if [ $rc -eq 2 ] && grep -q 'Watchdog' "$WORK/case15.log" \
+    && grep -q '预备役 Worker 已耗尽' "$WORK/case15.log" \
+    && ! grep -q 'INVARIANT' "$WORK/case15.log"; then
+    ok "用例15 全灭+spare 耗尽后看门狗 exit=2（响亮终止，无负账目、无静默挂起）"
+else
+    bad "用例15" "exit=$rc（预期 2）；log 尾部: $(tail -3 "$WORK/case15.log" | tr '\n' ' ')"
 fi
 
 # ================================================================

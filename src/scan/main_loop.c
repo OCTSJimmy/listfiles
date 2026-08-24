@@ -34,6 +34,47 @@
  * Handle return messages from IPC threads
  * ================================================================ */
 
+/**
+ * @brief  校验死亡类消息（RET_DEAD/RET_DEV_TIMEOUT/RET_EXIT）是否属于当前代
+ * @param  ctx              AppContext*    应用上下文
+ * @param  msg              IpcThreadMsg*  待校验消息
+ * @param  reported_pid_out pid_t*         输出：消息携带的 worker pid，允许为 NULL
+ * @return bool  true = 同代（受理）；false = 跨代残留或畸形（丢弃）
+ *
+ * @note   v15.6.1（P0-101）：此前 RET_DEAD 无载荷，stale 判定
+ *         （is_alive && pid != -1 → 丢弃）恰好把每一条真实死亡都误判为残留——
+ *         Worker 崩溃永不清理、永不替换、永不销账（生产事故 R1）。
+ *         现在死亡类消息携带 IPC 线程观测到的 pid，仅当 reported_pid == slot->pid
+ *         时受理；换代后 slot->pid 变更，旧代消息自然失配被丢弃。
+ */
+static bool death_msg_current_generation(AppContext *ctx, IpcThreadMsg *msg, pid_t *reported_pid_out) {
+    int sid = msg->slot_id;
+    if (!ctx->worker_pool || sid < 0 || sid >= ctx->worker_pool->num_workers) return false;
+    pid_t reported = -1;
+    if (msg->type == RET_DEV_TIMEOUT || msg->type == RET_ERROR || msg->type == RET_ENTRY_ERROR) {
+        if (!msg->data || msg->data_len < sizeof(RetErrorPayload)) {
+            log_error("[Bus] RET type=%u missing/short payload (slot=%d), dropped", msg->type, sid);
+            return false;
+        }
+        reported = ((RetErrorPayload*)msg->data)->reported_pid;
+    } else {
+        if (!msg->data || msg->data_len < sizeof(RetDeathPayload)) {
+            log_error("[Bus] death message type=%u missing/short payload (slot=%d), dropped",
+                      msg->type, sid);
+            return false;
+        }
+        reported = ((RetDeathPayload*)msg->data)->reported_pid;
+    }
+    if (reported_pid_out) *reported_pid_out = reported;
+    WorkerSlot *slot = &ctx->worker_pool->slots[sid];
+    if (reported != slot->pid) {
+        log_debug_v(202608241500UL, "[Bus] stale death message dropped: type=%u slot=%d reported_pid=%d current_pid=%d",
+                    msg->type, sid, (int)reported, (int)slot->pid);
+        return false;
+    }
+    return true;
+}
+
 static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
     log_debug("[Bus] received type=%u slot=%d len=%zu", msg->type, msg->slot_id, msg->data_len);
 
@@ -71,6 +112,9 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             break;
         }
         case RET_ERROR: {
+            /* v15.6.1（P0-101 补）：RET_ERROR 改变账目（pending--），必须同代校验——
+             * 旧代 Worker 的迟到 ERROR 会对新一代 slot 误销账（混沌压测实测可致负） */
+            if (!death_msg_current_generation(ctx, msg, NULL)) break;
             if (msg->data_len >= sizeof(RetErrorPayload)) {
                 RetErrorPayload *err = (RetErrorPayload*)msg->data;
                 IpcErrorHeader hdr = { err->errno_code, err->dev };
@@ -86,7 +130,9 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
         case RET_ENTRY_ERROR: {
             /* v15.5.7: 条目级错误（单条目 stat 失败、路径截断）——Worker 仍在正常扫描，
              * 不触发设备惩罚/探测/Worker 状态变更，仅记入熔断清单并累加 skipped_count，
-             * 扫描结束时以非零退出码暴露不完整。 */
+             * 扫描结束时以非零退出码暴露不完整。
+             * v15.6.1（P0-101 补）：同代校验——旧代迟到条目错误不应计入本轮熔断清单 */
+            if (!death_msg_current_generation(ctx, msg, NULL)) break;
             if (msg->data_len >= sizeof(RetErrorPayload)) {
                 RetErrorPayload *err = (RetErrorPayload*)msg->data;
                 char reason[64];
@@ -116,23 +162,45 @@ static void handle_return_message(AppContext *ctx, IpcThreadMsg *msg) {
             break;
         }
         case RET_DEAD: {
-            WorkerSlot *slot = &ctx->worker_pool->slots[msg->slot_id];
-            if (atomic_load(&slot->is_alive) && slot->pid != -1) {
-                /* Stale RET_DEAD after replacement; ignore */
-                break;
-            }
-            log_error("[Bus] Worker %d DEAD reported by IPC thread", msg->slot_id);
+            /* v15.6.1（P0-101）：同代校验——修复 stale 判定反转（真实死亡曾被
+             * 100% 误吞：永不清理/替换/销账，生产事故 R1） */
+            pid_t rpid;
+            if (!death_msg_current_generation(ctx, msg, &rpid)) break;
+            log_error("[Bus] Worker %d DEAD reported by IPC thread (pid=%d)", msg->slot_id, (int)rpid);
             cleanup_dead_worker_slot(ctx, msg->slot_id, true);
             break;
         }
         case RET_DEV_TIMEOUT: {
-            log_error_v(202607030000UL, "[Bus] Worker %d DEV_TIMEOUT (scanner stuck), replacing", msg->slot_id);
+            /* v15.6.1（P0-106）：解除版本门控——scanner 卡死意味着该目录元数据
+             * 可能丢失，按既定规则必须全局可见 */
+            pid_t rpid;
+            if (!death_msg_current_generation(ctx, msg, &rpid)) break;
+            log_error("[Bus] Worker %d DEV_TIMEOUT (scanner stuck, pid=%d), replacing",
+                      msg->slot_id, (int)rpid);
             cleanup_dead_worker_slot(ctx, msg->slot_id, true);
             break;
         }
         case RET_EXIT: {
-            log_info("[Bus] Worker %d normal exit", msg->slot_id);
-            cleanup_dead_worker_slot(ctx, msg->slot_id, false);
+            /* v15.6.1（P0-101/P0-109）：同代校验；携带在途任务的 EXIT = 非预期死亡。
+             * 原实现 cleanup(redispatch_current=false)：在途目录不重入队、不写 spbin，
+             * enqueued_set 又阻断重新发现 → 整棵子树静默丢失（生产事故 R9，
+             * 8 亿 vs 1.9 亿缺口的真凶）。"正常退出"的合法时机仅 STOP 之后。 */
+            pid_t rpid;
+            if (!death_msg_current_generation(ctx, msg, &rpid)) break;
+            WorkerSlot *slot = &ctx->worker_pool->slots[msg->slot_id];
+            bool in_flight = (slot->task_state == DT_SCANNING
+                           || slot->task_state == DT_BATCHES_RECEIVED
+                           || slot->task_state == DT_BATCHES_PROCESSED);
+            if (in_flight) {
+                log_error("[Bus] Worker %d EXIT with in-flight task (pid=%d, task_state=%d), "
+                          "按非预期死亡处理: %s",
+                          msg->slot_id, (int)rpid, slot->task_state,
+                          path_log_mask(slot->current_path));
+                cleanup_dead_worker_slot(ctx, msg->slot_id, true);
+            } else {
+                log_warn("[Bus] Worker %d exit (pid=%d, 无在途任务)", msg->slot_id, (int)rpid);
+                cleanup_dead_worker_slot(ctx, msg->slot_id, false);
+            }
             break;
         }
         default: {
@@ -537,10 +605,19 @@ void main_loop_run(AppContext *ctx) {
         for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
             WorkerSlot *slot = &ctx->worker_pool->slots[i];
             if (!atomic_load(&slot->is_alive) && slot->pid == -1) {
+                /* v15.6.1（P0-102）：屏障接管态（DT_BATCHES_*）的任务仍可由
+                 * advance_task_barriers 完结（dpbin 需要 current_path/current_st）——
+                 * 必须等屏障销账后才允许替换复用 slot，否则 dpbin 会拿到空路径 */
+                if (slot->task_state == DT_BATCHES_RECEIVED || slot->task_state == DT_BATCHES_PROCESSED)
+                    continue;
                 cleanup_dead_worker_slot(ctx, i, true);
-                log_info("[Replace] Replacing dead worker %d", i);
-                worker_pool_replace(ctx->worker_pool, i);
-                send_replace_to_ipc(ctx, i, slot->fd_cmd, slot->fd_data, slot->fd_ctrl, slot->pid);
+                /* v15.6.1（P0-106）：Worker 替换是生命周期关键事件，默认级别可见 */
+                log_warn("[Replace] Replacing dead worker %d", i);
+                /* v15.6.1（P0-107b）：替换走预备役池，运行期零 fork；
+                 * 失败（spare 耗尽）下一轮重试，由有效进展看门狗兜底 */
+                if (worker_pool_replace(ctx->worker_pool, i)) {
+                    send_replace_to_ipc(ctx, i, slot->fd_cmd, slot->fd_data, slot->fd_ctrl, slot->pid);
+                }
             }
         }
 
@@ -557,7 +634,22 @@ void main_loop_run(AppContext *ctx) {
         dspill_flush_check(ctx, false);
 
         /* 8. Termination check */
-        if (atomic_load(&ctx->pending_tasks) == 0
+        /* v15.6.1（P0-104）：账目不变量——pending_tasks<0 即销账 bug，必须立即暴露，
+         * 不得死等（生产事故：-6 使完结条件永不成立，空转 54 小时）。
+         * 杀光存活 Worker 后 _exit(2)（严重失败），不走优雅退出（账目已不可信）。 */
+        long pending_now = atomic_load(&ctx->pending_tasks);
+        if (pending_now < 0) {
+            log_fatal("[MainLoop] INVARIANT VIOLATION: pending_tasks=%ld < 0 —— "
+                      "任务账目错误，终止运行", pending_now);
+            ctx->state.has_error = true;
+            for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
+                WorkerSlot *slot = &ctx->worker_pool->slots[i];
+                if (atomic_load(&slot->is_alive) && slot->pid > 0)
+                    kill(slot->pid, SIGKILL);
+            }
+            _exit(2);
+        }
+        if (pending_now <= 0
             && atomic_load(&ctx->pending_batches) == 0
             && dispatch_queue_count(&ctx->dispatch_queue) == 0
             && ctx->hist_pump_state == HIST_PUMP_DONE) {

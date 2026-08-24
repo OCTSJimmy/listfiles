@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -279,6 +281,11 @@ static void dispatch_probes(Monitor *mon) {
         mon->active_probe_dev = task.dev;
         mon->active_probe_retry_count = task.retry_count;
         mon->active_probe_interval = task.probe_interval;
+    } else {
+        /* v15.6.1（P0-108）：探测 fork 失败必须留痕（严格超售下大 VSZ fork 会
+         * ENOMEM——与 Worker 替换失败同族）。探测任务已 remove，失败即放弃本次，
+         * 设备恢复依赖后续错误重新触发探测调度。 */
+        log_error("[Probe] fork failed: errno=%d (%s)", errno, strerror(errno));
     }
 }
 
@@ -372,6 +379,80 @@ static void reap_probes(Monitor *mon) {
  * Monitor thread lifecycle
  * ================================================================ */
 
+/* ================================================================
+ * v15.6.1（P0-105）：有效进展看门狗
+ * ================================================================ */
+
+/**
+ * @brief  检测"活而无效"僵死：计数无增长但仍有应做工作
+ * @param  mon  Monitor*  监控器指针
+ * @return void
+ *
+ * @note   生产事故教训（Design-todo-v15.6.1.md R5）：主循环 cond_timedwait 空转 +
+ *         替换静默失败时，进程所有线程状态"正常"，主循环 tick 看门狗无法发现——
+ *         必须按有效进展判定。判定：file+dir 计数无增长 且（pending_tasks!=0 或
+ *         dispatch_queue 非空或存在 BUSY Worker）持续超 --stall-timeout 秒 →
+ *         输出现场并按 --stall-action 终止（exit=杀 Worker 后 _exit(2)；abort=core）。
+ *         阈值默认 900s，须大于最大 redispatch 退避（300s）避免误报；
+ *         设备探测等待/spbin 积压场景 pending==0 且队列空，不误报。
+ */
+static void stall_watchdog(Monitor *mon) {
+    AppContext *ctx = mon->ctx;
+    if (!ctx || ctx->cfg.stall_timeout <= 0) return;
+
+    time_t now = time(NULL);
+    unsigned long total = ctx->state.file_count + ctx->state.dir_count;
+    if (total != mon->wd_last_total) {
+        mon->wd_last_total = total;
+        mon->wd_last_change = now;
+        return;
+    }
+
+    bool work_expected = atomic_load(&ctx->pending_tasks) != 0
+                      || dispatch_queue_count(&ctx->dispatch_queue) > 0;
+    if (!work_expected && ctx->worker_pool) {
+        for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
+            if (atomic_load(&ctx->worker_pool->slots[i].state) == WORKER_STATE_BUSY) {
+                work_expected = true;
+                break;
+            }
+        }
+    }
+    if (!work_expected) {
+        mon->wd_last_change = now;
+        return;
+    }
+
+    long idle_for = (long)difftime(now, mon->wd_last_change);
+    if (idle_for < ctx->cfg.stall_timeout) return;
+
+    log_error("[Watchdog] 扫描无有效进展已达 %lds（阈值 %ds）——判定僵死，输出现场后终止",
+              idle_for, ctx->cfg.stall_timeout);
+    log_error("[Watchdog] pending_tasks=%ld pending_batches=%ld dispatch_queue=%zu hist_pump=%d",
+              atomic_load(&ctx->pending_tasks), atomic_load(&ctx->pending_batches),
+              dispatch_queue_count(&ctx->dispatch_queue), (int)ctx->hist_pump_state);
+    if (ctx->worker_pool) {
+        for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
+            WorkerSlot *slot = &ctx->worker_pool->slots[i];
+            log_error("[Watchdog]   W%d: state=%d pid=%d alive=%d path=%s",
+                      i, atomic_load(&slot->state), (int)slot->pid,
+                      (int)atomic_load(&slot->is_alive), path_log_mask(slot->current_path));
+        }
+    }
+
+    if (ctx->cfg.stall_action == STALL_ACTION_ABORT) {
+        abort();  /* SIGABRT → 致命信号处理器 re-raise → core dump */
+    }
+    /* 默认 exit：杀掉全部存活 Worker 避免孤儿，退出码 2（严重失败） */
+    if (ctx->worker_pool) {
+        for (int i = 0; i < ctx->worker_pool->num_workers; i++) {
+            WorkerSlot *slot = &ctx->worker_pool->slots[i];
+            if (atomic_load(&slot->is_alive) && slot->pid > 0) kill(slot->pid, SIGKILL);
+        }
+    }
+    _exit(2);
+}
+
 /**
  * @brief  监控线程主入口函数
  * @param  arg  void*  指向 Monitor 结构体的指针，不能为空
@@ -400,6 +481,7 @@ void* monitor_thread_entry(void *arg) {
             last_check_time = now;
         }
         reap_probes(mon);
+        stall_watchdog(mon);  /* v15.6.1（P0-105）：有效进展看门狗 */
 
         usleep(MONITOR_INTERVAL_MS * 1000);
     }
@@ -422,6 +504,9 @@ Monitor* monitor_create(AppContext *ctx) {
     mon->ctx = ctx;
     mon->running = true;
     mon->active_probe_pid = -1;
+    /* v15.6.1（P0-105）：看门狗基线初始化，防止启动即误判 */
+    mon->wd_last_total = 0;
+    mon->wd_last_change = time(NULL);
 
     return mon;
 }

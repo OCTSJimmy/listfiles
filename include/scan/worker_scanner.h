@@ -23,6 +23,7 @@ typedef struct {
     bool   task_ready;
     bool   stop_flag;
     uint64_t task_epoch;    /* v15.6.0: 当前任务 epoch（随 CMD_SCAN 下发，BATCH/FINISH 回带） */
+    bool   dev_timeout_reported; /* v15.6.1（P0-102）：同一任务只报一次 DEV_TIMEOUT（新任务复位） */
 
     /* Scanner 进度监控 */
     pthread_mutex_t progress_mutex;
