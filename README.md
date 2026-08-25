@@ -146,15 +146,16 @@ make clean
 ## 测试
 
 ```bash
-tests/run_regression.sh        # 回归测试集（用例 1-15，含子用例共 19 个断言点：
+tests/run_regression.sh        # 回归测试集（用例 1-17，含子用例共 21 个断言点：
                                # 基线一致性、并发一致性、错误注入、崩溃续传、
                                # 二次崩溃、盲信门禁、kill -9 Worker spare 补位、
-                               # 全灭+spare 耗尽看门狗等；通过标准为 PASS=19 FAIL=0）
+                               # 全灭+spare 耗尽看门狗、EINVAL 非法文件名治理等；
+                               # 通过标准为 PASS=21 FAIL=0）
 ```
 
 ## 版本
 
-当前版本：**15.6.0**
+当前版本：**15.6.2**
 
 ## 许可证
 

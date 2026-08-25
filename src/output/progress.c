@@ -364,7 +364,8 @@ void spbin_append(AppContext *ctx, const SpbinEntry *entry) {
  *
  * @note   所有跳过路径（RET_ERROR 各 reason、目录级熔断达阈值、毒丸隔离）的统一入口。
  *         - 内存状态：PROBE_FAIL/TIMEOUT → SP_STATUS_PROBING（等待设备探测恢复）；
- *           PERMISSION/CIRCUIT_BREAKER/POISON → SP_STATUS_CONDEMNED（本次运行不再入队）。
+ *           PERMISSION/CIRCUIT_BREAKER/POISON/INVALID_NAME → SP_STATUS_CONDEMNED
+ *           （本次运行不再入队）。
  *         - spbin_set（path-only 指纹）兼作去重依据：同一路径重复跳过只更新既有条目
  *           （如 PROBE_FAIL 升级为 POISON）；磁盘 append-only 允许重复记录，
  *           恢复时后写覆盖先写。

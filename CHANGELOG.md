@@ -4,6 +4,54 @@
 
 ---
 
+## [15.6.2] - 2026-08-25
+
+### Fixed：非法 UTF-8 文件名治理（NFSv4 EINVAL 误分类与探测假恢复循环）
+
+生产背景：NFSv4.1 挂载的全量扫描中，早年经 SMB/NFSv3 写入的**截断 UTF-8 文件名**
+（名字末尾只剩半个汉字）触发服务端 UTF-8 校验，`lstat/stat/opendir` 返回
+`EINVAL(22)`；READDIR 不逐名校验，故 `readdir` 能列出但 stat 永远失败。此类条目
+在 NFSv4 挂载下物理不可读，客户端无法自救，但 listfiles 的处理链存在三个缺陷。
+
+**修复内容：**
+
+1. **错误分类矩阵新增 `SP_REASON_INVALID_NAME(6)`**（`include/output/spbin.h`）：
+   `EINVAL/EILSEQ` 归类为条目级永久问题——永久跳过（CONDEMNED）、**不触发设备探测**。
+   此前落入 default 分支按 PROBE_FAIL 保守处理（`device_level=true`），单个坏名
+   目录即惩罚整台设备进入探测流程。
+2. **修复探测子进程"恒成功"缺陷**（`src/output/monitor.c`）：探测子进程原实现
+   `(void)lstat(path); _exit(0)` 不看结果——坏名路径探测秒回"成功" → 设备
+   mark_alive → spbin 整组重入队 → 再失败 → 再探测……**每个坏名目录形成永不
+   终止的假恢复循环**（探测槽霸占、spbin 磁盘 append-only 无限膨胀、
+   skipped_count 每轮虚增、日志刷屏）。现子进程退出码携带 lstat 的 errno，
+   父进程分类处置：0/ENOENT/ENOTDIR → 设备恢复整组重入队；EINVAL/EILSEQ →
+   设备存活但路径改判 INVALID_NAME 永久跳过（不重入队），同设备其余路径
+   正常恢复；其余 errno 或超时 → 维持指数退避/判死语义。
+3. **坏名条目退化输出**（`src/scan/worker_scanner.c`）：条目级 stat 遇
+   EINVAL/EILSEQ 时，条目仍写入批次——mode 取自 `dirent.d_type`、ino 取自
+   `dirent.d_ino`，其余字段清零——同时照常 `ENTRY_ERROR` 上报（skipped_count
+   照计、非零退出码不变）。名单完整，事后可直接从输出提取全量坏名清单去改名；
+   此前坏名条目连名字都不进输出，无法审计。
+4. **hex 转储日志**：坏名错误附路径字节级 hex dump（上限 256 字节）。路径掩码
+   与终端显示看不出原始字节，hex 是定位改名对象的唯一手段。涉及元数据可能被
+   忽略，按既定规则全局可见、不做版本门控。
+
+**运维侧治本**：坏名只能在存储服务端或经 NFSv3 挂载 rename 为合法 UTF-8
+（v3 不校验编码，可正常操作这些名字）；也可用 NFSv3 挂载整体重扫。
+
+**验证**：构建零警告；回归 **21/21**（新增用例 16：条目级 EINVAL 注入 →
+退化输出 + ENTRY_ERROR(errno=22) + hex 日志；用例 17：目录级 EINVAL 注入 →
+spbin reason=6 永久跳过、无设备探测、无重试循环，60s 超时兜底完结）。
+新增故障注入 shim `tests/inject_lstat.c`（劫持 lstat/stat/__xstat/__lxstat，
+按路径子串注入指定 errno）。
+
+**修改的文件**：`include/output/spbin.h`、`include/output/monitor.h`、
+`include/core/config.h`、`src/scan/main_loop.c`、`src/scan/worker_scanner.c`、
+`src/output/monitor.c`、`src/output/progress.c`、`src/output/progress_archive.c`、
+`tests/inject_lstat.c`（新增）、`tests/run_regression.sh`。
+
+---
+
 ## [15.6.1] - 2026-08-24
 
 ### Fixed：/public4 生产事故热修复（Worker 生命周期可靠性，P0-101~109）

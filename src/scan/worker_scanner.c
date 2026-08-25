@@ -322,6 +322,33 @@ static int entry_stat(const char *path, struct stat *st) {
 }
 
 /**
+ * @brief  非法文件名（EINVAL/EILSEQ）的字节级 hex 转储日志（v15.6.2）
+ * @param  worker_id  int          Worker 编号
+ * @param  path       const char*  含非法 UTF-8 字节的路径，不能为空
+ * @param  err        int          errno（EINVAL/EILSEQ）
+ * @return void
+ *
+ * @note   NFSv4 服务端强制 UTF-8 校验，截断/损坏的文件名（常见于早年经
+ *         SMB/NFSv3 写入的名字）在 LOOKUP/GETATTR 时被拒返回 EINVAL；
+ *         READDIR 不逐名校验，故 readdir 能列出但 stat 永远失败。
+ *         路径掩码/终端显示看不出原始字节，hex 转储是定位改名对象的唯一手段。
+ *         此类异常意味着条目元数据可能被忽略，按既定规则必须全局可见，
+ *         不得版本门控。转储上限 256 字节（足以覆盖实际 NAME_MAX=255 的单级名）。
+ */
+static void log_invalid_name_hex(int worker_id, const char *path, int err) {
+    char hex[256 * 2 + 24];
+    size_t len = strlen(path);
+    size_t n = len > 256 ? 256 : len;
+    char *p = hex;
+    for (size_t i = 0; i < n; i++)
+        p += sprintf(p, "%02x", (unsigned char)path[i]);
+    *p = '\0';
+    log_warn("[W%d-Scanner] INVALID_NAME errno=%d hex=%s%s （名字含非法 UTF-8 字节，"
+             "NFSv4 服务端拒绝；需在存储侧或经 NFSv3 挂载改名）",
+             worker_id, err, hex, len > 256 ? "...(trunc)" : "");
+}
+
+/**
  * @brief  扫描单个目录并将结果批次发送回 Master
  * @param  fd_out     int          输出文件描述符，取值范围: >= 0 的可写 fd
  * @param  dir_path   const char*  要扫描的目录路径，不能为空
@@ -364,6 +391,9 @@ static bool scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
             return false;
         }
         log_warn("[W%d-Scanner] lstat failed on %s: %s", worker_id, dir_path, strerror(lstat_err));
+        /* v15.6.2：坏名目录附 hex 转储（掩码日志看不出原始字节） */
+        if (lstat_err == EINVAL || lstat_err == EILSEQ)
+            log_invalid_name_hex(worker_id, dir_path, lstat_err);
         send_dir_error(task->fd_ctrl, lstat_err, task->current_dev, dir_path);
         return true;
     }
@@ -442,12 +472,30 @@ static bool scan_and_send(int fd_out, const char *dir_path, int worker_id, Worke
                  * ENOENT/ENOTDIR 为 readdir 后条目被并发删除/替换的正常竞态，静默；
                  * 其余 errno（EACCES/EIO/ETIMEDOUT/ESTALE 等）意味着真实存在的条目
                  * 被遗漏，上报 Master 记入熔断清单并累加 skipped_count。 */
-                if (errno != ENOENT && errno != ENOTDIR)
-                    send_entry_error(task->fd_ctrl, errno, dir_dev, full_path);
+                int ent_err = errno;
+                if (ent_err != ENOENT && ent_err != ENOTDIR)
+                    send_entry_error(task->fd_ctrl, ent_err, dir_dev, full_path);
                 entry_anomalies++; /* v15.5.8: 条目异常时禁用 nlink oracle，防并发删除误报 */
-                continue;
+                /* v15.6.2：EINVAL/EILSEQ（NFSv4 服务端拒绝非法 UTF-8 名字）——
+                 * 条目元数据永远 stat 不到，但 readdir 已给出名字/d_type/d_ino。
+                 * 退化输出该条目（mode 取自 d_type、ino 取自 dirent，其余字段清零），
+                 * 保证名单完整、事后可从输出提取全量坏名清单去改名；
+                 * skipped_count 照计，扫描仍以非零退出码结束。 */
+                if (ent_err == EINVAL || ent_err == EILSEQ) {
+                    log_warn("[W%d-Scanner] entry stat failed on %s: %s —— 退化输出（零字段）",
+                             worker_id, full_path, strerror(ent_err));
+                    log_invalid_name_hex(worker_id, full_path, ent_err);
+                    memset(&st, 0, sizeof(st));
+                    st.st_dev  = dir_dev;
+                    st.st_ino  = entry->d_ino;
+                    st.st_mode = dt_to_mode(entry->d_type);
+                    got = true;
+                } else {
+                    continue;
+                }
+            } else {
+                got = true;
             }
-            got = true;
         }
 
         if (got) {

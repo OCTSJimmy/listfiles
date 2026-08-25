@@ -491,8 +491,8 @@ static void parse_spbin_buffer(const uint8_t *buf, size_t size,
  *         1. 读独立 {base}.spbin（新格式流式读，读坏即停），逐条合并入内存
  *            （archive 的 SPBIN 块已在 iterate_archive 阶段经 parse_spbin_buffer 合并）；
  *         2. 按 reason 分类、按 device_key 分组：
- *            - PERMISSION/CIRCUIT_BREAKER/POISON → 永久跳过（CONDEMNED，本次运行
- *              不再入队，log_info 计数）；
+ *            - PERMISSION/CIRCUIT_BREAKER/POISON/INVALID_NAME → 永久跳过（CONDEMNED，
+ *              本次运行不再入队，log_info 计数）；
  *            - PROBE_FAIL/TIMEOUT → 检查 timestamp + 退避窗口（按 retry_count
  *              指数：30min→2h→6h→24h 封顶）。未超窗 → 保持跳过（待下次会话）；
  *              超窗 → 对该设备 push 敢死队 probe_task（复用 probe_scheduler/
@@ -553,7 +553,7 @@ static void restore_spbin(const Config *cfg, AppContext *ctx) {
         /* 未知 reason：log_warn 并按 PROBE_FAIL 保守处理 */
         if (e->reason != SP_REASON_PROBE_FAIL && e->reason != SP_REASON_TIMEOUT
             && e->reason != SP_REASON_CIRCUIT_BREAKER && e->reason != SP_REASON_PERMISSION
-            && e->reason != SP_REASON_POISON) {
+            && e->reason != SP_REASON_POISON && e->reason != SP_REASON_INVALID_NAME) {
             log_warn("[restore] spbin 未知 reason=%u（%s），按 PROBE_FAIL 保守处理",
                      e->reason, path_log_mask(e->path));
             e->reason = SP_REASON_PROBE_FAIL;
@@ -561,7 +561,8 @@ static void restore_spbin(const Config *cfg, AppContext *ctx) {
 
         if (e->reason == SP_REASON_PERMISSION
             || e->reason == SP_REASON_CIRCUIT_BREAKER
-            || e->reason == SP_REASON_POISON) {
+            || e->reason == SP_REASON_POISON
+            || e->reason == SP_REASON_INVALID_NAME /* v15.6.2：非法文件名，重试永远不会成功 */) {
             /* 永久跳过：本次运行不再入队（CONDEMNED），不进入探测队列 */
             e->s_status = SP_STATUS_CONDEMNED;
             permanent++;

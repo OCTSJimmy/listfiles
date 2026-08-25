@@ -235,13 +235,17 @@ void main_loop_handle_heartbeat(AppContext *ctx, int worker_id, uint64_t timesta
  *         处理顺序（先落 spbin 后销账，崩溃不一致时宁可 spbin 多记）：
  *         1. reason 分类（P1-002 errno 分类矩阵）：EACCES/EPERM → PERMISSION(4)；
  *            ETIMEDOUT → TIMEOUT(2)；EIO/ENODEV/ESTALE → PROBE_FAIL(1)；
+ *            EINVAL/EILSEQ → INVALID_NAME(6)（v15.6.2：NFSv4 服务端拒绝非法
+ *            UTF-8 名字，条目级永久问题，与设备健康无关——误归类 PROBE_FAIL
+ *            会触发设备探测且探测恒"成功"，造成假恢复→重入队→再失败的无限
+ *            循环，生产实测）；
  *            未知 errno → PROBE_FAIL 保守处理 + log_warn；
  *         2. 记熔断清单（沿用原语义：设备级记 DEV_TIMEOUT/EIO，其余记 DIR_ERROR）；
  *         3. 写 spbin（内存 + spbin_set + 磁盘 append-only，见 spbin_write_record）；
  *         4. 设备级错误（TIMEOUT/PROBE_FAIL 类）→ dev_mgr_mark_probing +
  *            push probe_task（沿用 probe_scheduler 敢死队探测状态机；
  *            ETIMEDOUT 原来 mark_dead，现按设计改 probing 语义）；
- *            PERMISSION 类不做设备探测；
+ *            PERMISSION/INVALID_NAME 类不做设备探测；
  *         5. 放弃该任务的完成屏障（task_state=DT_NONE，batches 计数清零，
  *            不写 dpbin——目录未完成，留给 spbin/Reset 援救），
  *            pending_tasks--（Worker 已释放任务），Worker 置 IDLE 可被再派发。
@@ -268,6 +272,15 @@ void main_loop_handle_error(AppContext *ctx, int worker_id, const IpcErrorHeader
         case ESTALE:
             reason = SP_REASON_PROBE_FAIL;
             device_level = true;
+            break;
+        case EINVAL:
+#ifdef EILSEQ
+        case EILSEQ:
+#endif
+            /* v15.6.2：非法文件名（NFSv4 服务端 UTF-8 校验拒绝）。条目级永久
+             * 错误：不探测设备、永久跳过（CONDEMNED），重试永远不会成功。 */
+            reason = SP_REASON_INVALID_NAME;
+            device_level = false;
             break;
         default:
             log_warn("[Error] Worker %d unknown errno=%u on %s, 按 PROBE_FAIL 保守处理",

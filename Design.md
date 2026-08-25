@@ -226,8 +226,8 @@ util/     — 日志、xxhash
    │   ├── 完整 → fpbin 转正（泵送入队），dfpbin 合并入 dpbin
    │   │         （merge_dfpbin_into_dpbin：封口 → rename → 重置写状态）
    │   └── 不完整 → 整对抛弃，无法对账的残留由 Reset 援救兜底重扫（§9.6）
-   ├── 读取 spbin → 按原因码分流（§8.4）：PERMISSION/CIRCUIT_BREAKER/POISON
-   │   永久跳过；PROBE_FAIL/TIMEOUT 超窗后敢死队探测，设备活则经
+   ├── 读取 spbin → 按原因码分流（§8.4）：PERMISSION/CIRCUIT_BREAKER/POISON/
+   │   INVALID_NAME 永久跳过；PROBE_FAIL/TIMEOUT 超窗后敢死队探测，设备活则经
    │   enqueue_dir 重入队；毒丸目录隔离，不阻塞同设备其余目录
    ├── 读取 dspill → 经 enqueue_dir 回填（enqueued_set 去重）
    └── 差集 = discovered_set − completed_set = "待扫描目录" → 泵送入队
@@ -497,7 +497,8 @@ completed_set（终态；恢复时差集 = discovered − completed）
 **错误路径**：
 - `RET_ERROR`：目录登记 enqueued_set 后**不重入队**（DEVICE_WAITING 语义），写 spbin 等恢复路径重试；`record_path` 对运行期出错目录绕过 enqueue_dir 集合去重直写 pbin，保证恢复闭环可达。
 - Worker 死亡：未达 DT_COMPLETED 的目录回滚重扫（current_path 重入队），未 COMMITTED 输出随目录回滚。
-- 永久跳过（PERMISSION / CIRCUIT_BREAKER / POISON）：spbin 记账，不阻塞本次运行其他目录，但本次运行 status=Incomplete（baseline_eligible=0）。
+- 永久跳过（PERMISSION / CIRCUIT_BREAKER / POISON / INVALID_NAME）：spbin 记账，不阻塞本次运行其他目录，但本次运行 status=Incomplete（baseline_eligible=0）。
+- 非法文件名治理（v15.6.2）：条目级 lstat/stat 遇 EINVAL/EILSEQ（NFSv4 服务端拒绝非法 UTF-8 名字）时，条目**退化输出**（mode 取自 `dirent.d_type`、ino 取自 `dirent.d_ino`，其余字段清零）并照常 `ENTRY_ERROR` 上报——名单完整可审计，skipped_count 照计；同时输出名字节级 hex 转储日志（全局，不门控）供运维定位改名。
 
 **关键规则**：
 - **只有 DT_COMPLETED 写 dpbin**
@@ -732,7 +733,7 @@ Master                                    Worker
 ```
 `device_key` 暂为 st_dev 的十进制字符串（P1-003 将升级为 (fsid, server, export) 三元组）。
 
-**五类原因码**（`include/output/spbin.h`）：
+**六类原因码**（`include/output/spbin.h`）：
 
 | 值 | 名称 | 含义 | 恢复行为 |
 |----|------|------|---------|
@@ -741,15 +742,18 @@ Master                                    Worker
 | 3 | `SP_REASON_CIRCUIT_BREAKER` | 目录级熔断（连续 DEV_TIMEOUT 达阈值） | 永久跳过 |
 | 4 | `SP_REASON_PERMISSION` | 权限拒绝（EACCES/EPERM） | 永久跳过 |
 | 5 | `SP_REASON_POISON` | 毒丸目录（累计致死 Worker 3 次，P1-004） | 永久跳过，隔离记账 |
+| 6 | `SP_REASON_INVALID_NAME` | 非法文件名（EINVAL/EILSEQ，NFSv4 服务端拒绝非法 UTF-8 名字，v15.6.2） | 永久跳过（条目级永久问题，重试永远不会成功，不触发设备探测） |
 
 **恢复行为**：
 1. 按 `device_key` 分组
-2. PERMISSION / CIRCUIT_BREAKER / POISON → 永久跳过（本轮不再入队）
+2. PERMISSION / CIRCUIT_BREAKER / POISON / INVALID_NAME → 永久跳过（本轮不再入队）
 3. PROBE_FAIL / TIMEOUT → 检查 timestamp 与退避窗口（按 retry_count 指数升级：30min → 2h → 6h → 24h 封顶，retry_count 不持久化、恢复时从 0 开始）
    - 未超窗 → 保持跳过（CONDEMNED）
    - 超窗 → 敢死队探测该设备
-     - 成功 → 设备标记 NORMAL，整组经 `enqueue_dir` 重入队（条目标记 RECOVERED）
-     - 失败 → timestamp 更新，退避升级
+     - 探测子进程退出码即 lstat errno（v15.6.2，此前恒 `_exit(0)` 不看结果——"设备活但路径坏"会被误判为设备恢复，造成假恢复→重入队→再失败的无限循环）：
+       - `0` / ENOENT / ENOTDIR → 设备标记 NORMAL，整组经 `enqueue_dir` 重入队（条目标记 RECOVERED）
+       - EINVAL / EILSEQ → 设备存活但探测路径是非法文件名：该路径改判 INVALID_NAME 永久跳过（不重入队），设备恢复、同设备其余路径重入队
+       - 其余 errno 或被信号杀死（alarm 超时）→ timestamp 更新，退避升级；达 `PROBE_MAX_RETRIES` 判死（CONDEMNED）
 4. 运行期出错目录的重入队统一经 `spbin_requeue_recovered` → `enqueue_dir`；`record_path` 对出错目录绕过集合去重直写 pbin，保证恢复闭环可达
 
 **毒丸隔离（P1-004）**：毒丸目录隔离到独立账目，不阻塞同设备其余目录的恢复。
@@ -951,8 +955,8 @@ pbin/fpbin/dpbin/dfpbin/archive 的二进制字段宽度（`size_t`、`time_t`�
 
 ### 工程约束
 
-- **版本号**：`VERSION "15.6.1"`、`VERSION_NAME "v15.6.1"`、`VERSION_CODE 202608241500UL`（`include/core/config.h`）。
-- **版本限定日志写死调用点**：v15.6.0 周期的 4 处版本限定日志写死 `202608202330UL`；v15.6.1 新增的版本限定日志写死 `202608241500UL`。均不定义宏——防止宏值随版本递进被一改全改、旧日志被不断宽限而失去门控意义。
+- **版本号**：`VERSION "15.6.2"`、`VERSION_NAME "v15.6.2"`、`VERSION_CODE 202608251230UL`（`include/core/config.h`）。
+- **版本限定日志写死调用点**：v15.6.0 周期的 4 处版本限定日志写死 `202608202330UL`；v15.6.1 新增的版本限定日志写死 `202608241500UL`；v15.6.2 新增的版本限定日志（探测退出码明细）写死 `202608251200UL`。均不定义宏——防止宏值随版本递进被一改全改、旧日志被不断宽限而失去门控意义。
 - **门控严格遵循规则**（config.h 注释）：
   1. 可能导致文件元数据被忽略或丢失的异常日志，不得被版本门控，必须归属于全局日志（引用 VERSION_CODE 的 `log_*` 宏）；
   2. error 类型日志不得被版本门控——`log_error`/`log_fatal` 在宏定义层固定引用 VERSION_CODE，结构上无法被门控。
@@ -988,4 +992,5 @@ mount -t nfs -o soft,timeo=6000,retrans=3 server:/public2 /public2
 | v15.0.0 | 2026-05 | 三通道分离 + IPC 状态机 | mutex 阻塞心跳 |
 | v15.5.9 | 2026-08 | NFS 大目录防误判加固 | HEARTBEAT_TIMEOUT 过严 |
 | v15.6.0 | 2026-08 | 目录任务完成屏障 + 输出三态 + fpbin/dfpbin 原子对 + 三集合统一队列 + Run manifest + epoch 机制 + spbin 恢复路径 + pbin schema 2 盲信门禁 | FINISH/BATCH 竞态、输出无状态、二次崩溃恢复、背压竞态、MSG_DROP 丢任务、RET_ERROR 空转、状态无权威来源、盲信前提不受强制、旧 Worker 残留污染；另修复 next_dispatch_worker 溢出段错误与 per-slot 数组越界活锁 |
-| v15.6.1 | 2026-08 | 死亡类消息 (pid,epoch) 同代校验 + 预备役 Worker 池（运行期零 fork）+ fork 时序前移 + 有效进展看门狗 + 账目不变量 | /public4 生产事故：RET_DEAD stale 判定反转吞噬真实死亡、cleanup 无条件销账致 pending=-6、RET_EXIT 丢在途目录致子树静默丢失、严格超售下 fork ENOMEM 静默 54h、DEV_TIMEOUT 链路日志被门控吞掉、无"活而无效"看门狗 |
+| v15.6.1 | 2026-08 | 死亡类消息 (pid,epoch) 同代校验 + 预备役 Worker 池（运行期零 fork）+ fork 时序前移 + 有效进展看门狗 + 账目不变量 | 生产事故：RET_DEAD stale 判定反转吞噬真实死亡、cleanup 无条件销账致 pending=-6、RET_EXIT 丢在途目录致子树静默丢失、严格超售下 fork ENOMEM 静默 54h、DEV_TIMEOUT 链路日志被门控吞掉、无"活而无效"看门狗 |
+| v15.6.2 | 2026-08 | 非法 UTF-8 文件名治理：SP_REASON_INVALID_NAME 分类 + 探测子进程退出码携带 errno + 坏名条目退化输出 + hex 转储日志 | 坏名目录误归类 PROBE_FAIL → 探测恒"成功"→ 假恢复 → 重入队 → 再失败的无限循环（探测槽霸占、spbin 膨胀、skipped_count 虚增）；坏名条目连名字都不进输出，无法审计 |

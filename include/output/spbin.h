@@ -5,13 +5,18 @@
 #include <time.h>
 
 /* v15.6.0（P0-005）：spbin 跳过原因码
- * 恢复行为：PERMISSION/CIRCUIT_BREAKER/POISON 永久跳过；
+ * 恢复行为：PERMISSION/CIRCUIT_BREAKER/POISON/INVALID_NAME 永久跳过；
  * PROBE_FAIL/TIMEOUT 检查 timestamp + 退避窗口，超窗后敢死队探测该设备。 */
 #define SP_REASON_PROBE_FAIL       1  /* 设备探测失败（EIO/ENODEV/ESTALE 及未知 errno 保守归类） */
 #define SP_REASON_TIMEOUT          2  /* 设备超时（ETIMEDOUT） */
 #define SP_REASON_CIRCUIT_BREAKER  3  /* 目录级熔断（连续 DEV_TIMEOUT 达 CIRCUIT_BREAKER_THRESHOLD） */
 #define SP_REASON_PERMISSION       4  /* 权限拒绝（EACCES/EPERM） */
 #define SP_REASON_POISON           5  /* 毒丸目录（P1-004：累计致死 Worker 3 次） */
+#define SP_REASON_INVALID_NAME     6  /* v15.6.2：非法文件名（EINVAL/EILSEQ——NFSv4 服务端
+                                       * 拒绝截断/非法 UTF-8 名字）。条目级永久问题，与设备
+                                       * 健康无关：不触发设备探测，永久跳过（CONDEMNED）。
+                                       * 误分类为 PROBE_FAIL 会导致"探测恒成功→假恢复→
+                                       * 重入队→再失败"无限循环（生产实测）。 */
 
 /* 内存条目状态（不持久化） */
 #define SP_STATUS_PROBING   0  /* 等待设备探测/恢复（DEVICE_WAITING） */

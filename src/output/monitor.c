@@ -274,13 +274,19 @@ static void dispatch_probes(Monitor *mon) {
     if (pid == 0) {
         alarm(timeout_sec);
         struct stat st;
-        (void)lstat(task.probe_path, &st);
-        _exit(0);
+        /* v15.6.2：探测结果必须区分"设备死"与"设备活但路径坏"——此前不看
+         * lstat 结果恒 _exit(0)，非法文件名路径探测恒"成功"→ 假恢复 →
+         * 重入队 → 再失败 → 无限循环（生产实测）。退出码携带 errno
+         * （<128 安全），父进程按 errno 分类处置。 */
+        int rc = lstat(task.probe_path, &st);
+        if (rc == 0) _exit(0);
+        _exit(errno > 0 && errno < 128 ? errno : 1);
     } else if (pid > 0) {
         mon->active_probe_pid = pid;
         mon->active_probe_dev = task.dev;
         mon->active_probe_retry_count = task.retry_count;
         mon->active_probe_interval = task.probe_interval;
+        safe_strcpy(mon->active_probe_path, task.probe_path, sizeof(mon->active_probe_path));
     } else {
         /* v15.6.1（P0-108）：探测 fork 失败必须留痕（严格超售下大 VSZ fork 会
          * ENOMEM——与 Worker 替换失败同族）。探测任务已 remove，失败即放弃本次，
@@ -294,9 +300,13 @@ static void dispatch_probes(Monitor *mon) {
  * @param  mon  Monitor*  监控器指针，不能为空
  * @return void
  *
- * @note   以 WNOHANG 方式 waitpid 检查活跃探测进程：
- *         - 若正常退出（WIFEXITED）：设备恢复为 NORMAL，将 spbin 中该设备的积压路径重新入队扫描
- *         - 若异常退出（被 signal 杀死，通常是 alarm 超时）：重新推入 ProbeScheduler 进行指数退避重试
+ * @note   以 WNOHANG 方式 waitpid 检查活跃探测进程。v15.6.2 起子进程退出码
+ *         携带 lstat 的 errno，按此分类：
+ *         - 0 / ENOENT / ENOTDIR：设备恢复为 NORMAL，spbin 该设备积压路径整组重入队；
+ *         - EINVAL / EILSEQ：设备存活但探测路径是非法文件名——该路径改判
+ *           SP_REASON_INVALID_NAME 永久跳过（不重入队），设备恢复、其余路径重入队；
+ *         - 其余 errno 或被信号杀死（alarm 超时）：重新推入 ProbeScheduler
+ *           指数退避重试，达 PROBE_MAX_RETRIES 判死（CONDEMNED）。
  *         无论结果如何，最后重置 active_probe_pid 为 -1，允许调度下一个探测任务。
  */
 static void reap_probes(Monitor *mon) {
@@ -308,7 +318,25 @@ static void reap_probes(Monitor *mon) {
 
     AppContext *ctx = mon->ctx;
     if (rc == mon->active_probe_pid) {
-        if (WIFEXITED(status)) {
+        /* v15.6.2：退出码即子进程 lstat 的 errno（0=成功；-1=被信号杀，超时） */
+        int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        log_debug_v(202608251200UL, "[Probe] dev %lu probe exit_code=%d",
+                    (unsigned long)mon->active_probe_dev, exit_code);
+        if (exit_code == 0 || exit_code == ENOENT || exit_code == ENOTDIR) {
+            /* 路径可 stat（或已消失——重扫按空目录正常完结）：设备存活，整组重入队 */
+            dev_mgr_mark_alive(ctx->dev_mgr, mon->active_probe_dev);
+            spbin_requeue_recovered(ctx, mon->active_probe_dev);
+        } else if (exit_code == EINVAL || exit_code == EILSEQ) {
+            /* v15.6.2：设备存活（服务端即时应答），但探测路径是非法文件名——
+             * 条目级永久问题，重试永远不会成功。改判 INVALID_NAME（CONDEMNED，
+             * 不重入队）后恢复设备、重入队该设备其余积压路径。
+             * 涉及目录被永久跳过（元数据不再采集），按既定规则必须全局可见。 */
+            log_warn("[Probe] dev %lu 存活，但探测路径为非法文件名（errno=%d），"
+                     "改判 INVALID_NAME 永久跳过: %s",
+                     (unsigned long)mon->active_probe_dev, exit_code,
+                     path_log_mask(mon->active_probe_path));
+            spbin_write_record(ctx, mon->active_probe_path,
+                               SP_REASON_INVALID_NAME, mon->active_probe_dev);
             dev_mgr_mark_alive(ctx->dev_mgr, mon->active_probe_dev);
             spbin_requeue_recovered(ctx, mon->active_probe_dev);
         } else {
@@ -373,6 +401,7 @@ static void reap_probes(Monitor *mon) {
     mon->active_probe_dev = 0;
     mon->active_probe_retry_count = 0;
     mon->active_probe_interval = 0;
+    mon->active_probe_path[0] = '\0';
 }
 
 /* ================================================================

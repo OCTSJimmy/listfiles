@@ -30,6 +30,11 @@
 #      输出 == 基线，stderr 有 DEAD/预备役日志，无 INVARIANT（账目不为负）
 #  15. Worker 全灭 + spare 耗尽（v15.6.1 P0-105/108）：有效进展看门狗
 #      --stall-timeout=5 触发，exit=2，有 [Watchdog]/耗尽日志，无静默挂起
+#  16. EINVAL 条目注入（v15.6.2 非法 UTF-8 文件名）：exit!=0 +
+#      ENTRY_ERROR(errno=22) + 坏名条目退化输出（零字段）+ hex 转储日志
+#  17. EINVAL 目录注入（v15.6.2）：exit!=0 + DIR_ERROR(errno=22) +
+#      spbin reason=6（INVALID_NAME）永久跳过，无设备探测、无重试循环
+#      （60s 超时兜底），坏名子树缺席但其余条目完整
 #
 # 注意（用例 10/11）：kill 时序在慢机器上可能偏早/偏晚——断言只依赖"最终输出
 # == 基线"，不依赖崩溃具体位置；若首轮在 kill 前已跑完（小树上可能），该用例
@@ -408,6 +413,51 @@ if [ $rc -eq 2 ] && grep -q 'Watchdog' "$WORK/case15.log" \
     ok "用例15 全灭+spare 耗尽后看门狗 exit=2（响亮终止，无负账目、无静默挂起）"
 else
     bad "用例15" "exit=$rc（预期 2）；log 尾部: $(tail -3 "$WORK/case15.log" | tr '\n' ' ')"
+fi
+
+# ================================================================
+say "== 用例 16/17: EINVAL 注入（v15.6.2 非法 UTF-8 文件名治理）=="
+gcc -shared -fPIC -O2 -o "$WORK/inject_lstat.so" "$PROJECT_ROOT/tests/inject_lstat.c" -ldl \
+    || { say "inject_lstat shim 编译失败"; exit 2; }
+
+# 用例 16: 条目级 EINVAL——退化输出 + ENTRY_ERROR(errno=22) + hex 日志
+EINV1=$WORK/einval_entry_tree
+rm -rf "$EINV1"; mkdir -p "$EINV1/normal"
+echo x > "$EINV1/normal/good.txt"
+echo x > "$EINV1/normal/badfile_einval"
+LF_LSTAT_TARGET_SUBSTR=badfile_einval LD_PRELOAD="$WORK/inject_lstat.so" \
+    "$LF" -p "$EINV1" -F "%p %s" -D -O "$WORK/out16" -f "$WORK/prog16" \
+    --max-slice 50000 --yes --worker-count 2 -M > /dev/null 2> "$WORK/case16.log"; rc=$?
+collect "$WORK/out16" > "$WORK/out16.sorted"
+if [ $rc -ne 0 ] \
+    && breaker_has "$WORK/prog16" 'ENTRY_ERROR(errno=22)' \
+    && grep -q 'INVALID_NAME errno=22 hex=' "$WORK/case16.log" \
+    && grep -q 'badfile_einval 0$' "$WORK/out16.sorted" \
+    && grep -q 'good.txt' "$WORK/out16.sorted"; then
+    ok "用例16 条目 EINVAL：退化输出（零字段）+ ENTRY_ERROR(errno=22) + hex 日志，exit=$rc"
+else
+    bad "用例16" "exit=$rc；breaker: $(tail -2 "$WORK/prog16.circuit_breaker" 2>/dev/null | tr '\n' ' ')；out: $(cat "$WORK/out16.sorted" | tr '\n' ' ')"
+fi
+
+# 用例 17: 目录级 EINVAL——spbin reason=6 永久跳过，无设备探测、无重试循环
+EINV2=$WORK/einval_dir_tree
+rm -rf "$EINV2"; mkdir -p "$EINV2/baddir_einval" "$EINV2/okdir"
+echo x > "$EINV2/baddir_einval/inner.txt"
+echo x > "$EINV2/okdir/f.txt"
+LF_LSTAT_TARGET_SUBSTR=baddir_einval LD_PRELOAD="$WORK/inject_lstat.so" \
+    timeout 60 "$LF" -p "$EINV2" -F "%p %s" -D -O "$WORK/out17" -f "$WORK/prog17" \
+    --max-slice 50000 --yes --worker-count 2 -M > /dev/null 2> "$WORK/case17.log"; rc=$?
+collect "$WORK/out17" > "$WORK/out17.sorted"
+if [ $rc -ne 0 ] && [ $rc -ne 124 ] \
+    && breaker_has "$WORK/prog17" 'DIR_ERROR(errno=22)' \
+    && grep -q 'reason=6' "$WORK/case17.log" \
+    && ! grep -q '\[Probe\]' "$WORK/case17.log" \
+    && grep -q 'baddir_einval 0$' "$WORK/out17.sorted" \
+    && ! grep -q 'inner.txt' "$WORK/out17.sorted" \
+    && grep -q 'okdir/f.txt' "$WORK/out17.sorted"; then
+    ok "用例17 目录 EINVAL：INVALID_NAME 永久跳过、无探测循环（exit=$rc，60s 内完结）"
+else
+    bad "用例17" "exit=$rc（124=超时即循环）；log: $(tail -3 "$WORK/case17.log" | tr '\n' ' ')"
 fi
 
 # ================================================================
